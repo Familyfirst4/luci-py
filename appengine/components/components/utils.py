@@ -16,6 +16,7 @@ import re
 import sys
 import threading
 
+import six
 from six.moves import urllib
 
 from email import utils as email_utils
@@ -28,9 +29,6 @@ from google.appengine.api import modules
 from google.appengine.api import taskqueue
 from google.appengine.ext import ndb
 from google.appengine.runtime import apiproxy_errors
-
-from protorpc import messages
-from protorpc.remote import protojson
 
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -163,6 +161,11 @@ def time_time():
   return (utcnow() - EPOCH).total_seconds()
 
 
+def time_time_ns():
+  """Returns the equivalent of time.time_ns() as mocked if applicable."""
+  return int((utcnow() - EPOCH).total_seconds() * 1e9)
+
+
 def milliseconds_since_epoch(now=None):
   """Returns the number of milliseconds since unix epoch as an int."""
   now = now or utcnow()
@@ -282,11 +285,54 @@ def constant_time_equals(a, b):
 ## Cache
 
 
-class _Cache(object):
-  """Holds state of a cache for cache_with_expiration and cache decorators.
+class _EternalCache(object):
+  """Holds state of a cache for @cache decorators.
 
-  May call func more than once.
-  Thread- and NDB tasklet-safe.
+  May call |func| more than once and concurrently. Thread- and NDB tasklet-safe.
+  """
+
+  def __init__(self, func):
+    self.func = func
+    self.value = None
+    self.value_is_set = False
+
+  def get_value(self):
+    """Returns a cached value getting it first if necessary."""
+    # We assume Python booleans are "atomic". They are in CPython.
+    # Note: attempting to protect this initialization with a lock leads to
+    # issues when using ndb tasklets inside `func`: they easily can end up
+    # calling other unrelated code (while the lock is still held), eventually
+    # leading to deadlocks if this code calls get_value again. There's a test
+    # for that in utils_test.py.
+    if not self.value_is_set:
+      self.value = self.func()
+      self.value_is_set = True
+    return self.value
+
+  def clear(self):
+    """Clears stored cached value."""
+    self.value_is_set = False
+    self.value = None
+
+  def get_wrapper(self):
+    """Returns a callable object that can be used in place of |func|.
+
+    It's basically self.get_value, updated by functools.wraps to look more like
+    original function.
+    """
+    # Wrapping self.get_value directly fails since it is "instancemethod", not
+    # a regular function.
+    #
+    # pylint: disable=unnecessary-lambda
+    wrapper = functools.wraps(self.func)(lambda: self.get_value())
+    wrapper.__parent_cache__ = self
+    return wrapper
+
+
+class _ExpiringCache(object):
+  """Holds state of a cache for @cache_with_expiration decorators.
+
+  May call |func| more than once and concurrently. Thread- and NDB tasklet-safe.
   """
 
   def __init__(self, func, expiration_sec):
@@ -308,8 +354,7 @@ class _Cache(object):
     with self.lock:
       self.value = new_value
       self.value_is_set = True
-      if self.expiration_sec:
-        self.expires = time_time() + self.expiration_sec
+      self.expires = time_time() + self.expiration_sec
 
     return self.value
 
@@ -326,8 +371,10 @@ class _Cache(object):
     It's basically self.get_value, updated by functools.wraps to look more like
     original function.
     """
-    # functools.wraps doesn't like 'instancemethod', use lambda as a proxy.
-    # pylint: disable=W0108
+    # Wrapping self.get_value directly fails since it is "instancemethod", not
+    # a regular function.
+    #
+    # pylint: disable=unnecessary-lambda
     wrapper = functools.wraps(self.func)(lambda: self.get_value())
     wrapper.__parent_cache__ = self
     return wrapper
@@ -335,22 +382,25 @@ class _Cache(object):
 
 def cache(func):
   """Decorator that implements permanent cache of a zero-parameter function."""
-  return _Cache(func, None).get_wrapper()
+  return _EternalCache(func).get_wrapper()
 
 
 def cache_with_expiration(expiration_sec):
   """Decorator that implements in-memory cache for a zero-parameter function."""
+  assert expiration_sec > 0, expiration_sec
   def decorator(func):
-    return _Cache(func, expiration_sec).get_wrapper()
+    return _ExpiringCache(func, expiration_sec).get_wrapper()
   return decorator
 
 
 def clear_cache(func):
-  """Given a function decorated with @cache, resets cached value."""
+  """Given a function decorated with @cache, resets cached value.
+
+  Exclusively for tests!
+  """
   func.__parent_cache__.clear()
 
 
-# ignore time parameter warning | pylint: disable=redefined-outer-name
 def memcache_async(key, key_args=None, time=None):
   """Decorator that implements memcache-based cache for a function.
 
@@ -676,10 +726,22 @@ def enqueue_task(*args, **kwargs):
 
 ## JSON
 
+if six.PY2:  # protorpc does not work with py3 at all
+  try:
+    # protorpc is an ancient and deprecated library, but to_json_encodable is
+    # used in many places. Make to_json_encodable gracefully degrade when
+    # protorpc is missing.
+    from protorpc import messages
+    from protorpc.remote import protojson
+  except ImportError:
+    messages = None
+else:
+  messages = None
+
 
 def to_json_encodable(data):
   """Converts data into json-compatible data."""
-  if isinstance(data, messages.Message):
+  if messages and isinstance(data, messages.Message):
     # protojson.encode_message returns a string that is already encoded json.
     # Load it back into a json-compatible representation of the data.
     return json.loads(protojson.encode_message(data))
@@ -802,9 +864,17 @@ def fix_protobuf_package():
   google.__path__.append(path)
 
   # six is needed for oauth2client and webtest (local testing).
+  # TODO(vadimsh): What do they have to do with protobuf?
   six_path = os.path.join(THIS_DIR, 'third_party', 'six')
   if six_path not in sys.path:
     sys.path.insert(0, six_path)
+
+
+def import_third_party():
+  """Adds vendored third party packages to sys.path."""
+  third_party = os.path.join(THIS_DIR, 'third_party')
+  if third_party not in sys.path:
+    sys.path.insert(0, third_party)
 
 
 def import_jinja2():
@@ -815,7 +885,7 @@ def import_jinja2():
   for i in sys.path[:]:
     if os.path.basename(i) == 'jinja2':
       sys.path.remove(i)
-  sys.path.append(os.path.join(THIS_DIR, 'third_party'))
+  import_third_party()
 
 
 # NDB Futures

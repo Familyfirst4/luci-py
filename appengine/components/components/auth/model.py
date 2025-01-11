@@ -221,6 +221,10 @@ class Identity(
     """Serializes this identity to byte buffer."""
     return '%s:%s' % (self.kind, self.name)
 
+  def to_normalized_bytes(self):
+    """Normalizes the serialized identity byte buffer."""
+    return self.normalize(self.to_bytes())
+
   @classmethod
   def from_bytes(cls, byte_buf):
     """Given a byte buffer returns corresponding Identity object."""
@@ -253,6 +257,13 @@ class Identity(
   def is_user(self):
     """True if this object represents user account."""
     return self.kind == IDENTITY_USER
+
+  @staticmethod
+  def normalize(identity):
+    """Returns the normalized version of the given identity value."""
+    if identity.startswith('user:'):
+      return identity.lower()
+    return identity
 
 
 # Predefined Anonymous identity.
@@ -1318,9 +1329,14 @@ class AuthRealmsGlobals(ndb.Model, AuthVersionedEntityMixin):
   _use_cache = False
   _use_memcache = False
 
-  # All globally defined permissions, in alphabetical order.
+  # All globally defined permissions, in alphabetical order, populated
+  # by Auth Service v1 (Python).
   permissions = datastore_utils.ProtobufProperty(
       realms_pb2.Permission, repeated=True)
+
+  # All globally defined permissions, in alphabetical order, populated
+  # by Auth Service v2 (Go).
+  permissionslist = ndb.BlobProperty(indexed=False)
 
 
 class AuthProjectRealms(ndb.Model, AuthVersionedEntityMixin):

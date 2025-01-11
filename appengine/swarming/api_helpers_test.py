@@ -18,6 +18,7 @@ from components import auth_testing
 from components import utils
 import handlers_exceptions
 from proto.config import config_pb2
+from proto.config import pools_pb2
 from server import acl
 from server import config
 from server import pools_config
@@ -26,13 +27,13 @@ from server import service_accounts
 from server import task_request
 from test_support import test_case
 
-from proto.api.internal.bb import swarming_bb_pb2
+from proto.api_v2 import swarming_pb2
 
 class TestProcessTaskRequest(test_case.TestCase):
 
   def setUp(self):
     super(TestProcessTaskRequest, self).setUp()
-    now = datetime.datetime(2019, 01, 02, 03)
+    now = datetime.datetime(2019, 1, 2, 3)
     test_case.mock_now(self, now, 0)
 
     self._known_pools = None
@@ -57,11 +58,17 @@ class TestProcessTaskRequest(test_case.TestCase):
   def test_process_task_request_BadRequest(self):
     tr = task_request.TaskRequest(
         created_ts=utils.utcnow(),
+        manual_tags=['swarming.terminate:1'],
         task_slices=[
-            task_request.TaskSlice(
-                properties=task_request.TaskProperties(
-                    dimensions_data={u'chicken': [u'egg1', u'egg2']}))
+            task_request.TaskSlice(properties=task_request.TaskProperties(
+                dimensions_data={u'chicken': [u'egg1', u'egg2']}))
         ])
+
+    # Catch reserved tags use.
+    with self.assertRaisesRegexp(handlers_exceptions.BadRequestException,
+                                 'reserved for internal use'):
+      api_helpers.process_task_request(tr, task_request.TEMPLATE_AUTO)
+    tr.manual_tags = []
 
     # Catch init_new_request() ValueError exceptions.
     with self.assertRaisesRegexp(handlers_exceptions.BadRequestException,
@@ -89,7 +96,7 @@ class TestProcessTaskRequest(test_case.TestCase):
       api_helpers.process_task_request(tr, task_request.TEMPLATE_AUTO)
 
   def test_process_task_request(self):
-    self.mock_pool_config('default')
+    pool_cfg = self.mock_pool_config('default')
     tr = self.basic_task_request()
 
     expected_tr = self.basic_task_request()
@@ -97,6 +104,7 @@ class TestProcessTaskRequest(test_case.TestCase):
                                   acl.can_schedule_high_priority_tasks(),
                                   task_request.TEMPLATE_AUTO)
     expected_tr.realms_enabled = True
+    expected_tr.scheduling_algorithm = pool_cfg.scheduling_algorithm
 
     self.mock(realms, 'check_tasks_create_in_realm', lambda *_: True)
     self.mock(realms, 'check_pools_create_task', lambda *_: True)
@@ -105,7 +113,7 @@ class TestProcessTaskRequest(test_case.TestCase):
     self.assertEqual(expected_tr, tr)
 
   def test_process_task_request_service_account(self):
-    self.mock_pool_config('default')
+    pool_cfg = self.mock_pool_config('default')
 
     tr = self.basic_task_request()
     tr.service_account = 'service-account@example.com'
@@ -116,6 +124,7 @@ class TestProcessTaskRequest(test_case.TestCase):
                                   acl.can_schedule_high_priority_tasks(),
                                   task_request.TEMPLATE_AUTO)
     expected_tr.realms_enabled = True
+    expected_tr.scheduling_algorithm = pool_cfg.scheduling_algorithm
 
     self.mock(realms, 'check_tasks_create_in_realm', lambda *_: True)
     self.mock(realms, 'check_pools_create_task', lambda *_: True)
@@ -123,7 +132,6 @@ class TestProcessTaskRequest(test_case.TestCase):
     self.mock(service_accounts, 'has_token_server', lambda: True)
 
     api_helpers.process_task_request(tr, task_request.TEMPLATE_AUTO)
-
     self.assertEqual(expected_tr, tr)
 
   def test_process_task_request_service_account_legacy(self):
@@ -145,24 +153,45 @@ class TestProcessTaskRequest(test_case.TestCase):
     self.assertIn(
         'only if the task is associated with a realm', exc.exception.message)
 
-  def mock_pool_config(self, name):
+  def test_process_task_request_rbe_mode(self):
+    self.mock(realms, 'check_tasks_create_in_realm', lambda *_: True)
+    self.mock(realms, 'check_pools_create_task', lambda *_: True)
+
+    self.mock_pool_config(
+        'default',
+        pools_pb2.Pool.RBEMigration(
+            rbe_instance='rbe-inst',
+            rbe_mode_percent=100,
+        ))
+
+    tr = self.basic_task_request()
+    api_helpers.process_task_request(tr, task_request.TEMPLATE_AUTO)
+
+    self.assertEqual(tr.rbe_instance, 'rbe-inst')
+    self.assertIn(u'rbe:rbe-inst', tr.tags)
+
+  def mock_pool_config(self, name, rbe_migration=None):
+    mocked = pools_config.init_pool_config(
+        name=name,
+        rev='rev',
+        rbe_migration=rbe_migration,
+        scheduling_algorithm=pools_pb2.Pool.SCHEDULING_ALGORITHM_LIFO,
+    )
 
     def mocked_get_pool_config(pool):
       if pool == name:
-        return pools_config.init_pool_config(
-            name=name,
-            rev='rev',
-        )
+        return mocked
       return None
 
     self.mock(pools_config, 'get_pool_config', mocked_get_pool_config)
+    return mocked
 
 
 class TestCheckIdenticalRequest(test_case.TestCase):
 
   def setUp(self):
     super(TestCheckIdenticalRequest, self).setUp()
-    self.now = test_case.mock_now(self, datetime.datetime(2019, 01, 02, 03), 0)
+    self.now = test_case.mock_now(self, datetime.datetime(2019, 1, 2, 3), 0)
 
   def test_cache_hit(self):
     func = mock.Mock(return_value='ok')
@@ -230,31 +259,60 @@ class TestCheckIdenticalRequest(test_case.TestCase):
 
   def test_validate_configs(self):
     configs = [
-        swarming_bb_pb2.SwarmingBackendConfig(
+        swarming_pb2.SwarmingTaskBackendConfig(
+            priority=task_request.MAXIMUM_PRIORITY + 1,
+            bot_ping_tolerance=task_request._MAX_BOT_PING_TOLERANCE_SECS + 1,
+            service_account='bokbok',
+            parent_run_id='123',
+            tags=['key:value', 'onlykey', '']),
+        swarming_pb2.SwarmingTaskBackendConfig(priority=0,
+                                               bot_ping_tolerance=1),
+    ]
+    errors = api_helpers.validate_backend_configs(configs)
+
+    expected_errors = [
+        (0, "priority (256) must be between 0 and 255 (inclusive)"),
+        (0, "bot_ping_tolerance (1201) must range between 60 and 1200"),
+        (0, u"parent_run_id (123) got error: Invalid key u'12'"),
+        (0, ("service_account must be an email, \"bot\" or \"none\""
+             " string, got u\'bokbok\'")),
+        (0, "tag must be in key:value form, not onlykey"),
+        (0, "tag must be in key:value form, not "),
+        (1, "bot_ping_tolerance (1) must range between 60 and 1200"),
+    ]
+    self.assertEqual(expected_errors, errors)
+
+  def test_validate_configs_full_validation(self):
+    self.maxDiff = None
+    configs = [
+        swarming_pb2.SwarmingTaskBackendConfig(
             priority=task_request.MAXIMUM_PRIORITY + 1,
             bot_ping_tolerance=task_request._MAX_BOT_PING_TOLERANCE_SECS + 1,
             service_account='bokbok',
             parent_run_id='123',
             agent_binary_cipd_filename='agent',
             agent_binary_cipd_pkg='agent/package/${platform}??',
-            agent_binary_cipd_vers='3'),
-        swarming_bb_pb2.SwarmingBackendConfig(priority=0)
-        ]
-    errors = api_helpers.validate_backend_configs(configs)
+            agent_binary_cipd_vers='3',
+            tags=['key:value', 'onlykey', '']),
+        swarming_pb2.SwarmingTaskBackendConfig(priority=0, ),
+    ]
+    errors = api_helpers.validate_backend_configs(configs, full_validation=True)
 
     expected_errors = [
         (0, "priority (256) must be between 0 and 255 (inclusive)"),
         (0, "bot_ping_tolerance (1201) must range between 60 and 1200"),
-        (0, "parent_run_id (123) got error: Invalid key u'12'"),
+        (0, u"parent_run_id (123) got error: Invalid key u'12'"),
         (0, ("service_account must be an email, \"bot\" or \"none\""
-         " string, got u\'bokbok\'")),
-        (0, ("agent_binary_cipd_pkg must be a valid CIPD package name"
+             " string, got u\'bokbok\'")),
+        (0, (u"agent_binary_cipd_pkg must be a valid CIPD package name"
              " template, got \"agent/package/${platform}??\"")),
+        (0, "tag must be in key:value form, not onlykey"),
+        (0, "tag must be in key:value form, not "),
         (1, "bot_ping_tolerance (0) must range between 60 and 1200"),
-        (1, ("agent_binary_cipd_pkg must be a valid CIPD package name"
+        (1, (u"agent_binary_cipd_pkg must be a valid CIPD package name"
              " template, got \"\"")),
         (1, "agent_binary_cipd_vers must be a valid package version, got \"\""),
-        (1, "missing `agent_binary_cipd_filename`"),
+        (1, "missing `agent_binary_cipd_filename`")
     ]
     self.assertEqual(expected_errors, errors)
 

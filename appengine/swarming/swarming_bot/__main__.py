@@ -18,6 +18,7 @@ import os
 import shutil
 import socket
 import sys
+import tempfile
 import zipfile
 
 
@@ -243,15 +244,45 @@ def CMDversion(_args):
 
 
 def main():
+  # Setup a temporary 'best effort' logger. This is to be used before the actual
+  # logger is initialised.
+  logger = logging.getLogger('init')
+  logging_utils.prepare_logging(
+      os.path.join(tempfile.gettempdir(), "swarming_bot_init.log"), logger)
+
+  base_dir = os.path.dirname(THIS_FILE)
+
+  # Log to a permanant location as well. This is the log that should be piped by
+  # cloudtail. Continue logging to the temp dir as a backup (in case there's an
+  # issue with the handler)
+  perm_log_location = os.path.join(base_dir, 'logs', 'swarming_bot_init.log')
+  try:
+    logger.addHandler(
+        logging_utils.new_rotating_file_handler(perm_log_location))
+  except Exception:
+    logger.exception("Failed to open: %s\n", perm_log_location)
+
+  logger.info("Starting %s with args %s", THIS_FILE, sys.argv)
   # Always make the current working directory the directory containing this
   # file. It simplifies assumptions.
-  base_dir = os.path.dirname(THIS_FILE)
-  os.chdir(base_dir)
-  # Always create the logs dir first thing, before printing anything out.
-  if not os.path.isdir('logs'):
-    os.mkdir('logs')
+  try:
+    os.chdir(base_dir)
+    # Always create the logs dir first thing, before printing anything out.
+    # This is already done above when adding the rotating file handler, but
+    # just in case it fails we should try again.
+    if not os.path.isdir('logs'):
+      os.mkdir('logs')
+  except OSError:
+    logger.exception("Failed to create logging directory at path: %s\n",
+                     base_dir)
 
-  net.set_user_agent('swarming_bot/' + __version__ + '@' + socket.gethostname())
+  try:
+    user_agent = 'swarming_bot/' + __version__ + '@' + socket.gethostname()
+  except OSError:
+    logger.exception("Failed to obtain hostname")
+
+  logger.info("Setting user agent: %s", user_agent)
+  net.set_user_agent(user_agent)
 
   # This is necessary so os.path.join() works with unicode path. No kidding.
   # This must be done here as each of the command take wildly different code
@@ -259,19 +290,24 @@ def main():
   # issues otherwise, especially in module os.path.
   fix_encoding.fix_encoding()
 
+  logger.info("Registering signal handlers (Mac and Linux only)")
   # This is extremely useful to debug hangs.
   signal_trace.register()
 
   if os.path.basename(THIS_FILE) == 'swarming_bot.zip':
     # Self-replicate itself right away as swarming_bot.1.zip and restart the bot
     # process as this copy. This enables LKGBC logic.
-    print('Self replicating pid:%d.' % os.getpid(), file=sys.stderr)
+    logger.info('Self replicating pid:%d.', os.getpid())
     new_zip = os.path.join(base_dir, 'swarming_bot.1.zip')
-    if os.path.isfile(new_zip):
-      os.remove(new_zip)
-    shutil.copyfile(THIS_FILE, new_zip)
+    try:
+      if os.path.isfile(new_zip):
+        os.remove(new_zip)
+      shutil.copyfile(THIS_FILE, new_zip)
+    except OSError:
+      logger.exception("Failed to replicate %s to %s\n", THIS_FILE, new_zip)
+
     cmd = [new_zip] + sys.argv[1:]
-    print('cmd: %s' % cmd, file=sys.stderr)
+    logger.info('cmd: %s', cmd)
     return common.exec_python(cmd)
 
   # sys.argv[0] is the zip file itself.
@@ -284,14 +320,15 @@ def main():
   fn = getattr(sys.modules[__name__], 'CMD%s' % cmd, None)
   if fn:
     try:
+      logger.info("Executing function: CMD%s", cmd)
       return fn(args)
     except ImportError:
-      logging.exception('Failed to run %s', cmd)
+      logger.exception('Failed to run %s', cmd)
       with zipfile.ZipFile(THIS_FILE, 'r') as f:
-        logging.error('Files in %s:\n%s', THIS_FILE, f.namelist())
+        logger.error('Files in %s:\n%s', THIS_FILE, f.namelist())
       return 1
 
-  print('Unknown command %s' % cmd, file=sys.stderr)
+  logger.error('Unknown command %s' % cmd)
   return 1
 
 

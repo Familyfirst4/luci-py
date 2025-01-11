@@ -24,7 +24,6 @@ from components import utils
 from test_support import test_case
 
 from proto.api import swarming_pb2
-from server import bq_state
 from server import config
 from server import pools_config
 from server import task_pack
@@ -357,6 +356,11 @@ class TaskRequestApiTest(TestCase):
         i[5:] for i in dir(self) if i.startswith('test_'))
     self.assertFalse(missing)
 
+  def test_is_reserved_tag(self):
+    self.assertFalse(task_request.is_reserved_tag('a:b'))
+    self.assertTrue(task_request.is_reserved_tag('swarming.terminate:1'))
+    self.assertTrue(task_request.is_reserved_tag('swarming.terminate'))
+
   def test_get_automatic_tags(self):
     req = _gen_request()
     expected = set((u'hostname:localhost', u'OS:Windows-3.1.1', u'pool:default',
@@ -415,9 +419,13 @@ class TaskRequestApiTest(TestCase):
     self.assertEqual(expected, task_request.get_automatic_tags(req, 1))
 
   def test_create_termination_task(self):
-    request = task_request.create_termination_task(
-        u'some-bot', wait_for_capacity=True)
+    request = task_request.create_termination_task(u'some-bot')
     self.assertTrue(request.task_slice(0).properties.is_terminate)
+
+  def test_create_termination_task_with_reason(self):
+    reason = "hello world"
+    request = task_request.create_termination_task(u'some-bot', reason=reason)
+    self.assertEqual(request.name, "Terminate some-bot: hello world")
 
   def test_new_request_key(self):
     for _ in range(3):
@@ -505,7 +513,7 @@ class TaskRequestApiTest(TestCase):
     # Needed for the get() call below.
     req.put()
     sb = _gen_secret(req, 'I am a banana')
-    # Needed for properties_hash() call.
+    # Needed for get_properties_hash() call.
     sb.put()
     expected_properties = {
         'caches': [],
@@ -551,14 +559,24 @@ class TaskRequestApiTest(TestCase):
         'outputs': [],
     }
     expected_request = {
-        'authenticated': auth_testing.DEFAULT_MOCKED_IDENTITY,
-        'has_build_token': False,
-        'name': u'Request name',
-        'parent_task_id': unicode(parent_id),
-        'priority': 50,
-        'pubsub_topic': None,
-        'pubsub_userdata': None,
-        'service_account': u'none',
+        'authenticated':
+        auth_testing.DEFAULT_MOCKED_IDENTITY,
+        'has_build_task':
+        False,
+        'name':
+        u'Request name',
+        'parent_task_id':
+        unicode(parent_id),
+        'root_task_id':
+        unicode(parent_id),
+        'priority':
+        50,
+        'pubsub_topic':
+        None,
+        'pubsub_userdata':
+        None,
+        'service_account':
+        u'none',
         'tags': [
             u'OS:Windows-3.1.1',
             u'authenticated:user:mocked@example.com',
@@ -572,16 +590,25 @@ class TaskRequestApiTest(TestCase):
             u'tag:1',
             u'user:Jesus',
         ],
-        'task_slices': [{
-            'expiration_secs': 30,
-            'properties': expected_properties,
-            'wait_for_capacity': False,
-        },],
-        'user': u'Jesus',
-        'realm': None,
-        'realms_enabled': False,
-        'bot_ping_tolerance_secs': 120,
-        'resultdb': None,
+        'task_slices': [
+            {
+                'expiration_secs': 30,
+                'properties': expected_properties,
+                'wait_for_capacity': False,
+            },
+        ],
+        'user':
+        u'Jesus',
+        'realm':
+        None,
+        'realms_enabled':
+        False,
+        'bot_ping_tolerance_secs':
+        120,
+        'resultdb':
+        None,
+        'rbe_instance':
+        None,
     }
     actual = req.to_dict()
     actual.pop('created_ts')
@@ -592,7 +619,7 @@ class TaskRequestApiTest(TestCase):
     # Other unit tests should use the calculated value.
     self.assertEqual(
         '01c7cb24beefad19fe79f8adab4e72447175a6d8b290fb22930f102fc71cf596',
-        req.task_slice(0).properties_hash(req).encode('hex'))
+        req.task_slice(0).get_properties_hash(req).encode('hex'))
 
   def test_init_new_request_cas_input(self):
     parent = _gen_request()
@@ -620,7 +647,7 @@ class TaskRequestApiTest(TestCase):
     # Needed for the get() call below.
     req.put()
     sb = _gen_secret(req, 'I am not a banana')
-    # Needed for properties_hash() call.
+    # Needed for get_properties_hash() call.
     sb.put()
     expected_properties = {
         'caches': [],
@@ -666,14 +693,24 @@ class TaskRequestApiTest(TestCase):
         'has_secret_bytes': True,
     }
     expected_request = {
-        'authenticated': auth_testing.DEFAULT_MOCKED_IDENTITY,
-        'has_build_token': False,
-        'name': u'Request name',
-        'parent_task_id': parent_id,
-        'priority': 50,
-        'pubsub_topic': None,
-        'pubsub_userdata': None,
-        'service_account': u'none',
+        'authenticated':
+        auth_testing.DEFAULT_MOCKED_IDENTITY,
+        'has_build_task':
+        False,
+        'name':
+        u'Request name',
+        'parent_task_id':
+        parent_id,
+        'root_task_id':
+        parent_id,
+        'priority':
+        50,
+        'pubsub_topic':
+        None,
+        'pubsub_userdata':
+        None,
+        'service_account':
+        u'none',
         'tags': [
             u'OS:Windows-3.1.1',
             u'authenticated:user:mocked@example.com',
@@ -687,16 +724,25 @@ class TaskRequestApiTest(TestCase):
             u'tag:1',
             u'user:Jesus',
         ],
-        'task_slices': [{
-            'expiration_secs': 30,
-            'properties': expected_properties,
-            'wait_for_capacity': False,
-        },],
-        'user': u'Jesus',
-        'realm': None,
-        'realms_enabled': False,
-        'bot_ping_tolerance_secs': 120,
-        'resultdb': None,
+        'task_slices': [
+            {
+                'expiration_secs': 30,
+                'properties': expected_properties,
+                'wait_for_capacity': False,
+            },
+        ],
+        'user':
+        u'Jesus',
+        'realm':
+        None,
+        'realms_enabled':
+        False,
+        'bot_ping_tolerance_secs':
+        120,
+        'resultdb':
+        None,
+        'rbe_instance':
+        None,
     }
     actual = req.to_dict()
     # expiration_ts - created_ts == scheduling_expiration_secs.
@@ -708,7 +754,7 @@ class TaskRequestApiTest(TestCase):
     # Other unit tests should use the calculated value.
     self.assertEqual(
         'be94b558a518f4d2864960ce0b1a3dbdce050e2713df668d52fd4f43fc0ce2c2',
-        req.task_slice(0).properties_hash(req).encode('hex'))
+        req.task_slice(0).get_properties_hash(req).encode('hex'))
 
   def test_init_new_request_parent(self):
     parent = _gen_request()
@@ -740,7 +786,7 @@ class TaskRequestApiTest(TestCase):
     # Ensure the algorithm is deterministic.
     self.assertEqual(
         '7f75debbd69ed0838c40cacc5ff6942e0199644103b84cf49a84c5deb44f6b78',
-        request.task_slice(0).properties_hash(request).encode('hex'))
+        request.task_slice(0).get_properties_hash(request).encode('hex'))
 
   def test_init_new_request_bot_service_account(self):
     request = _gen_request(service_account='bot')
@@ -874,9 +920,44 @@ class TaskRequestApiTest(TestCase):
                 properties=_gen_properties(idempotent=True)),
         ])
     self.assertEqual(
-        request_1.task_slice(0).properties_hash(request_1),
-        request_2.task_slice(0).properties_hash(request_2))
-    self.assertTrue(request_1.task_slice(0).properties_hash(request_1))
+        request_1.task_slice(0).get_properties_hash(request_1),
+        request_2.task_slice(0).get_properties_hash(request_2))
+    self.assertTrue(request_1.task_slice(0).get_properties_hash(request_1))
+
+    self.assertEqual(
+        request_1.task_slice(0).calculate_properties_hash_v2(None),
+        request_2.task_slice(0).calculate_properties_hash_v2(None))
+
+  def test_calculate_properties_hash_v2_no_secret(self):
+    task_slice = task_request.TaskSlice(properties=task_request.TaskProperties(
+        dimensions_data={
+            u'd1': [u'v1', u'v2'],
+            u'pool': [u'pool'],
+        },
+        env_prefixes={
+            u'p1': [u'v2', u'v1'],
+        },
+    ))
+    self.assertEqual(
+        task_slice.calculate_properties_hash_v2(None).encode('hex'),
+        '079e5c6f0bb17d036cc3196c89d2d3ef15fea09d85e7a69a8ba7fe69cf5a7afd',
+    )
+
+  def test_calculate_properties_hash_v2_with_secret(self):
+    task_slice = task_request.TaskSlice(properties=task_request.TaskProperties(
+        dimensions_data={
+            u'd1': [u'v1', u'v2'],
+            u'pool': [u'pool'],
+        },
+        env_prefixes={
+            u'p1': [u'v2', u'v1'],
+        },
+    ))
+    secret_bytes = task_request.SecretBytes(secret_bytes='secret', )
+    self.assertEqual(
+        task_slice.calculate_properties_hash_v2(secret_bytes).encode('hex'),
+        'b114a396a92ef47203df9f2927e73a90b1bf6e4573daa4e714c10d1394c8da05',
+    )
 
   def test_different(self):
     # Two TestRequest with different properties.
@@ -885,8 +966,8 @@ class TaskRequestApiTest(TestCase):
     request_2 = _gen_request(
         properties=_gen_properties(execution_timeout_secs=129, idempotent=True))
     self.assertNotEqual(
-        request_1.task_slice(0).properties_hash(request_1),
-        request_2.task_slice(0).properties_hash(request_2))
+        request_1.task_slice(0).get_properties_hash(request_1),
+        request_2.task_slice(0).get_properties_hash(request_2))
 
   def test_TaskRequest_to_proto(self):
     # Try to set as much things as possible to exercise most code paths.
@@ -1045,18 +1126,14 @@ class TaskRequestApiTest(TestCase):
     actual = swarming_pb2.TaskRequest()
     request.to_proto(actual)
     self.assertEqual(unicode(expected), unicode(actual))
-    actual = swarming_pb2.TaskRequest()
-    expected.root_task_id = grand_parent.task_id
-    expected.root_run_id = grand_parent.task_id[:-1] + u'1'
-    request.to_proto(actual, append_root_ids=True)
-    self.assertEqual(unicode(expected), unicode(actual))
 
-    # With append_root_ids=True.
     actual = swarming_pb2.TaskRequest()
-    request.to_proto(actual, append_root_ids=True)
     expected.root_task_id = grand_parent.task_id
     expected.root_run_id = grand_parent.task_id[:-1] + u'1'
-    self.assertEqual(unicode(expected), unicode(actual))
+    request.to_proto(actual, append_root_ids=True)
+
+    # Propagated via `root_task_id` property as well.
+    self.assertEqual(request.root_task_id, expected.root_run_id)
 
   def test_TaskRequest_to_proto_empty(self):
     # Assert that it doesn't throw on empty entity.
@@ -1723,14 +1800,6 @@ class TaskRequestApiTest(TestCase):
     key = task_request.convert_to_request_key(now)
     self.assertEqual(9157134072765480958, key.id())
 
-  def test_request_key_to_datetime(self):
-    key = ndb.Key(task_request.TaskRequest, 0x7f14acec2fcfffff)
-    # Resolution is only kept at millisecond level compared to
-    # datetime_to_request_base_id() by design.
-    self.assertEqual(
-        datetime.datetime(2012, 1, 2, 3, 4, 5, 123000),
-        task_request.request_key_to_datetime(key))
-
   def test_request_id_to_key(self):
     # Simple XOR.
     self.assertEqual(
@@ -1742,114 +1811,6 @@ class TaskRequestApiTest(TestCase):
     with self.assertRaises(datastore_errors.BadValueError):
       task_request.SecretBytes(secret_bytes='a' * (20 * 1024 + 1)).put()
 
-  def test_cron_delete_old_task_requests(self):
-    # Creating 1000 tasks would make this test significantly slower.
-    self.mock(task_request, '_TASKS_DELETE_CHUNK_SIZE', 5)
-
-    now = utils.utcnow()
-    task_ids = []
-    for i in range(14):
-      self.mock_now(now, i)
-      request = _gen_request_slices()
-      request.key = task_request.new_request_key()
-      request.put()
-      task_ids.append(task_pack.pack_request_key(request.key))
-
-    # Use 11 seconds offset, so that entities 12, 13 are not deleted. Yet create
-    # 3 GAE tasks to delete the chunks limited at 5 items.
-    self.mock_now(now + task_request._OLD_TASK_REQUEST_CUT_OFF, 11)
-    self.assertEqual(12, task_request.cron_delete_old_task_requests())
-    expected = [
-        (
-            ('/internal/taskqueue/cleanup/tasks/delete', 'delete-tasks'),
-            {
-                'payload': utils.encode_to_json({u'task_ids': task_ids[0:5]})
-            },
-        ),
-        (
-            ('/internal/taskqueue/cleanup/tasks/delete', 'delete-tasks'),
-            {
-                'payload': utils.encode_to_json({u'task_ids': task_ids[5:10]})
-            },
-        ),
-        (
-            ('/internal/taskqueue/cleanup/tasks/delete', 'delete-tasks'),
-            {
-                'payload': utils.encode_to_json({u'task_ids': task_ids[10:12]})
-            },
-        ),
-    ]
-    # task_ids[12:14] are not touched.
-    self.assertEqual(expected, self._enqueue_calls)
-    self._enqueue_calls = []
-
-  def test_task_delete_tasks(self):
-    # The data here should be the same as what is passed to the task queue in
-    # test_cron_delete_old_task_requests.
-    class Foo(ndb.Model):
-      pass
-
-    task_ids = []
-    for _ in range(5):
-      request = _gen_request_slices()
-      request.key = task_request.new_request_key()
-      request.put()
-      # Create a dummy child entity to ensure it's deleted too.
-      Foo(parent=request.key, id=1).put()
-      task_ids.append(task_pack.pack_request_key(request.key))
-
-    self.assertEqual(5, task_request.task_delete_tasks(task_ids))
-    self.assertEqual(0, task_request.TaskRequest.query().count())
-    self.assertEqual(0, Foo.query().count())
-
-  def test_task_bq_empty(self):
-    # Empty, nothing is done.
-    start = utils.utcnow()
-    end = start + datetime.timedelta(seconds=60)
-    self.assertEqual(0, task_request.task_bq(start, end))
-
-  def test_task_bq(self):
-
-    def getrandbits(i):
-      self.assertEqual(i, 16)
-      return 0x7766
-
-    self.mock(random, 'getrandbits', getrandbits)
-    payloads = []
-
-    def send_to_bq(table_name, rows):
-      self.assertEqual('task_requests', table_name)
-      payloads.append(rows)
-
-    self.mock(bq_state, 'send_to_bq', send_to_bq)
-
-    # Generate two tasks requests.
-    now = datetime.datetime(2014, 1, 2, 3, 4, 5, 6)
-    start = self.mock_now(now, 10)
-    request_1 = _gen_request()
-    request_1.key = task_request.new_request_key()
-    run_1_id = request_1.task_id[:-1] + '1'
-    request_1.put()
-    self.mock_now(now, 20)
-    request_2 = _gen_request(parent_task_id=run_1_id)
-    request_2.key = task_request.new_request_key()
-    request_2.put()
-    end = self.mock_now(now, 30)
-
-    self.assertEqual(2, task_request.task_bq(start, end))
-    self.assertEqual(1, len(payloads), payloads)
-    actual_rows = payloads[0]
-    self.assertEqual(2, len(actual_rows))
-    expected_ids = [
-        # No root IDs on task 1.
-        (request_1.task_id, '', ''),
-        # Task 1 is the root of Task 2.
-        (request_2.task_id, request_1.task_id, run_1_id),
-    ]
-    self.assertEqual(
-        expected_ids,
-        [(t.task_id, t.root_task_id, t.root_run_id) for _, t in actual_rows])
-
   def test_yield_request_keys_by_parent_task_id(self):
     parent_request = _gen_request()
     parent_request.key = task_request.new_request_key()
@@ -1858,7 +1819,7 @@ class TaskRequestApiTest(TestCase):
         parent_request.key)
     parent_summary_id = task_pack.pack_result_summary_key(parent_summary_key)
     parent_run_key = task_pack.result_summary_key_to_run_result_key(
-        parent_summary_key, 1)
+        parent_summary_key)
     parent_run_id = task_pack.pack_run_result_key(parent_run_key)
 
     child_request_1_key = _gen_request(parent_task_id=parent_run_id).put()
@@ -1866,7 +1827,7 @@ class TaskRequestApiTest(TestCase):
 
     it = task_request.yield_request_keys_by_parent_task_id(parent_summary_id)
     expected = [child_request_1_key, child_request_2_key]
-    self.assertEqual(sorted(expected), sorted([k for k in it]))
+    self.assertEqual(sorted(expected), sorted(list(it)))
 
   def test_normalize_or_dimensions(self):
     dim1 = _gen_request(

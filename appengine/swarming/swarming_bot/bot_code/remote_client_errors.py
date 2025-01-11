@@ -19,6 +19,10 @@ class BotCodeError(Exception):
                          % (new_zip, url, version))
 
 
+class ClaimError(Exception):
+  """Raised on unrecoverable errors in RemoteClient.claim."""
+
+
 class InternalError(Exception):
   """Raised on unrecoverable errors that abort task with 'internal error'."""
 
@@ -29,3 +33,7 @@ class PollError(Exception):
 
 class MintTokenError(Exception):
   """Raised on unrecoverable errors in RemoteClient.mint_*_token."""
+
+
+class RBEServerError(Exception):
+  """Raised on errors from Swarming RBE backend."""

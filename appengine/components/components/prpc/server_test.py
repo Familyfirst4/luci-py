@@ -3,8 +3,6 @@
 # Use of this source code is governed under the Apache License, Version 2.0
 # that can be found in the LICENSE file.
 
-# pylint: disable=unused-argument
-
 import httplib
 import json
 import sys
@@ -53,6 +51,9 @@ class TestServicer(object):
     return test_pb2.EchoResponse(response=['hello!', str(request.r.m)])
 
 
+EXCEPTION_MESSAGE = "Look at me, I'm bad."
+
+
 class BadTestServicer(object):
   """BadTestServicer implements the Test service in test.proto, but poorly."""
 
@@ -62,7 +63,7 @@ class BadTestServicer(object):
     return 5
 
   def Take(self, _request, _context):
-    raise Exception("Look at me, I'm bad.")
+    raise Exception(EXCEPTION_MESSAGE)
 
   def Echo(self, request, _context):
     return None  # no respose and no status code
@@ -101,16 +102,16 @@ class PRPCServerTestCaseBase(test_case.TestCase):
                         data=None,
                         headers='',
                         expect_errors=False):
-    return None
+    raise NotImplementedError()
 
   def get_options_response(self, app, url, headers=''):
-    return None
+    raise NotImplementedError()
 
   def get_response_body(self, response):
-    return None
+    raise NotImplementedError()
 
   def get_response_status(self, response):
-    return None
+    raise NotImplementedError()
 
   # when adding new test case please add the function as check_XXX and add it
   # check_all_test()
@@ -275,6 +276,7 @@ class PRPCServerTestCaseBase(test_case.TestCase):
     self.assertEqual(self.get_response_status(resp),
                      httplib.INTERNAL_SERVER_ERROR)
     self.check_headers(resp.headers, server_base.StatusCode.INTERNAL)
+    self.assertIn(EXCEPTION_MESSAGE, self.get_response_body(resp))
 
     req = test_pb2.EchoRequest()
     resp = self.get_post_response(
@@ -400,7 +402,7 @@ class PRPCWebapp2ServerTestCase(PRPCServerTestCaseBase):
         extra_environ={'REMOTE_ADDR': '127.0.0.1'},
     )
 
-    bad_s = webapp2_server.Webapp2Server()
+    bad_s = webapp2_server.Webapp2Server(debug=True)
     bad_s.add_service(BadTestServicer())
     real_bad_app = webapp2.WSGIApplication(bad_s.get_routes(), debug=True)
     self.bad_app = webtest.TestApp(
@@ -464,14 +466,31 @@ class InterceptorsTestCase(test_case.TestCase):
       'Content-Type': encoding.Encoding.JSON[1],
       'Accept': encoding.Encoding.JSON[1],
     })
-    raw_resp = app.post(
-        '/prpc/test.Test/Echo',
-        json.dumps({'r': {'m': m}}),
-        headers,
-        expect_errors=True)
+    raw_resp = app.post('/prpc/test.Test/Echo',
+                        json.dumps({'r': {
+                            'm': m
+                        }}),
+                        headers,
+                        expect_errors=True)
     if return_raw_resp:
       return raw_resp
     return json.loads(raw_resp.body[4:])
+
+  def test_unknown_fields_allowed(self):
+    s = TestServicer()
+    app = self.make_test_server_app(s, [])
+    headers = {}
+    headers.update({
+        'Content-Type': encoding.Encoding.JSON[1],
+        'Accept': encoding.Encoding.JSON[1],
+    })
+    app.post('/prpc/test.Test/Echo',
+             json.dumps({
+                 'r': {
+                     'm': 123
+                 },
+                 'c': 'unknown'
+             }), headers)
 
   def test_no_interceptors(self):
     s = TestServicer()
@@ -538,7 +557,7 @@ class InterceptorsTestCase(test_case.TestCase):
         return cont(request, context, details)
       except Error as exc:
         context.set_code(server_base.StatusCode.PERMISSION_DENIED)
-        context.set_details(exc.message)
+        context.set_details(str(exc))
 
     def inner(request, context, details, cont):
       raise Error('FAIL')
@@ -562,7 +581,7 @@ class PRPCFlaskServerTestCase(PRPCServerTestCaseBase):
     for route in routes:
       self.app.add_url_rule(route[0], view_func=route[1], methods=route[2])
 
-    bad_s = flask_server.FlaskServer()
+    bad_s = flask_server.FlaskServer(debug=True)
     bad_s.add_service(BadTestServicer())
     bad_s_routes = bad_s.get_routes()
     self.bad_app = flask.Flask('test_bad_app')

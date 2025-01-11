@@ -14,7 +14,9 @@ import swarming_test_env
 swarming_test_env.setup_test_env()
 
 from google.appengine.api import app_identity
+from google.appengine.ext import ndb
 
+from google.protobuf import json_format
 from protorpc.remote import protojson
 import webtest
 
@@ -31,12 +33,18 @@ import gae_ts_mon
 from test_support import test_case
 
 from proto.config import config_pb2
+from proto.config import pools_pb2
 from proto.config import realms_pb2
+from proto.plugin import plugin_pb2
+from server import bot_code
 from server import config
+from server import external_scheduler
+from server import hmac_secret
 from server import large
 from server import pools_config
 from server import realms
 from server import service_accounts
+from server import task_queues
 
 # Realm permissions used in Swarming.
 _ALL_PERMS = [
@@ -88,6 +96,9 @@ class AppTestBase(test_case.TestCase):
         'get_default_version_hostname', lambda: 'test-swarming.appspot.com')
     utils.clear_cache(config.settings)
 
+    self.mock_config_bundle_rev('1' * 64, '2' * 64)
+    self.mock_secret('hmac-secret')
+
     # Note that auth.ADMIN_GROUP != admins_group.
     auth.bootstrap_group(
         auth.ADMIN_GROUP,
@@ -99,6 +110,90 @@ class AppTestBase(test_case.TestCase):
         [auth.Identity(auth.IDENTITY_USER, 'priv@example.com')])
     auth.bootstrap_group(
         users_group, [auth.Identity(auth.IDENTITY_USER, 'user@example.com')])
+
+  def mock_secret(self, val):
+
+    class MockedSecret(object):
+
+      def access(_self):
+        return val
+
+    self.mock(hmac_secret, 'get_shared_hmac_secret', MockedSecret)
+
+  def mock_config_bundle_rev(self, stable_bot_digest, canary_bot_digest):
+    self.stable_bot_digest = stable_bot_digest
+    self.canary_bot_digest = canary_bot_digest
+
+    bot_code.ConfigBundleRev(
+        key=bot_code.config_bundle_rev_key(),
+        stable_bot=bot_code.BotArchiveInfo(
+            digest=self.stable_bot_digest,
+            chunks=['stable:1', 'stable:2'],
+            bot_config_rev='stable-rev',
+        ),
+        canary_bot=bot_code.BotArchiveInfo(
+            digest=self.canary_bot_digest,
+            chunks=['canary:1', 'canary:2'],
+            bot_config_rev='canary-rev',
+        ),
+    ).put()
+
+    put_chunk = lambda name, data: bot_code.BotArchiveChunk(
+        key=bot_code.bot_archive_chunk_key(name),
+        data=data,
+    ).put()
+
+    put_chunk('stable:1', 'stable-1234+')
+    put_chunk('stable:2', 'stable-5678')
+    put_chunk('canary:1', 'canary-1234+')
+    put_chunk('canary:2', 'canary-5678')
+
+  def mock_tq_tasks(self):
+    # Help to route TQ tasks to their implementations.
+    self.mock(utils, 'enqueue_task', self._enqueue_mock)
+    self.mock(utils, 'enqueue_task_async', self._enqueue_mock_async)
+
+  def _enqueue_mock(self, _url, queue_name, **kwargs):
+    if queue_name == 'es-notify-tasks':
+      es_host = kwargs['params']['es_host']
+      proto = plugin_pb2.NotifyTasksRequest()
+      json_format.Parse(kwargs['params']['request_json'], proto)
+      return external_scheduler.notify_request_now(es_host, proto)
+    self.assertIn(
+        queue_name,
+        ('buildbucket-notify', 'cancel-children-tasks', 'pubsub',
+         'monitoring-bq-tasks-results-run',
+         'monitoring-bq-tasks-results-summary', 'monitoring-bq-bots-events',
+         'monitoring-bq-tasks-requests', 'rbe-enqueue', 'pubsub-v2'))
+    return True
+
+  @ndb.tasklet
+  def _enqueue_mock_async(self, url, queue_name, payload, transactional=False):
+    if queue_name == 'rescan-matching-task-sets':
+      self.assertTrue(transactional)
+      self.assertTrue(ndb.in_transaction())
+
+      # Need to execute it after the transaction lands.
+      @ndb.non_transactional
+      def exec_tq():
+        task_queues.rescan_matching_task_sets_async(payload).get_result()
+
+      ndb.get_context().call_on_commit(exec_tq)
+      raise ndb.Return(True)
+
+    if queue_name == 'update-bot-matches':
+      self.assertTrue(transactional)
+      self.assertTrue(ndb.in_transaction())
+
+      # Need to execute it after the transaction lands.
+      @ndb.non_transactional
+      def exec_tq():
+        task_queues.update_bot_matches_async(payload).get_result()
+
+      ndb.get_context().call_on_commit(exec_tq)
+      raise ndb.Return(True)
+
+    self.fail(url)
 
   def set_as_anonymous(self):
     """Removes all IPs from the whitelist."""
@@ -128,6 +223,13 @@ class AppTestBase(test_case.TestCase):
     auth_testing.mock_get_current_identity(
         self, auth.Identity.from_bytes('user:' + os.environ['USER_EMAIL']))
 
+  def set_as_project(self):
+    self.set_as_anonymous()
+    self.testbed.setup_env(PROJECT='luci-project', overwrite=True)
+    auth_testing.reset_local_state()
+    auth_testing.mock_get_current_identity(
+        self, auth.Identity.from_bytes('project:' + os.environ['PROJECT']))
+
   def set_as_user(self):
     self.set_as_anonymous()
     self.testbed.setup_env(USER_EMAIL='user@example.com', overwrite=True)
@@ -140,6 +242,14 @@ class AppTestBase(test_case.TestCase):
     auth.bootstrap_ip_whitelist(auth.bots_ip_whitelist(), [self.source_ip])
     auth_testing.reset_local_state()
     auth_testing.mock_get_current_identity(self, auth.IP_WHITELISTED_BOT_ID)
+
+  def set_as_swarming_itself(self):
+    self.set_as_anonymous()
+    self.testbed.setup_env(USER_EMAIL=utils.get_service_account_name(),
+                           overwrite=True)
+    auth_testing.reset_local_state()
+    auth_testing.mock_get_current_identity(
+        self, auth.Identity.from_bytes('user:' + os.environ['USER_EMAIL']))
 
   # Web or generic
 
@@ -173,90 +283,99 @@ class AppTestBase(test_case.TestCase):
       return pools_config._PoolsCfg(
           {
               "template":
-                  pools_config.init_pool_config(
-                      name='template',
-                      rev='pools_cfg_rev',
-                      scheduling_users=frozenset([
-                          # See setUp above. We just duplicate the first ACL
-                          # layer here
-                          auth.Identity(auth.IDENTITY_USER,
-                                        'super-admin@example.com'),
-                          auth.Identity(auth.IDENTITY_USER,
-                                        'admin@example.com'),
-                          auth.Identity(auth.IDENTITY_USER, 'priv@example.com'),
-                          auth.Identity(auth.IDENTITY_USER, 'user@example.com'),
-                      ]),
-                      realm='test:pool/default',
-                      default_task_realm=default_task_realm,
-                      enforced_realm_permissions=enforced_realm_permissions or
-                      {},
-                      task_template_deployment=pools_config
-                      .TaskTemplateDeployment(
-                          prod=pools_config.TaskTemplate(
-                              cache=(),
-                              cipd_package=(pools_config.CipdPackage(
-                                  '.', 'some-pkg', 'prod-version'),),
-                              env=(pools_config.Env('VAR', 'prod', (), False),),
-                              inclusions=()),
-                          canary=pools_config.TaskTemplate(
-                              cache=(),
-                              cipd_package=(pools_config.CipdPackage(
-                                  '.', 'some-pkg', 'canary-version'),),
-                              env=(pools_config.Env('VAR', 'canary',
-                                                    (), False),),
-                              inclusions=()),
-                          canary_chance=0.5,
-                      ),
-                      default_cipd=default_cipd,
+              pools_config.init_pool_config(
+                  name='template',
+                  rev='pools_cfg_rev',
+                  scheduling_users=frozenset([
+                      # See setUp above. We just duplicate the first ACL
+                      # layer here
+                      auth.Identity(auth.IDENTITY_USER,
+                                    'super-admin@example.com'),
+                      auth.Identity(auth.IDENTITY_USER, 'admin@example.com'),
+                      auth.Identity(auth.IDENTITY_USER, 'priv@example.com'),
+                      auth.Identity(auth.IDENTITY_USER, 'user@example.com'),
+                  ]),
+                  realm='test:pool/default',
+                  default_task_realm=default_task_realm,
+                  enforced_realm_permissions=enforced_realm_permissions or {},
+                  task_template_deployment=pools_config.TaskTemplateDeployment(
+                      prod=pools_config.TaskTemplate(
+                          cache=(),
+                          cipd_package=(pools_config.CipdPackage(
+                              '.', 'some-pkg', 'prod-version'), ),
+                          env=(pools_config.Env('VAR', 'prod', (), False), ),
+                          inclusions=()),
+                      canary=pools_config.TaskTemplate(
+                          cache=(),
+                          cipd_package=(pools_config.CipdPackage(
+                              '.', 'some-pkg', 'canary-version'), ),
+                          env=(pools_config.Env('VAR', 'canary', (), False), ),
+                          inclusions=()),
+                      canary_chance=0.5,
                   ),
+                  default_cipd=default_cipd,
+                  scheduling_algorithm=(
+                      pools_pb2.Pool.SCHEDULING_ALGORITHM_UNKNOWN),
+              ),
               "default":
-                  pools_config.init_pool_config(
-                      name='default',
-                      rev='pools_cfg_rev',
-                      scheduling_users=frozenset([
-                          # See setUp above. We just duplicate the first ACL
-                          # layer here
-                          auth.Identity(auth.IDENTITY_USER,
-                                        'super-admin@example.com'),
-                          auth.Identity(auth.IDENTITY_USER,
-                                        'admin@example.com'),
-                          auth.Identity(auth.IDENTITY_USER, 'priv@example.com'),
-                          auth.Identity(auth.IDENTITY_USER, 'user@example.com'),
-                      ]),
-                      realm='test:pool/default',
-                      default_task_realm=default_task_realm,
-                      enforced_realm_permissions=enforced_realm_permissions or
-                      {},
-                      default_cipd=default_cipd,
-                  ),
+              pools_config.init_pool_config(
+                  name='default',
+                  rev='pools_cfg_rev',
+                  scheduling_users=frozenset([
+                      # See setUp above. We just duplicate the first ACL
+                      # layer here
+                      auth.Identity(auth.IDENTITY_USER,
+                                    'super-admin@example.com'),
+                      auth.Identity(auth.IDENTITY_USER, 'admin@example.com'),
+                      auth.Identity(auth.IDENTITY_USER, 'priv@example.com'),
+                      auth.Identity(auth.IDENTITY_USER, 'user@example.com'),
+                  ]),
+                  realm='test:pool/default',
+                  default_task_realm=default_task_realm,
+                  enforced_realm_permissions=enforced_realm_permissions or {},
+                  default_cipd=default_cipd,
+                  scheduling_algorithm=(
+                      pools_pb2.Pool.SCHEDULING_ALGORITHM_UNKNOWN),
+              ),
           },
           (default_cipd))
 
     self.mock(pools_config, '_fetch_pools_config', mocked_fetch_pools_config)
 
-  def mock_auth_db(self, permissions):
-    cache_mock = mock.Mock(auth_db=self.auth_db(permissions))
+  def mock_auth_db(self, permissions, pool_realm=None, task_realm=None):
+    peer_identity = auth.get_peer_identity()
+    cache_mock = mock.Mock(
+        auth_db=self.auth_db(permissions, pool_realm, task_realm),
+        peer_identity=peer_identity,
+    )
     self.mock(auth_api, 'get_request_cache', lambda: cache_mock)
 
   @staticmethod
-  def auth_db(permissions):
+  def auth_db(permissions, pool_realm=None, task_realm=None):
+    pool_realm = pool_realm or 'test:pool/default'
+    task_realm = task_realm or 'test:task_realm'
+    assert pool_realm.startswith('test:'), pool_realm
+    assert task_realm.startswith('test:'), task_realm
     return auth_api.AuthDB.from_proto(
         replication_state=auth_model.AuthReplicationState(),
         auth_db=replication_pb2.AuthDB(
             groups=[{
-                'name': 'test_users_group',
+                'name':
+                'test_users_group',
                 'members': [
                     'user:super-admin@example.com',
                     'user:admin@example.com',
                     'user:priv@example.com',
                     'user:user@example.com',
                 ],
-                'created_by': 'user:zzz@example.com',
-                'modified_by': 'user:zzz@example.com',
+                'created_by':
+                'user:zzz@example.com',
+                'modified_by':
+                'user:zzz@example.com',
             }],
             realms={
                 'api_version':
-                    auth_realms.API_VERSION,
+                auth_realms.API_VERSION,
                 'permissions': [{
                     'name': p.name
                 } for p in _ALL_PERMS],
@@ -266,26 +385,22 @@ class AppTestBase(test_case.TestCase):
                     },
                     {
                         'name':
-                            'test:pool/default',
+                        pool_realm,
                         'bindings': [{
-                            'permissions': [
-                                _ALL_PERMS.index(p) for p in permissions
-                            ],
-                            'principals': [
-                                auth.get_current_identity().to_bytes()
-                            ],
+                            'permissions':
+                            [_ALL_PERMS.index(p) for p in permissions],
+                            'principals':
+                            [auth.get_current_identity().to_bytes()],
                         }],
                     },
                     {
                         'name':
-                            'test:task_realm',
+                        task_realm,
                         'bindings': [{
-                            'permissions': [
-                                _ALL_PERMS.index(p) for p in permissions
-                            ],
-                            'principals': [
-                                auth.get_current_identity().to_bytes()
-                            ],
+                            'permissions':
+                            [_ALL_PERMS.index(p) for p in permissions],
+                            'principals':
+                            [auth.get_current_identity().to_bytes()],
                         }, {
                             'permissions': [
                                 _ALL_PERMS.index(
@@ -303,7 +418,11 @@ class AppTestBase(test_case.TestCase):
 
   # Bot
 
-  def do_handshake(self, bot='bot1', do_first_poll=False):
+  def do_handshake(self,
+                   bot='bot1',
+                   session_id='test-session',
+                   do_first_poll=False,
+                   response_copy=None):
     """Performs bot handshake, returns data to be sent to bot handlers.
 
     Also populates self.bot_version.
@@ -321,11 +440,17 @@ class AppTestBase(test_case.TestCase):
         },
         'version': '123',
     }
-    response = self.app.post_json(
-        '/swarming/api/v1/bot/handshake', params=params).json
+    if session_id:
+      params['session_id'] = session_id
+    response = self.app.post_json('/swarming/api/v1/bot/handshake',
+                                  params=params).json
+    if response_copy is not None:
+      response_copy.update(response)
     self.bot_version = response['bot_version']
+    params.pop('session_id', None)
     params['version'] = self.bot_version
-    params['state']['bot_group_cfg_version'] = response['bot_group_cfg_version']
+    if 'session' in response:
+      params['session'] = response['session']
     # A bit hackish but fine for unit testing purpose.
     if response.get('bot_config'):
       params['bot_config'] = response['bot_config']
@@ -667,7 +792,6 @@ class AppTestBase(test_case.TestCase):
             u'user:joe@localhost',
         ],
         u'task_id': u'5cee488008810',
-        u'try_number': u'0',
         u'user': u'joe@localhost',
     }
     out.update((unicode(k), v) for k, v in kwargs.items())
@@ -694,18 +818,26 @@ class AppTestBase(test_case.TestCase):
                 u'value': [u'default']
             },
         ],
-        u'bot_id': u'bot1',
-        u'bot_version': self.bot_version,
+        u'bot_id':
+        u'bot1',
+        u'bot_version':
+        self.bot_version,
         u'costs_usd': [0.0],
-        u'current_task_slice': u'0',
-        u'failure': False,
-        u'internal_failure': False,
-        u'name': u'job1',
-        u'run_id': u'5cee488008811',
+        u'current_task_slice':
+        u'0',
+        u'failure':
+        False,
+        u'internal_failure':
+        False,
+        u'name':
+        u'job1',
+        u'run_id':
+        u'5cee488008811',
         u'server_versions': [u'v1a'],
-        u'state': u'RUNNING',
-        u'task_id': u'5cee488008811',
-        u'try_number': u'1',
+        u'state':
+        u'RUNNING',
+        u'task_id':
+        u'5cee488008811'
     }
     out.update((unicode(k), v) for k, v in kwargs.items())
     return out

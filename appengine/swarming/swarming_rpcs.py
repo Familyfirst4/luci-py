@@ -7,7 +7,6 @@
 from protorpc import message_types
 from protorpc import messages
 
-from proto.jsonrpc import taskstate_pb2
 
 ### Enums
 
@@ -64,6 +63,8 @@ class TaskStateQuery(messages.Enum):
   KILLED = 12
   # Query for all tasks that are TaskState.NO_RESOURCE.
   NO_RESOURCE = 13
+  # Query for all tasks that are TaskState.CLIENT_ERROR.
+  CLIENT_ERROR = 14
 
 
 class TaskState(messages.Enum):
@@ -80,47 +81,50 @@ class TaskState(messages.Enum):
   As you read the following constants, astute readers may wonder why these
   constants look like a bitmask. This is because of historical reasons and this
   is effectively an enum, not a bitmask.
-
-  This enum is also available as a proto definition, see
-  proto/jsonrpc/taskstate.proto.
-
-  If you make any modifications to comments here, please also update
-  proto/jsonrpc/taskstate.proto.
   """
   # Invalid state, do not use.
-  INVALID = taskstate_pb2.INVALID
+  INVALID = 0x00
+
   # The task is currently running. This is in fact 3 phases: the initial
   # overhead to fetch input files, the actual task running, and the tear down
   # overhead to archive output files to the server.
-  RUNNING = taskstate_pb2.RUNNING
+  RUNNING = 0x10
+
   # The task is currently pending. This means that no bot reaped the task. It
   # will stay in this state until either a task reaps it or the expiration
   # elapsed. The task pending expiration is specified as
   # TaskSlice.expiration_secs, one per task slice.
-  PENDING = taskstate_pb2.PENDING
+  PENDING = 0x20
+
   # The task is not pending anymore, and never ran due to lack of capacity. This
   # means that other higher priority tasks ran instead and that not enough bots
   # were available to run this task for TaskSlice.expiration_secs seconds.
-  EXPIRED = taskstate_pb2.EXPIRED
+  EXPIRED = 0x30
+
   # The task ran for longer than the allowed time in
   # TaskProperties.execution_timeout_secs or TaskProperties.io_timeout_secs.
   # This means the bot forcefully killed the task process as described in the
   # graceful termination dance in the documentation.
-  TIMED_OUT = taskstate_pb2.TIMED_OUT
+  TIMED_OUT = 0x40
+
   # The task ran but the bot had an internal failure, unrelated to the task
   # itself. It can be due to the server being unavailable to get task update,
   # the host on which the bot is running crashing or rebooting, etc.
-  BOT_DIED = taskstate_pb2.BOT_DIED
+  BOT_DIED = 0x50
+
   # The task never ran, and was manually cancelled via the 'cancel' API before
   # it was reaped.
-  CANCELED = taskstate_pb2.CANCELED
+  CANCELED = 0x60
+
   # The task ran and completed normally. The task process exit code may be 0 or
   # another value.
-  COMPLETED = taskstate_pb2.COMPLETED
+  COMPLETED = 0x70
+
   # The task ran but was manually killed via the 'cancel' API. This means the
   # bot forcefully killed the task process as described in the graceful
   # termination dance in the documentation.
-  KILLED = taskstate_pb2.KILLED
+  KILLED = 0x80
+
   # The task was never set to PENDING and was immediately refused, as the server
   # determined that there is no bot capacity to run this task. This happens
   # because no bot exposes a superset of the requested task dimensions.
@@ -130,12 +134,20 @@ class TaskState(messages.Enum):
   # eventually switch to EXPIRED, as there's no bot to run it. That said, there
   # are situations where it is known that in some not-too-distant future a wild
   # bot will appear that will be able to run this task.
-  NO_RESOURCE = taskstate_pb2.NO_RESOURCE
+  NO_RESOURCE = 0x100
+
+  # The task run into an issue that was caused by the client. It can be due to
+  # a bad CIPD or CAS package. Retrying the task with the same parameters will
+  # not change the result.
+  CLIENT_ERROR = 0x200
 
 
 class TaskSort(messages.Enum):
   """Flag to sort returned tasks. The natural sort is CREATED_TS."""
-  CREATED_TS, MODIFIED_TS, COMPLETED_TS, ABANDONED_TS, STARTED_TS = range(5)
+  CREATED_TS = 0
+  COMPLETED_TS = 2
+  ABANDONED_TS = 3
+  STARTED_TS =  4
 
 
 class PoolTaskTemplateField(messages.Enum):
@@ -212,11 +224,6 @@ class ClientPermissions(messages.Message):
   cancel_tasks = messages.BooleanField(7)
   list_bots = messages.StringField(8, repeated=True)
   list_tasks = messages.StringField(9, repeated=True)
-
-
-class FileContentRequest(messages.Message):
-  """Content of a file."""
-  content = messages.StringField(1)
 
 
 class FileContent(messages.Message):
@@ -565,6 +572,9 @@ class TaskRequest(messages.Message):
   pubsub_userdata = messages.StringField(12)
   bot_ping_tolerance_secs = messages.IntegerField(14)
 
+  # RBE migration fields.
+  rbe_instance = messages.StringField(18)
+
 
 class TaskCancelRequest(messages.Message):
   """Request to cancel one task."""
@@ -669,8 +679,8 @@ class TaskResult(messages.Message):
   bot_idle_since_ts = message_types.DateTimeField(32)
   # Hash of the bot code which ran the task.
   bot_version = messages.StringField(4)
-  # List of task IDs that this task triggered, if any.
-  children_task_ids = messages.StringField(5, repeated=True)
+  # The cloud project id where the bot saves its logs.
+  bot_logs_cloud_project = messages.StringField(35)
   # Time the task completed normally. Only one of abandoned_ts or completed_ts
   # can be set except for state == KILLED.
   #
@@ -704,9 +714,6 @@ class TaskResult(messages.Message):
   state = messages.EnumField(TaskState, 19)
   # Summary task ID (ending with '0') when creating a new task.
   task_id = messages.StringField(20)
-  # Can be 0, 1 or 2. It is 0 for a deduped task, since nothing ran. It is
-  # normally 1. It is 2 if the first try had an internal failure.
-  try_number = messages.IntegerField(21)
 
   # Can be multiple values only in TaskResultSummary.
   costs_usd = messages.FloatField(22, repeated=True)
@@ -739,6 +746,12 @@ class TaskResult(messages.Message):
   # ResultDB related information.
   # None if the integration was not enabled for this task.
   resultdb_info = messages.MessageField(ResultDBInfo, 30)
+
+  # Reported missing CAS packages on CLIENT_ERROR state
+  missing_cas = messages.MessageField(CASReference, 33, repeated=True)
+
+  # Reported missing CIPD packages on CLIENT_ERROR state
+  missing_cipd = messages.MessageField(CipdPackage, 34, repeated=True)
 
 
 class TaskStates(messages.Message):

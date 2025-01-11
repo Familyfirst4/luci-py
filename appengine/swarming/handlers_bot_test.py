@@ -22,7 +22,6 @@ import test_env_handlers
 
 from google.appengine.api import datastore_errors
 from google.appengine.ext import ndb
-from google.protobuf import json_format
 
 import webapp2
 import webtest
@@ -31,7 +30,10 @@ import handlers_bot
 from components import auth
 from components import ereporter2
 from components import utils
-from proto.api import plugin_pb2
+from components.test_support import test_case
+from proto.config import bots_pb2
+from proto.config import pools_pb2
+from proto.plugin import plugin_pb2
 from server import bot_archive
 from server import bot_auth
 from server import bot_code
@@ -39,10 +41,12 @@ from server import bot_groups_config
 from server import bot_management
 from server import external_scheduler
 from server import pools_config
+from server import rbe
 from server import realms
 from server import service_accounts
 from server import task_pack
 from server import task_queues
+from server import task_scheduler
 
 
 def fmtdate(d):
@@ -69,41 +73,44 @@ class BotApiTest(test_env_handlers.AppTestBase):
         '%s, %s' % (args, kwargs)))
     # Bot API test cases run by default as bot.
     self.set_as_bot()
-    self._enqueue_task_orig = self.mock(utils, 'enqueue_task',
-                                        self._enqueue_task)
-    self._enqueue_task_async_orig = self.mock(utils, 'enqueue_task_async',
-                                              self._enqueue_task_async)
     self.now = datetime.datetime(2010, 1, 2, 3, 4, 5)
     self.mock_now(self.now)
     self.mock_default_pool_acl([])
+    self.mock_tq_tasks()
 
   def tearDown(self):
     super(BotApiTest, self).tearDown()
     mock.patch.stopall()
 
-  @ndb.non_transactional
-  def _enqueue_task(self, url, queue_name, **kwargs):
-    if queue_name == 'es-notify-tasks':
-      es_host = kwargs['params']['es_host']
-      proto = plugin_pb2.NotifyTasksRequest()
-      json_format.Parse(kwargs['params']['request_json'], proto)
-      return external_scheduler.notify_request_now(es_host, proto)
-    del kwargs
-    if queue_name in ('cancel-children-tasks', 'pubsub'):
-      return True
-    self.fail(url)
-
-  @ndb.non_transactional
-  def _enqueue_task_async(self, url, queue_name, **kwargs):
-    if queue_name == 'rebuild-task-cache':
-      # Call directly into it.
-      return task_queues.rebuild_task_cache_async(kwargs['payload'])
-    self.fail(url)
-
   def mock_bot_group_config(self, **kwargs):
-    cfg = bot_groups_config.BotGroupConfig(**kwargs)
-    self.mock(bot_auth,
-              'validate_bot_id_and_fetch_config', lambda *args, **kwargs: cfg)
+    auth_cfg = bot_groups_config.BotAuth(
+        log_if_failed=False,
+        require_luci_machine_token=True,
+        require_service_account=None,
+        require_gce_vm_token=None,
+        ip_whitelist=None,
+    )
+    kwargs = kwargs.copy()
+    kwargs['auth'] = (auth_cfg, )
+    for f in bot_groups_config.BotGroupConfig._fields:
+      if f not in kwargs:
+        kwargs[f] = None
+    group_cfg = bot_groups_config.BotGroupConfig(**kwargs)
+    self.mock(bot_auth, 'authenticate_bot', lambda *args, **kwargs:
+              (group_cfg, auth_cfg))
+    return group_cfg, auth_cfg
+
+  def mock_pool_config(self, pool, **kwargs):
+    def mocked_get_pool_config(name):
+      if name == pool:
+        return pools_config.init_pool_config(
+            name=name,
+            rev='rev',
+            scheduling_algorithm=pools_pb2.Pool.SCHEDULING_ALGORITHM_UNKNOWN,
+            **kwargs)
+      return None
+
+    self.mock(pools_config, 'get_pool_config', mocked_get_pool_config)
 
   def test_handshake(self):
     errors = []
@@ -124,6 +131,7 @@ class BotApiTest(test_env_handlers.AppTestBase):
             u'sleep_streak': 0
         },
         'version': '1',
+        'session_id': 'test-session',
     }
     response = self.app.post_json(
         '/swarming/api/v1/bot/handshake', params=params).json
@@ -131,12 +139,11 @@ class BotApiTest(test_env_handlers.AppTestBase):
         u'bot_config_name',
         u'bot_config_rev',
         u'bot_group_cfg',
-        u'bot_group_cfg_version',
         u'bot_version',
         u'server_version',
+        u'session',
     ], sorted(response))
     self.assertEqual({u'dimensions': {}}, response['bot_group_cfg'])
-    self.assertEqual('default', response['bot_group_cfg_version'])
     self.assertEqual(64, len(response['bot_version']))
     self.assertEqual(u'v1a', response['server_version'])
     self.assertEqual([], errors)
@@ -156,7 +163,6 @@ class BotApiTest(test_env_handlers.AppTestBase):
         u'bot_config_name',
         u'bot_config_rev',
         u'bot_group_cfg',
-        u'bot_group_cfg_version',
         u'bot_version',
         u'server_version',
     ], sorted(response))
@@ -199,12 +205,10 @@ class BotApiTest(test_env_handlers.AppTestBase):
         u'bot_config_name',
         u'bot_config_rev',
         u'bot_group_cfg',
-        u'bot_group_cfg_version',
         u'bot_version',
         u'server_version',
     ], sorted(response))
     self.assertEqual({u'dimensions': {}}, response['bot_group_cfg'])
-    self.assertEqual('default', response['bot_group_cfg_version'])
     self.assertEqual(64, len(response['bot_version']))
     self.assertEqual(u'v1a', response['server_version'])
     msg = (u'Quarantined Bot\n'
@@ -243,12 +247,10 @@ class BotApiTest(test_env_handlers.AppTestBase):
         u'bot_config_name',
         u'bot_config_rev',
         u'bot_group_cfg',
-        u'bot_group_cfg_version',
         u'bot_version',
         u'server_version',
     ], sorted(response))
     self.assertEqual({u'dimensions': {}}, response['bot_group_cfg'])
-    self.assertEqual('default', response['bot_group_cfg_version'])
     self.assertEqual(64, len(response['bot_version']))
     self.assertEqual(u'v1a', response['server_version'])
     msg = (u'Quarantined Bot\n'
@@ -287,7 +289,6 @@ class BotApiTest(test_env_handlers.AppTestBase):
         u'bot_config_name',
         u'bot_config_rev',
         u'bot_group_cfg',
-        u'bot_group_cfg_version',
         u'bot_version',
         u'server_version',
     ], sorted(response))
@@ -304,10 +305,11 @@ class BotApiTest(test_env_handlers.AppTestBase):
     params = self.do_handshake()
     params['state']['maintenance'] = 'very busy'
     response = self.post_json('/swarming/api/v1/bot/poll', params)
-    self.assertTrue(response.pop(u'duration'))
     expected = {
         u'cmd': u'sleep',
         u'quarantined': True,
+        u'duration': mock.ANY,
+        u'session': mock.ANY,
     }
     self.assertEqual(expected, response)
 
@@ -332,8 +334,9 @@ class BotApiTest(test_env_handlers.AppTestBase):
     expected = {
         u'cmd': u'sleep',
         u'quarantined': True,
+        u'duration': mock.ANY,
+        u'session': mock.ANY,
     }
-    self.assertTrue(response.pop(u'duration'))
     self.assertEqual(expected, response)
     expected = [
         'Quarantined Bot\n'
@@ -383,8 +386,8 @@ class BotApiTest(test_env_handlers.AppTestBase):
     self.assertEqual(expected, response)
 
   def test_poll_bad_dimensions(self):
+    ticker = test_case.Ticker(self.now)
     errors = []
-
     def add_error(request, source, message):
       self.assertTrue(request)
       self.assertEqual('bot', source)
@@ -392,13 +395,16 @@ class BotApiTest(test_env_handlers.AppTestBase):
 
     self.mock(ereporter2, 'log_request', add_error)
 
+    self.mock_now(ticker())
     params = self.do_handshake()
     params['dimensions']['foo'] = [['bar']]  # list is invalid.
+    t1 = self.mock_now(ticker())
     response = self.post_json('/swarming/api/v1/bot/poll', params)
-    self.assertTrue(response.pop(u'duration'))
     expected = {
         u'cmd': u'sleep',
         u'quarantined': True,
+        u'duration': mock.ANY,
+        u'session': mock.ANY,
     }
     self.assertEqual(expected, response)
 
@@ -419,7 +425,7 @@ class BotApiTest(test_env_handlers.AppTestBase):
         'event_type': u'request_sleep',
         'external_ip': u'192.168.2.2',
         'idle_since_ts': None,
-        'last_seen_ts': None,
+        'last_seen_ts': t1,
         'lease_expiration_ts': None,
         'lease_id': None,
         'leased_indefinitely': None,
@@ -428,18 +434,19 @@ class BotApiTest(test_env_handlers.AppTestBase):
         'maintenance_msg': None,
         'message': u"Invalid dimension value. key: foo, value: [u'bar']",
         'quarantined': True,
+        'session_id': 'test-session',
         'state': {
-            u'bot_group_cfg_version': u'default',
             u'running_time': 1234.0,
             u'sleep_streak': 0,
             u'started_ts': 1410990411.111,
         },
         'task_id': None,
-        'ts': self.now,
+        'ts': t1,
         'version': self.bot_version,
     }
     events = [
-        e.to_dict() for e in bot_management.get_events_query('bot1', True)
+        e.to_dict(exclude=['expire_at'])
+        for e in bot_management.get_events_query('bot1')
     ]
     self.assertEqual(events[0], expected_event)
 
@@ -453,22 +460,161 @@ class BotApiTest(test_env_handlers.AppTestBase):
     # A bot polls, gets nothing.
     params = self.do_handshake()
     response = self.post_json('/swarming/api/v1/bot/poll', params)
-    self.assertTrue(response.pop(u'duration'))
     expected = {
         u'cmd': u'sleep',
         u'quarantined': False,
+        u'duration': mock.ANY,
+        u'session': mock.ANY,
     }
     self.assertEqual(expected, response)
 
     # Sleep again
     params['state']['sleep_streak'] += 1
     response = self.post_json('/swarming/api/v1/bot/poll', params)
-    self.assertTrue(response.pop(u'duration'))
     expected = {
         u'cmd': u'sleep',
         u'quarantined': False,
+        u'duration': mock.ANY,
+        u'session': mock.ANY,
     }
     self.assertEqual(expected, response)
+
+  def test_poll_session_refresh(self):
+    handshake_response = {}
+    params = self.do_handshake(session_id='fake-session',
+                               response_copy=handshake_response)
+    self.assertTrue('session' in handshake_response)
+    session = handshake_response['session']
+
+    self.now += datetime.timedelta(seconds=1)
+    self.mock_now(self.now)
+
+    params['session'] = session
+    response = self.post_json('/swarming/api/v1/bot/poll', params)
+    self.assertNotEqual(session, response['session'])
+
+  def test_poll_session_expiry(self):
+    handshake_response = {}
+    params = self.do_handshake(session_id='fake-session',
+                               response_copy=handshake_response)
+    self.assertTrue('session' in handshake_response)
+    session = handshake_response['session']
+
+    self.now += datetime.timedelta(hours=2)
+    self.mock_now(self.now)
+
+    params['session'] = session
+    response = self.post_json('/swarming/api/v1/bot/poll', params)
+    self.assertEqual(
+        response, {
+            u'cmd': u'bot_restart',
+            u'message': u'Restarting because the bot session expired',
+        })
+
+  def test_poll_rbe(self):
+    self.mock_bot_group_config(
+        version='default',
+        dimensions={u'pool': [u'default']},
+        is_default=True)
+    self.mock_pool_config(
+        pool='default',
+        rbe_migration=pools_pb2.Pool.RBEMigration(
+            rbe_instance='some-instance',
+            bot_mode_allocation=[
+                {
+                    'mode': 'RBE',
+                    'percent': 100
+                },
+            ],
+        ),
+    )
+    self.mock(task_scheduler, 'exponential_backoff', lambda _: 1.23)
+
+    expected_rbe_params = {
+        u'instance': u'some-instance',
+        u'hybrid_mode': False,
+        u'sleep': 1.23,
+        u'poll_token': u'legacy-unused-field',
+    }
+
+    # A bot notifies Swarming of its existence, gets RBE parameters.
+    handshake_response = {}
+    params = self.do_handshake(response_copy=handshake_response)
+    self.assertEqual(expected_rbe_params, handshake_response['rbe'])
+
+    # A bot polls, gets RBE parameters.
+    response = self.post_json('/swarming/api/v1/bot/poll', params)
+    expected = {
+        u'cmd': u'rbe',
+        u'rbe': expected_rbe_params,
+        u'session': mock.ANY,
+    }
+    self.assertEqual(expected, response)
+
+    # The bot is idle, since it didn't report `rbe_idle`.
+    bot_info = bot_management.get_info_key('bot1').get()
+    self.assertEqual(bot_info.last_seen_ts, self.now)
+    self.assertEqual(bot_info.idle_since_ts, self.now)
+
+    self.now += datetime.timedelta(seconds=1)
+    self.mock_now(self.now)
+
+    # The bot is reporting that is it busy now.
+    params['state']['rbe_idle'] = False
+    self.post_json('/swarming/api/v1/bot/poll', params)
+
+    # It is indeed marked as busy in datastore.
+    bot_info = bot_management.get_info_key('bot1').get()
+    self.assertEqual(bot_info.last_seen_ts, self.now)
+    self.assertIsNone(bot_info.idle_since_ts)
+
+  def test_poll_rbe_in_hybrid_mode(self):
+    self.mock_bot_group_config(
+        version='default',
+        dimensions={u'pool': [u'default']},
+        is_default=True)
+    self.mock_pool_config(
+        pool='default',
+        rbe_migration=pools_pb2.Pool.RBEMigration(
+            rbe_instance='some-instance',
+            bot_mode_allocation=[
+                {
+                    'mode': 'HYBRID',
+                    'percent': 100
+                },
+            ],
+        ),
+        realm='test:pool/default',
+    )
+
+    # A bot polls and registers itself in Swarming scheduler.
+    self.set_as_bot()
+    params = self.do_handshake()
+    params['force'] = False
+    response = self.post_json('/swarming/api/v1/bot/poll', params)
+    self.assertEqual(response['cmd'], u'rbe')
+
+    # Enqueue a native Swarming task. It should be accepted, there's a bot
+    # for it.
+    self.set_as_user()
+    self.mock_auth_db([
+        auth.Permission('swarming.pools.createTask'),
+        auth.Permission('swarming.tasks.createInRealm'),
+    ])
+    _, task_id = self.client_create_task_raw(
+        properties={u'relative_cwd': u'de/ep'}, realm='test:task_realm')
+    task_id = task_id[:-1] + '1'
+
+    # A bot polls again, but still only to register itself.
+    self.set_as_bot()
+    response = self.post_json('/swarming/api/v1/bot/poll', params)
+    self.assertEqual(response['cmd'], u'rbe')
+
+    # A bot polls again asking to force-poll Swarming scheduler, gets the task.
+    params['force'] = True
+    response = self.post_json('/swarming/api/v1/bot/poll', params)
+    self.assertEqual(response['cmd'], u'run')
+    self.assertEqual(response['manifest']['task_id'], task_id)
 
   def test_poll_update(self):
     params = self.do_handshake()
@@ -483,23 +629,34 @@ class BotApiTest(test_env_handlers.AppTestBase):
 
   def test_poll_bot_group_config_change(self):
     params = self.do_handshake()
-    params['state']['bot_group_cfg_version'] = 'badversion'
+
+    # Change the bot group config after the handshake to something else.
+    self.mock_bot_group_config(version='default',
+                               dimensions={u'pool': [u'another-pool']},
+                               is_default=True)
+
     response = self.post_json('/swarming/api/v1/bot/poll', params)
     expected = {
         u'cmd': u'bot_restart',
         u'message': u'Restarting to pick up new bots.cfg config',
+        u'session': mock.ANY,
     }
     self.assertEqual(expected, response)
 
   def test_poll_bot_group_config_change_with_quarantined_flag(self):
     params = self.do_handshake()
-    params['state']['bot_group_cfg_version'] = 'badversion'
     params['state']['quarantined'] = True
+
+    # Change the bot group config after the handshake to something else.
+    self.mock_bot_group_config(version='default',
+                               dimensions={u'pool': [u'another-pool']},
+                               is_default=True)
 
     response = self.post_json('/swarming/api/v1/bot/poll', params)
     expected = {
         u'cmd': u'bot_restart',
         u'message': u'Restarting to pick up new bots.cfg config',
+        u'session': mock.ANY,
     }
     self.assertEqual(expected, response)
 
@@ -568,7 +725,13 @@ class BotApiTest(test_env_handlers.AppTestBase):
                 },
             },
             u'task_id': task_id,
+            u'bot_dimensions': {
+                'id': ['bot1'],
+                'os': ['Amiga'],
+                'pool': ['default'],
+            },
         },
+        u'session': mock.ANY,
     }
     self.assertEqual(expected, response)
 
@@ -640,7 +803,13 @@ class BotApiTest(test_env_handlers.AppTestBase):
                 },
             },
             u'task_id': task_id,
+            u'bot_dimensions': {
+                'id': ['bot1'],
+                'os': ['Amiga'],
+                'pool': ['default'],
+            },
         },
+        u'session': mock.ANY,
     }
     self.assertEqual(expected, response)
 
@@ -725,7 +894,13 @@ class BotApiTest(test_env_handlers.AppTestBase):
             },
             u'task_id':
             task_id,
+            u'bot_dimensions': {
+                'id': ['bot1'],
+                'os': ['Amiga'],
+                'pool': ['default'],
+            },
         },
+        u'session': mock.ANY,
     }
     self.assertEqual(expected, response)
 
@@ -786,7 +961,7 @@ class BotApiTest(test_env_handlers.AppTestBase):
 
     self.set_as_user()
     _, task_id = self.client_create_task_cas_input_root()
-    task_id = task_id[:-1] + '1'  # conver to run_id.
+    task_id = task_id[:-1] + '1'  # convert to run_id.
 
     self.set_as_bot()
     response = self.post_json('/swarming/api/v1/bot/poll', params)
@@ -808,7 +983,8 @@ class BotApiTest(test_env_handlers.AppTestBase):
                     u'path': u'bin',
                     u'version': u'git_revision:deadbeef',
                 }],
-                u'server': u'https://pool.config.cipd.example.com',
+                u'server':
+                u'https://pool.config.cipd.example.com',
             },
             u'command': [u'python', u'run_test.py'],
             u'containment': {
@@ -845,7 +1021,13 @@ class BotApiTest(test_env_handlers.AppTestBase):
                 },
             },
             u'task_id': task_id,
+            u'bot_dimensions': {
+                'id': ['bot1'],
+                'os': ['Amiga'],
+                'pool': ['default'],
+            },
         },
+        u'session': mock.ANY,
     }
     self.assertEqual(expected, response)
 
@@ -858,52 +1040,14 @@ class BotApiTest(test_env_handlers.AppTestBase):
         started_ts=fmtdate(self.now))
     self.assertEqual(expected, response)
 
-  def test_poll_conflicting_dimensions(self):
-    params = self.do_handshake()
-    self.assertEqual(params['dimensions']['pool'], ['default'])
-
-    self.mock_bot_group_config(
-        version='default',
-        owners=None,
-        auth=(bot_groups_config.BotAuth(
-            log_if_failed=False,
-            require_luci_machine_token=False,
-            require_service_account=None,
-            require_gce_vm_token=None,
-            ip_whitelist=None,
-        ),),
-        dimensions={u'pool': [u'server-side']},
-        bot_config_script=None,
-        bot_config_script_rev=None,
-        bot_config_script_content=None,
-        system_service_account=None,
-        is_default=True)
-
-    # Bot sends 'default' pool, but server config defined it as 'server-side'.
-    response = self.post_json('/swarming/api/v1/bot/poll', params)
-    self.assertTrue(response.pop(u'duration'))
-    expected = {
-        u'cmd': u'sleep',
-        u'quarantined': False,
-    }
-    self.assertEqual(expected, response)
-
   def test_poll_extra_bot_config(self):
     self.mock_bot_group_config(
         version='default',
-        owners=None,
-        auth=(bot_groups_config.BotAuth(
-            log_if_failed=False,
-            require_luci_machine_token=False,
-            require_service_account=None,
-            require_gce_vm_token=None,
-            ip_whitelist=None,
-        ),),
         dimensions={},
         bot_config_script='foo.py',
         bot_config_script_rev='abcd',
         bot_config_script_content='print("Hi");import sys; sys.exit(1)',
-        system_service_account=None,
+        logs_cloud_project='chrome-infra-logs',
         is_default=True)
     params = self.do_handshake()
     self.assertEqual(u'print("Hi");import sys; sys.exit(1)',
@@ -953,6 +1097,7 @@ class BotApiTest(test_env_handlers.AppTestBase):
         'duration': mock.ANY,
         'cmd': 'sleep',
         'quarantined': False,
+        'session': mock.ANY,
     }
     self.assertEqual(expected, response)
 
@@ -1080,6 +1225,125 @@ class BotApiTest(test_env_handlers.AppTestBase):
 
     res2 = self.post_json('/swarming/api/v1/bot/poll', params)
     self.assertEqual(res1, res2)
+
+  def test_claim_run(self):
+    self.mock_pool_config(
+        pool='default',
+        rbe_migration=pools_pb2.Pool.RBEMigration(
+            rbe_instance='some-instance',
+            rbe_mode_percent=100,
+        ),
+    )
+    self.mock(realms, 'check_tasks_create_in_realm', lambda *_: True)
+    self.mock(realms, 'check_pools_create_task', lambda *_: True)
+    self.mock(realms, 'check_tasks_act_as', lambda *_: True)
+
+    to_run = []
+
+    def mocked_rbe_enqueue(_request, task_to_run):
+      to_run.append(task_to_run)
+
+    self.mock(rbe, 'enqueue_rbe_task', mocked_rbe_enqueue)
+
+    self.set_as_user()
+    _, task_id = self.client_create_task_raw()
+    run_result_id = task_id[:-1] + '1'
+    self.assertEqual(len(to_run), 1)
+
+    self.set_as_bot()
+    params = self.do_handshake()
+    params[u'claim_id'] = 'some-claim-id'
+    params[u'task_id'] = task_id
+    params[u'task_to_run_shard'] = to_run[0].shard_index
+    params[u'task_to_run_id'] = to_run[0].key.id()
+    response = self.post_json('/swarming/api/v1/bot/claim', params)
+    self.assertEqual(
+        response, {
+            u'cmd': u'run',
+            u'manifest': {
+                u'bot_authenticated_as': u'bot:whitelisted-ip',
+                u'bot_dimensions': {
+                    u'id': [u'bot1'],
+                    u'os': [u'Amiga'],
+                    u'pool': [u'default']
+                },
+                u'bot_id': u'bot1',
+                u'caches': [],
+                u'cas_input_root': None,
+                u'cipd_input': {
+                    u'client_package': {
+                        u'package_name': u'infra/tools/cipd/${platform}',
+                        u'path': None,
+                        u'version': u'git_revision:deadbeef'
+                    },
+                    u'packages': [{
+                        u'package_name': u'rm',
+                        u'path': u'bin',
+                        u'version': u'git_revision:deadbeef'
+                    }],
+                    u'server':
+                    u'https://pool.config.cipd.example.com'
+                },
+                u'command': [u'python', u'run_test.py'],
+                u'containment': {
+                    u'containment_type': 2
+                },
+                u'dimensions': {
+                    u'os': [u'Amiga'],
+                    u'pool': [u'default']
+                },
+                u'env': {},
+                u'env_prefixes': {},
+                u'grace_period': 30,
+                u'hard_timeout': 3600,
+                u'host': u'http://localhost:8080',
+                u'io_timeout': 1200,
+                u'outputs': [u'foo', u'path/to/foobar'],
+                u'realm': {},
+                u'relative_cwd': None,
+                u'resultdb': None,
+                u'secret_bytes': None,
+                u'service_accounts': {
+                    u'system': {
+                        u'service_account': u'none'
+                    },
+                    u'task': {
+                        u'service_account': u'none'
+                    }
+                },
+                u'task_id': run_result_id,
+            },
+            u'session': mock.ANY,
+        })
+
+    # Submitted the bot event.
+    events = list(bot_management.get_events_query('bot1'))
+    self.assertEqual(events[-1].event_type, 'request_task')
+    self.assertEqual(events[-1].task_id, run_result_id)
+
+  def test_claim_skip(self):
+    params = self.do_handshake()
+    params[u'claim_id'] = 'some-claim-id'
+    params[u'task_id'] = '5cee400000010'  # doesn't exist
+    params[u'task_to_run_shard'] = 1
+    params[u'task_to_run_id'] = 1
+    response = self.post_json('/swarming/api/v1/bot/claim', params)
+    self.assertEqual(response, {
+        u'cmd': u'skip',
+        u'reason': u'No task slice',
+        u'session': mock.ANY,
+    })
+
+  def test_claim_bad_task_to_run(self):
+    params = self.do_handshake()
+    params[u'claim_id'] = 'some-claim-id'
+    params[u'task_id'] = '?????'
+    params[u'task_to_run_shard'] = 1
+    params[u'task_to_run_id'] = 1
+    response = self.app.post_json('/swarming/api/v1/bot/claim',
+                                  params,
+                                  expect_errors=True)
+    self.assertEqual(response.status_code, 400)
 
   def test_complete_task_cas_output_root(self):
     # Successfully poll a task.
@@ -1227,10 +1491,11 @@ class BotApiTest(test_env_handlers.AppTestBase):
         'log_request', lambda *args, **kwargs: errors.append((args, kwargs)))
     params = self.do_handshake()
     response = self.post_json('/swarming/api/v1/bot/poll', params)
-    self.assertTrue(response.pop(u'duration'))
     expected = {
         u'cmd': u'sleep',
         u'quarantined': False,
+        u'duration': mock.ANY,
+        u'session': mock.ANY,
     }
     self.assertEqual(expected, response)
 
@@ -1271,19 +1536,22 @@ class BotApiTest(test_env_handlers.AppTestBase):
         })
     response = ereporter2_app.post_json('/ereporter2/api/v1/on_error',
                                         error_params)
+    self.assertTrue('id' in response.json)
+    error_id = response.json['id']
     expected = {
-        u'id': 1,
-        u'url': u'http://localhost/restricted/ereporter2/errors/1',
+        u'id': error_id,
+        u'url': u'http://localhost/restricted/ereporter2/errors/%s' % error_id,
     }
     self.assertEqual(expected, response.json)
 
     # A bot error currently does not result in permanent quarantine. It will
     # eventually.
     response = self.post_json('/swarming/api/v1/bot/poll', params)
-    self.assertTrue(response.pop(u'duration'))
     expected = {
         u'cmd': u'sleep',
         u'quarantined': False,
+        u'duration': mock.ANY,
+        u'session': mock.ANY,
     }
     self.assertEqual(expected, response)
     self.assertEqual([], errors)
@@ -1297,10 +1565,11 @@ class BotApiTest(test_env_handlers.AppTestBase):
         'log_request', lambda *args, **kwargs: errors.append((args, kwargs)))
     params = self.do_handshake()
     response = self.post_json('/swarming/api/v1/bot/poll', params)
-    self.assertTrue(response.pop(u'duration'))
     expected = {
         u'cmd': u'sleep',
         u'quarantined': False,
+        u'duration': mock.ANY,
+        u'session': mock.ANY,
     }
     self.assertEqual(expected, response)
 
@@ -1314,10 +1583,11 @@ class BotApiTest(test_env_handlers.AppTestBase):
     # A bot error currently does not result in permanent quarantine. It will
     # eventually.
     response = self.post_json('/swarming/api/v1/bot/poll', params)
-    self.assertTrue(response.pop(u'duration'))
     expected = {
         u'cmd': u'sleep',
         u'quarantined': False,
+        u'duration': mock.ANY,
+        u'session': mock.ANY,
     }
     self.assertEqual(expected, response)
     expected = [
@@ -1331,6 +1601,9 @@ class BotApiTest(test_env_handlers.AppTestBase):
 
   def test_bot_event(self):
     self.mock(random, 'getrandbits', lambda _: 0x88)
+    ticker = test_case.Ticker(self.now)
+    ticks = []
+    ticks.append(self.mock_now(ticker()))
     params = self.do_handshake()
     dimensions = params['dimensions']
     for e in handlers_bot.BotEventHandler.ALLOWED_EVENTS:
@@ -1339,47 +1612,57 @@ class BotApiTest(test_env_handlers.AppTestBase):
         continue
       params['event'] = e
       params['message'] = 'for the best'
+      ticks.append(self.mock_now(ticker()))
       response = self.post_json('/swarming/api/v1/bot/event', params)
       self.assertEqual({}, response)
 
     # TODO(maruel): Replace with client api to query last BotEvent.
     actual = [
-        e.to_dict() for e in bot_management.get_events_query('bot1', True)
+        e.to_dict(exclude=['expire_at'])
+        for e in bot_management.get_events_query('bot1')
     ]
-    expected = [{
-        'authenticated_as': u'bot:whitelisted-ip',
-        'dimensions': dimensions,
-        'event_type': unicode(e),
-        'external_ip': u'192.168.2.2',
-        'idle_since_ts': None,
-        'last_seen_ts': None,
-        'lease_id': None,
-        'lease_expiration_ts': None,
-        'leased_indefinitely': None,
-        'machine_type': None,
-        'machine_lease': None,
-        'message': u'for the best',
-        'quarantined': False,
-        'maintenance_msg': None,
-        'state': {
-            u'bot_group_cfg_version': u'default',
-            u'running_time': 1234.0,
-            u'sleep_streak': 0,
-            u'started_ts': 1410990411.111,
-        },
-        'task_id': None,
-        'ts': self.now,
-        'version': self.bot_version,
-    }
-                for e in reversed(handlers_bot.BotEventHandler.ALLOWED_EVENTS)
-                if e != 'bot_error']
+    events_to_check = reversed([
+        event for event in handlers_bot.BotEventHandler.ALLOWED_EVENTS
+        if event != "bot_error"
+    ])
+    expected = [
+        {
+            'authenticated_as': u'bot:whitelisted-ip',
+            'dimensions': dimensions,
+            'event_type': unicode(event),
+            'external_ip': u'192.168.2.2',
+            'idle_since_ts': None,
+            'last_seen_ts': ticks[-(idx + 1)],  # see `ts` below
+            'lease_id': None,
+            'lease_expiration_ts': None,
+            'leased_indefinitely': None,
+            'machine_type': None,
+            'machine_lease': None,
+            'message': u'for the best',
+            'quarantined': False,
+            'maintenance_msg': None,
+            'session_id': u'test-session',
+            'state': {
+                u'running_time': 1234.0,
+                u'sleep_streak': 0,
+                u'started_ts': 1410990411.111,
+            },
+            'task_id': None,
+            # explanation of this index:
+            # ticks[0] is the timestamp for the bot_connected event so there
+            # will be len(ALLOWED_EVENTS)+1 in the ticks list.
+            # -(idx+1) is the same as reverse(ticks)[idx+1]
+            'ts': ticks[-(idx + 1)],
+            'version': self.bot_version,
+        } for idx, event in enumerate(events_to_check)
+    ]
     expected.append({
         'authenticated_as': u'bot:whitelisted-ip',
         'dimensions': dimensions,
         'event_type': u'bot_connected',
         'external_ip': u'192.168.2.2',
         'idle_since_ts': None,
-        'last_seen_ts': None,
+        'last_seen_ts': ticks[0],
         'lease_id': None,
         'lease_expiration_ts': None,
         'leased_indefinitely': None,
@@ -1388,13 +1671,15 @@ class BotApiTest(test_env_handlers.AppTestBase):
         'message': None,
         'quarantined': False,
         'maintenance_msg': None,
+        'session_id': u'test-session',
         'state': {
+            u'handshaking': True,
             u'running_time': 1234.0,
             u'sleep_streak': 0,
             u'started_ts': 1410990411.111,
         },
         'task_id': None,
-        'ts': self.now,
+        'ts': ticks[0],
         'version': u'123',
     })
 
@@ -1402,7 +1687,7 @@ class BotApiTest(test_env_handlers.AppTestBase):
 
   def test_bot_event_bad_request(self):
     params = self.do_handshake()
-    params['event'] = 'bot_log'
+    params['event'] = 'bot_error'
     params['message'] = 'I have an invalid maintenance message.'
     params['state']['maintenance'] = True  # non-string maintenance message.
     self.post_json('/swarming/api/v1/bot/event', params, status=400)
@@ -1607,6 +1892,10 @@ class BotApiTest(test_env_handlers.AppTestBase):
         'id': params['dimensions']['id'][0],
         'message': 'Oh',
         'task_id': task_id,
+        'client_error': {
+            'missing_cas': None,
+            'missing_cipd': [],
+        },
     }
     self.post_json('/swarming/api/v1/bot/task_error', params)
 
@@ -1700,50 +1989,53 @@ class BotApiTest(test_env_handlers.AppTestBase):
     response = self.client_get_results(task_id)
     self.assertEqual(expected, response)
 
-  def test_bot_code_as_bot(self):
-    self.mock(bot_code, 'get_bot_version', lambda _: ('0' * 64, None, 'rev1'))
-    code = self.app.get('/swarming/api/v1/bot/bot_code/' + '0' * 64)
-    expected = {'config/bot_config.py',
-                'config/config.json'}.union(bot_archive.FILES)
-    with zipfile.ZipFile(StringIO.StringIO(code.body), 'r') as z:
-      self.assertEqual(expected, set(z.namelist()))
+  def test_bot_code_known(self):
+    resp = self.app.get('/swarming/api/v1/bot/bot_code/' +
+                        self.stable_bot_digest)
+    self.assertEqual(resp.status_int, 200)
+    self.assertEqual(resp.body, 'stable-1234+stable-5678')
+    resp = self.app.get('/swarming/api/v1/bot/bot_code/' +
+                        self.canary_bot_digest)
+    self.assertEqual(resp.status_int, 200)
+    self.assertEqual(resp.body, 'canary-1234+canary-5678')
 
-  def test_bot_code_as_bot_query_string(self):
-    self.mock(bot_code, 'get_bot_version', lambda _: ('0' * 64, None, 'rev1'))
-    self.app.get(
-        '/swarming/api/v1/bot/bot_code/' + '0' * 64 + '?bot_id=1', status=302)
+  def test_bot_code_strips_query(self):
+    resp = self.app.get('/swarming/api/v1/bot/bot_code/' +
+                        self.stable_bot_digest + '?q=123')
+    self.assertEqual(resp.status_int, 302)  # Found
+    self.assertEqual(
+        resp.location, 'http://localhost/swarming/api/v1/bot/bot_code/' +
+        self.stable_bot_digest)
 
-  def test_bot_code_without_token(self):
+  def test_bot_code_default_no_token(self):
     self.set_as_anonymous()
     self.app.get('/bot_code', status=403)
 
-  def test_bot_code_with_token(self):
-    self.mock(bot_code, 'get_bot_version', lambda _: ('0' * 64, None, 'rev1'))
+  def test_bot_code_default_with_token(self):
     self.set_as_anonymous()
     tok = bot_code.generate_bootstrap_token()
-    self.app.get('/bot_code?tok=%s' % tok, status=302)
-
-  def test_bot_code_redirect(self):
-    self.mock(bot_code, 'get_bot_version', lambda _: ('0' * 64, None, 'rev1'))
-    response = self.app.get('/bot_code')
-    self.assertEqual(response.status_int, 302)  # Found
+    resp = self.app.get('/bot_code?tok=%s' % tok)
+    self.assertEqual(resp.status_int, 302)
     self.assertEqual(
-        response.location,
-        'http://localhost/swarming/api/v1/bot/bot_code/' + '0' * 64)
+        resp.location, 'http://localhost/swarming/api/v1/bot/bot_code/' +
+        self.stable_bot_digest)
 
-  def test_bot_code_wrong_version(self):
-    self.mock(bot_code, 'get_bot_version', lambda _: ('0' * 64, None, 'rev1'))
-    response = self.app.get(
-        '/swarming/api/v1/bot/bot_code/' + '1' * 64,
-        headers={'X-Luci-Swarming-Bot-ID': 'bot1'})
-    self.assertEqual(response.status_int, 302)  # Found
-    self.assertEqual(response.location, 'http://localhost/bot_code?bot_id=bot1')
+  def test_bot_code_default_with_bot_auth(self):
+    self.set_as_bot()
+    resp = self.app.get('/bot_code')
+    self.assertEqual(resp.status_int, 302)
+    self.assertEqual(
+        resp.location, 'http://localhost/swarming/api/v1/bot/bot_code/' +
+        self.stable_bot_digest)
 
-  def test_bot_code_wrong_version_without_bot_id(self):
-    self.mock(bot_code, 'get_bot_version', lambda _: ('0' * 64, None))
-    response = self.app.get('/swarming/api/v1/bot/bot_code/' + '1' * 64)
-    self.assertEqual(response.status_int, 302)  # Found
-    self.assertEqual(response.location, 'http://localhost/bot_code')
+  def test_bot_code_unknown_with_bot_auth(self):
+    self.set_as_bot()
+    unknown = '3' * 64
+    resp = self.app.get('/swarming/api/v1/bot/bot_code/' + unknown)
+    self.assertEqual(resp.status_int, 302)
+    self.assertEqual(
+        resp.location, 'http://localhost/swarming/api/v1/bot/bot_code/' +
+        self.stable_bot_digest)
 
   FAKE_BOT_ID = 'bot1'
   FAKE_SCOPES = ['scope_a', 'scope_b']
@@ -1943,22 +2235,10 @@ class BotApiTest(test_env_handlers.AppTestBase):
                                 expected_kind, expected_scopes,
                                 expected_audience):
     self.set_as_bot()
-    self.mock_bot_group_config(
-        version='default',
-        owners=None,
-        auth=(bot_groups_config.BotAuth(
-            log_if_failed=False,
-            require_luci_machine_token=False,
-            require_service_account=None,
-            require_gce_vm_token=None,
-            ip_whitelist=None,
-        ),),
-        dimensions={},
-        bot_config_script=None,
-        bot_config_script_rev=None,
-        bot_config_script_content=None,
-        system_service_account='system@example.com',
-        is_default=True)
+    self.mock_bot_group_config(version='default',
+                               dimensions={},
+                               system_service_account='system@example.com',
+                               is_default=True)
 
     calls = []
 

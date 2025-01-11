@@ -2,6 +2,8 @@ export SHELL = /bin/bash
 export PATH := $(CURDIR)/nodejs/bin:$(PATH)
 export npm_config_cache := $(CURDIR)/.npm
 
+files_no_dist := $(shell git ls-files "[^dist]*.js")
+
 .ONESHELL:
 
 default: _packages-lock.json.done
@@ -11,7 +13,10 @@ release: _packages-lock.json.done
 	npx webpack --mode=production
 
 serve: _packages-lock.json.done
-	npx webpack-dev-server --mode=development --watch-poll
+	npx webpack-dev-server --mode=development
+
+live_demo: _packages-lock.json.done
+	npx webpack-dev-server --mode=development --env=demo_type=live
 
 test: _packages-lock.json.done
 	npx karma start
@@ -22,7 +27,7 @@ browser_test:
 	# tests there, seeing the results. Unfortunately, due to how karma needs to
 	# concatenate the _test.js files and run them through webpack, it doesn't
 	# autodetect changes and needs to be re-run manually :(
-	npx karma start --no-single-run
+	npx karma start --single-run=false --auto-watch=true
 
 continuous_test:
 	# Good for debugging/developing tests.
@@ -34,7 +39,8 @@ continuous_test:
 	done
 
 format: _packages-lock.json.done
-	git ls-files "[^dist]*.js" | xargs npx eslint --fix --quiet
+	npx prettier --write $(files_no_dist)
+	npx eslint --fix --quiet $(files_no_dist)
 
 _packages-lock.json.done: package-lock.json
 	npm ci

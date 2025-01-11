@@ -201,6 +201,10 @@ class AdbCommandsSafe(object):
     return bool(self._adb_cmd)
 
   @property
+  def has_handle(self):
+    return bool(self._handle)
+
+  @property
   def failure(self):
     return self._failure
 
@@ -480,6 +484,10 @@ class AdbCommandsSafe(object):
     self._handle.Reset(new_endpoint=new_endpoint)
     return self._Connect(False)
 
+  def ReconnectViaSerial(self):
+    """Reconnects to the device using the device serial."""
+    self._Reconnect(True)
+
   def Shell(self, cmd, timeout_ms=None):
     """Runs a command on an Android device while swallowing exceptions.
 
@@ -662,7 +670,7 @@ class AdbCommandsSafe(object):
     for i in self._Loop():
       try:
         out = self._adb_cmd.Reboot()
-      except usb_exceptions.ReadFailedError:
+      except (usb_exceptions.ReadFailedError, adb_protocol.InvalidResponseError):
         # It looks like it's possible that adbd restarts the device so fast that
         # it close the USB connection before adbd has the time to reply (yay for
         # race conditions). In that case there's no way to know if the command

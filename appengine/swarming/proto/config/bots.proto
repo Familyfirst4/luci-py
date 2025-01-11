@@ -153,6 +153,41 @@ message BotGroup {
   //
   // If not set, bots will not use authentication at all.
   string system_service_account = 24;
+
+  // The cloud project id where the bot saves its logs.
+  // For GCE bots, it is the same cloud project where the bots reside.
+  // For non-GCE bots, it is the cloud project where the logs are being sent to.
+  string logs_cloud_project = 27;
+
+  // Settings controlling migration to the RBE Scheduler.
+  //
+  // They are used only if all pools the bot belongs to are associated with an
+  // RBE instance, and it is the same instance for all pools.
+  //
+  // TODO(vadimsh): Remove when no longer used. Replace by BotModeAllocation in
+  // Pool.RBEMigration.
+  message RBEMigration {
+    // Approximate percent of bots in this bot group to switch to the RBE mode.
+    //
+    // A bot is in the RBE mode if `hash(bot_id) % 100 <= rbe_mode_percent`.
+    int32 rbe_mode_percent = 1;
+    // Bots to put into the RBE mode regardless of `rbe_mode_percent`.
+    //
+    // Useful to force the RBE mode on a particular bot.
+    repeated string enable_rbe_on = 2;
+    // Bots to exclude from the RBE mode regardless of `rbe_mode_percent`.
+    //
+    // Useful to exclude problematic bots from the RBE mode.
+    repeated string disable_rbe_on = 3;
+    // If true consume tasks from both Swarming and RBE schedulers at the same
+    // time (in an interleaved kind of way).
+    //
+    // Useful when migrating small bot pools. In this mode task ordering and
+    // priority may not be respected (if tasks end up in different schedulers)
+    // and there may be higher scheduling delays.
+    bool hybrid_mode = 4;
+  }
+  RBEMigration rbe_migration = 28;
 }
 
 

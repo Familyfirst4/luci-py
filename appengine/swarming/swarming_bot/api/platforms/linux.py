@@ -26,6 +26,9 @@ from api.platforms import gpu
 
 ## Private stuff.
 
+_RESOLUTION_REGEX = re.compile(
+    r' connected primary (?P<horizontal>\d+)x(?P<vertical>\d+)\+')
+
 
 libc = ctypes.cdll.LoadLibrary(ctypes.util.find_library('c'))
 
@@ -98,9 +101,9 @@ def _get_nvidia_version():
 
 
 @tools.cached
-def _get_intel_version():
-  """Retrieves the Mesa DRI driver version, which is usable as the Intel GPU
-  driver version.
+def _get_mesa_version():
+  """Retrieves the Mesa DRI driver version, which is usable as the Intel and AMD
+  GPU driver versions.
   """
   try:
     out = subprocess.check_output(['dpkg', '-s', 'libgl1-mesa-dri']).decode()
@@ -115,8 +118,11 @@ def _get_intel_version():
 
 
 def _read_cpuinfo():
-  with open('/proc/cpuinfo', 'r') as f:
-    return f.read()
+  try:
+    with open('/proc/cpuinfo', 'r') as f:
+      return f.read()
+  except (IOError, OSError):
+    return ''
 
 
 def _read_cgroup():
@@ -203,14 +209,19 @@ def get_cpuinfo():
     # MIPS.
     cpu_info['flags'] = values['isa']
     cpu_info['name'] = values['cpu model']
-  else:
+  elif "POWER" in values.get('cpu', ''):
+    # ppc64/ppc64le
+    cpu_info['name'] = values.get('cpu', '').split(' ')[0]
+  elif values:
     # CPU implementer == 0x41 means ARM.
-    cpu_info['flags'] = values['Features']
-    cpu_info['model'] = (
-        int(values['CPU variant'], 0),
-        int(values['CPU part'], 0),
-        int(values['CPU revision']),
-    )
+    if 'Features' in values:
+      cpu_info['flags'] = values['Features']
+    if 'CPU variant' in values:
+      cpu_info['model'] = (
+          int(values['CPU variant'], 0),
+          int(values.get('CPU part', 0), 0),
+          int(values.get('CPU revision', 0)),
+      )
     # ARM CPUs have a serial number embedded. Intel did try on the Pentium III
     # but gave up after backlash;
     # http://www.wired.com/1999/01/intel-on-privacy-whoops/
@@ -235,7 +246,8 @@ def get_cpuinfo():
                           or 'N/A')
 
   # http://unix.stackexchange.com/questions/43539/what-do-the-flags-in-proc-cpuinfo-mean
-  cpu_info['flags'] = sorted(i for i in cpu_info['flags'].split())
+  if 'flags' in cpu_info:
+    cpu_info['flags'] = sorted(i for i in cpu_info['flags'].split())
   return cpu_info
 
 
@@ -271,12 +283,11 @@ def get_gpu():
     dev_name = device.group(1)
     dev_id = device.group(2)
 
-    # TODO(maruel): Implement for AMD once needed.
     version = ''
     if ven_id == gpu.NVIDIA:
       version = _get_nvidia_version()
-    elif ven_id == gpu.INTEL:
-      version = _get_intel_version()
+    elif ven_id in (gpu.INTEL, gpu.AMD):
+      version = _get_mesa_version()
     ven_name, dev_name = gpu.ids_to_names(ven_id, ven_name, dev_id, dev_name)
 
     dimensions.add(ven_id)
@@ -308,6 +319,64 @@ def get_reboot_required():
   which is not set for all conditions requiring reboot.
   """
   return os.path.exists('/var/run/reboot-required')
+
+
+def is_display_attached():
+  """Returns whether a display is attached to the machine or not.
+
+  Returns:
+    None, True, or False. It is None when the presence of a display cannot be
+    determined, and a bool otherwise returning whether a display is attached.
+  """
+  try:
+    # Since this uses xrandr, an alternative method will need to be added
+    # whenever Wayland is planned to be used for testing.
+    out = subprocess.check_output(['xrandr', '--display', ':0.0', '--query'],
+                                  universal_newlines=True)
+  except (OSError, subprocess.CalledProcessError) as e:
+    # Could happen when the host is shutting down or lshw is not available
+    # for some reason.
+    logging.error('is_display_attached(): %s', e)
+    return None
+
+  # When a display is properly attached, there should be a monitor listed as
+  # connected and set as primary.
+  for line in out.splitlines():
+    if ' connected primary ' in line:
+      return True
+  return False
+
+
+def get_display_resolution():
+  """Gets the resolution of the attached display.
+
+  Returns:
+    None or a tuple (horizontal, vertical). It is None when the resolution
+    cannot be determined, e.g. if a display is not attched. Otherwise,
+    |horizontal| and |vertical| are ints specifying the horizontal and vertical
+    resolution of the display.
+  """
+  try:
+    # Since this uses xrandr, an alternative method will need to be added
+    # whenever Wayland is planned to be used for testing.
+    out = subprocess.check_output(['xrandr', '--display', ':0.0', '--query'],
+                                  universal_newlines=True)
+  except (OSError, subprocess.CalledProcessError) as e:
+    # Could happen when the host is shutting down or xrandr is not available
+    # for some reason.
+    logging.error('get_display_resolution(): %s', e)
+    return None
+
+  # When a display is properly attached, there should be a monitor listed as
+  # connected and set as primary with the current resolution, e.g.
+  #   DisplayPort-2 connected primary 2560x1440+0+518 (normal...
+  for line in out.splitlines():
+    match = _RESOLUTION_REGEX.search(line)
+    if not match:
+      continue
+    return int(match.group('horizontal')), int(match.group('vertical'))
+
+  return None
 
 
 @tools.cached

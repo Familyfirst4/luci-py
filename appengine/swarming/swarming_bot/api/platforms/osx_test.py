@@ -236,6 +236,42 @@ class TestOsx(unittest.TestCase):
                        ], ['AMD Radeon RX 560', 'Intel UHD Graphics 630']),
                      gpus)
 
+  def test_get_gpu_apple_m2(self):
+    # Copied from actual output of 'system_profiler SPDisplaysDataType -xml' on
+    # a Macbook Pro M2 with irrelevant elements removed.
+    plist = textwrap.dedent("""\
+    <?xml version="1.0" encoding="UTF-8"?>
+    <plist version="1.0">
+    <array>
+      <dict>
+        <key>_items</key>
+        <array>
+          <dict>
+            <key>_name</key>
+            <string>Apple M2</string>
+            <key>spdisplays_mtlgpufamilysupport</key>
+            <string>spdisplays_metal3</string>
+            <key>spdisplays_vendor</key>
+            <string>sppci_vendor_Apple</string>
+            <key>sppci_bus</key>
+            <string>spdisplays_builtin</string>
+            <key>sppci_cores</key>
+            <string>10</string>
+            <key>sppci_device_type</key>
+            <string>spdisplays_gpu</string>
+            <key>sppci_model</key>
+            <string>Apple M2</string>
+          </dict>
+        </array>
+      </dict>
+    </array>
+    </plist>""").encode()
+
+    self.mock_check_output.side_effect = [plist]
+
+    gpus = osx.get_gpu()
+    self.assertEqual((['apple', 'apple:m2'], ['apple m2']), gpus)
+
   def test_get_cpuinfo(self):
     self.mock_check_output.return_value = textwrap.dedent("""\
         machdep.cpu.max_basic: 22
@@ -498,6 +534,22 @@ class TestOsx(unittest.TestCase):
     # being able to determine one way or the other.
     display_attached = osx.is_display_attached()
     self.assertIsNotNone(display_attached)
+
+  def test_get_display_resolution(self):
+    # The display resolution is going to be dependent on hardware, but we can
+    # at least ensure that we don't hit any errors.
+    resolution = osx.get_display_resolution()
+    self.assertIsNotNone(resolution)
+    self.assertIsInstance(resolution, tuple)
+    self.assertEqual(len(resolution), 2)
+    self.assertIsInstance(resolution[0], int)
+    self.assertIsInstance(resolution[1], int)
+
+  def test_get_thermal_state(self):
+    # The thermal state is going to be dependent on the specific machine, but
+    # we *some* valid state.
+    thermal_state = osx.get_thermal_state()
+    self.assertIsInstance(thermal_state, str)
 
 
 if __name__ == '__main__':

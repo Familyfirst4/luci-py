@@ -58,6 +58,10 @@ _ADB_KEYS = None
 # keys.
 _ADB_KEYS_PUB = set()
 
+# Grabs the key/value pair list from lines such as:
+# Temperature{mValue=25.6, mType=0, mName=AP, mStatus=0}
+_THERMALSERVICE_TEMPERATURE_REGEX = re.compile(r'^Temperature\{(.*)\}$')
+
 
 class _PerDeviceCache(object):
   """Caches data per device, thread-safe."""
@@ -336,7 +340,7 @@ def GetLocalDevices(
 
 
 def GetRemoteDevices(banner, endpoints, default_timeout_ms, auth_timeout_ms,
-                     on_error=None, as_root=False):
+                     on_error=None, as_root=False, allow_missing_keys=False):
   """Returns the list of devices available.
 
   Caller MUST call CloseDevices(devices) on the return value or call .Close() on
@@ -350,13 +354,15 @@ def GetRemoteDevices(banner, endpoints, default_timeout_ms, auth_timeout_ms,
   - auth_timeout_ms: timeout for the user to accept the public key.
   - on_error: callback when an internal failure occurs.
   - as_root: if True, restarts adbd as root if possible.
+  - allow_missing_keys: if True, attempt to connect even if _ADB_KEYS is not
+        set.
 
   Returns one of:
     - list of HighDevice instances.
     - None if adb is unavailable.
   """
   with _ADB_KEYS_LOCK:
-    if not _ADB_KEYS:
+    if not (_ADB_KEYS or allow_missing_keys):
       return []
   # Create unopened handles for all remote devices.
   handles = [common.TcpHandle(endpoint) for endpoint in endpoints]
@@ -627,6 +633,13 @@ class HighDevice(object):
 
   def GetTemperatures(self):
     """Returns the device's temperatures if available as a dict."""
+    temperature_data = self._GetTemperaturesFromSysFiles()
+    if not temperature_data:
+      temperature_data = self._GetTemperaturesFromThermalService()
+    return temperature_data
+
+  def _GetTemperaturesFromSysFiles(self):
+    """Helper to get temperatures from /sys/ files."""
     # Not all devices export these files. On other devices, the only real way to
     # read it is via Java
     # developer.android.com/guide/topics/sensors/sensors_environment.html
@@ -667,6 +680,24 @@ class HighDevice(object):
         out[sensor_type.strip()] = value
     # Filter out unnecessary stuff.
     return out
+
+  def _GetTemperaturesFromThermalService(self):
+    """Helper to get temperatures from dumpsys thermalservice."""
+    temperature_data = {}
+    # dumpsys thermalservice is only expected to work on Android 10 and above.
+    if int(self.cache.build_props.get('ro.build.version.sdk', 0)) < 29:
+      return temperature_data
+
+    dumpsys_output = self.Dumpsys('thermalservice')
+    if not dumpsys_output:
+      _LOG.error(
+          'Failed to run "dumpsys thermalservice" during fallback temperature '
+          'collection')
+      return temperature_data
+
+    temperature_data = _ParseThermalServiceOutput(dumpsys_output)
+
+    return temperature_data
 
   def GetBattery(self):
     """Returns details about the battery's state."""
@@ -947,6 +978,36 @@ class HighDevice(object):
         return False
       time.sleep(1)
 
+  def WaitUntilFullyBootedWithResets(
+      self, num_attempts=5, per_attempt_timeout=60, **kwargs):
+    """Run WaitUntilFullyBooted multiple times, resetting between attempts.
+
+    This should be functionally similar to WaitUntilFullyBooted, but more likely
+    to resolve connection issues rather than hang for the entire duration.
+
+    Args:
+      num_attempts: How many times WaitUntilFullyBooted will be run.
+      per_attempt_timeout: The timeout in seconds for each wait attempt.
+
+    Returns:
+      True if the device is fully booted, otherwise False.
+    """
+    for attempt in range(num_attempts):
+      booted = self.WaitUntilFullyBooted(per_attempt_timeout, **kwargs)
+      if booted:
+        _LOG.info('Device fully booted on attempt %d', attempt)
+        return True
+      if attempt < num_attempts - 1:
+        _LOG.warning(
+            'Device not fully booted on attempt %d, resetting connection',
+            attempt)
+      if self._device.has_handle:
+        self.Reset()
+      else:
+        # Connection is gone, find the new port by device serial.
+        self._device.ReconnectViaSerial()
+    return False
+
   def PushKeys(self):
     """Pushes all the keys on the file system to the device.
 
@@ -1052,3 +1113,67 @@ class HighDevice(object):
         kwargs['rsa_keys'] = _ADB_KEYS[:]
     device = constructor(**kwargs)
     return HighDevice(device, _InitCache(device))
+
+
+def _ParseThermalServiceOutput(output):
+  """Helper to parse the output of 'dumpsys thermalservice'
+
+  Args:
+    output: A string containing the output of 'dumpsys thermalservice'
+
+  Returns:
+    A dict mapping sensor names (strings) to sensor values (floats). May be
+    empty if data cannot be extracted for any reason.
+  """
+  temperature_data = {}
+
+  # Parse the temperature data from the block of lines such as:
+  # Current temperatures from HAL:
+  #      Temperature{mValue=25.6, mType=0, mName=AP, mStatus=0}
+  #      Temperature{mValue=23.8, mType=2, mName=BAT, mStatus=0}
+  #      ...
+  in_temperature_block = False
+  for line in output.splitlines():
+    line = line.strip()
+    # Ignore any blank lines.
+    if not line:
+      continue
+    if line.startswith('Current temperatures'):
+      in_temperature_block = True
+      continue
+    if not in_temperature_block:
+      continue
+
+    if not line.startswith('Temperature{'):
+      break
+
+    match = _THERMALSERVICE_TEMPERATURE_REGEX.match(line)
+    if not match:
+      _LOG.error('Unable to find expected temperature data in line %r',
+                 line)
+      continue
+    key_value_list = match.group(1)
+    sensor_name = None
+    sensor_value = None
+    for key_value_pair in key_value_list.split(','):
+      key_value_pair = key_value_pair.strip()
+      key, value = key_value_pair.split('=', maxsplit=1)
+      if key == 'mValue':
+        try:
+          sensor_value = float(value)
+        except ValueError:
+          _LOG.error('Unable to parse float from %r', value)
+          break
+      elif key == 'mName':
+        sensor_name = value
+
+    # This will also drop the data if the sensor value is 0, which is what we
+    # want since that's indicative of the sensor not providing useful data. This
+    # can happen during normal operation.
+    if sensor_name and sensor_value:
+      temperature_data[sensor_name] = sensor_value
+
+  if not temperature_data:
+    _LOG.warning('Did not find any data using fallback temperature path')
+
+  return temperature_data

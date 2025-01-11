@@ -175,7 +175,10 @@ def _taskproperties_to_rpc(props):
 def _taskslice_from_rpc(msg):
   """Converts a swarming_rpcs.TaskSlice to a task_request.TaskSlice."""
   props, secret_bytes = _taskproperties_from_rpc(msg.properties)
-  out = _rpc_to_ndb(task_request.TaskSlice, msg, properties=props)
+  out = _rpc_to_ndb(task_request.TaskSlice,
+                    msg,
+                    properties=props,
+                    properties_hash=None)
   return out, secret_bytes
 
 
@@ -309,11 +312,15 @@ def new_task_request_from_rpc(msg, now):
       tags=None,
       manual_tags=msg.tags,
       # This is internal field not settable via RPC.
+      root_task_id=None,
       realms_enabled=None,
       resultdb_update_token=None,
       resultdb=resultdb,
       pool_task_template=None,  # handled out of band
-      has_build_token=False)
+      has_build_task=False,
+      scheduling_algorithm=None,
+      rbe_instance=None,
+      txn_uuid=None)
 
   return req, secret_bytes, template_apply
 
@@ -344,6 +351,22 @@ def task_result_to_rpc(entity, send_stats):
         hostname=entity.resultdb_info.hostname,
         invocation=entity.resultdb_info.invocation,
     )
+
+  missing_cas = None
+  if entity.missing_cas:
+    missing_cas = []
+    for pkg in entity.missing_cas:
+      digest = _ndb_to_rpc(swarming_rpcs.Digest, pkg.digest)
+      missing_cas.append(
+          _ndb_to_rpc(swarming_rpcs.CASReference, pkg, digest=digest)
+      )
+
+  missing_cipd = None
+  if entity.missing_cipd:
+    missing_cipd = [
+      _ndb_to_rpc(swarming_rpcs.CipdPackage, pkg)
+      for pkg in entity.missing_cipd
+    ]
 
   performance_stats = None
   if send_stats and entity.performance_stats.is_valid:
@@ -382,6 +405,10 @@ def task_result_to_rpc(entity, send_stats):
           swarming_rpcs.TaskState(entity.state),
       'resultdb_info':
           resultdb_info,
+      'missing_cas':
+          missing_cas,
+      'missing_cipd':
+          missing_cipd,
   }
   if entity.__class__ is task_result.TaskRunResult:
     kwargs['costs_usd'] = []

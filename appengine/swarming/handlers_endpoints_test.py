@@ -99,23 +99,9 @@ class BaseTest(test_env_handlers.AppTestBase, test_case.EndpointsTestCase):
         '%s, %s' % (args, kwargs)))
     # Client API test cases run by default as user.
     self.set_as_user()
-    self.mock(utils, 'enqueue_task', self._enqueue_task)
-    self.mock(utils, 'enqueue_task_async', self._enqueue_task_async)
     self.now = datetime.datetime(2010, 1, 2, 3, 4, 5)
     self.mock_now(self.now)
-
-  @ndb.non_transactional
-  def _enqueue_task(self, url, queue_name, **kwargs):
-    del kwargs
-    if queue_name in ('cancel-children-tasks', 'pubsub'):
-      return True
-    self.fail(url)
-
-  @ndb.non_transactional
-  def _enqueue_task_async(self, url, queue_name, payload):
-    if queue_name == 'rebuild-task-cache':
-      return task_queues.rebuild_task_cache_async(payload)
-    self.fail(url)
+    self.mock_tq_tasks()
 
 
 class ServerApiTest(BaseTest):
@@ -130,15 +116,11 @@ class ServerApiTest(BaseTest):
 
     expected = {
         u'bot_version':
-            unicode(bot_code.get_bot_version('https://testbed.example.com')[0]),
-        u'display_server_url_template':
-            u'',
-        u'luci_config':
-            u'a.server',
-        u'server_version':
-            unicode(utils.get_app_version()),
-        u'cas_viewer_server':
-            u'https://test-cas-viewer-server.com',
+        unicode(bot_code.get_bot_version(bot_code.STABLE_BOT)[0]),
+        u'display_server_url_template': u'',
+        u'luci_config': u'a.server',
+        u'server_version': unicode(utils.get_app_version()),
+        u'cas_viewer_server': u'https://test-cas-viewer-server.com',
     }
     self.assertEqual(expected, response.json)
 
@@ -667,8 +649,7 @@ class TasksApiTest(BaseTest):
             u'swarming.pool.template:none',
             u'swarming.pool.version:pools_cfg_rev',
             u'user:joe@localhost',
-        ],
-        try_number=u'1')
+        ])
     t_request = self.gen_request(
         created_ts=fmtdate(self.now),
         properties=self.gen_props(
@@ -1138,7 +1119,7 @@ class TasksApiTest(BaseTest):
     resp = self.call_api('new', body=message_to_dict(request), status=400)
     expected = {
         u'error': {
-            u'message': u'expiration_secs (0) must be between 1s and 7 days',
+            u'message': u'expiration_secs (0) must be between 1s and 604800s',
         },
     }
     self.assertEqual(expected, resp.json)
@@ -1255,8 +1236,6 @@ class TasksApiTest(BaseTest):
       # Time advanced since the evaluate_only call.
       expected['request']['created_ts'] = fmtdate(self.now)
       self.assertEqual(expected, response.json)
-      # schedule_request should not be called this time.
-      self.assertFalse(mock_schedule_request.called)
 
   def test_new_denied_pool(self):
     # Ensures that quality check is done early enough that a 400 and not an 500
@@ -1710,14 +1689,6 @@ class TasksApiTest(BaseTest):
     },
                      self.call_api('list', body=message_to_dict(request)).json)
 
-    # Both sort and tag.
-    request = handlers_endpoints.TasksRequest.combined_message_class(
-        end=end,
-        start=start,
-        tags=['commit:pre'],
-        sort=swarming_rpcs.TaskSort.MODIFIED_TS,
-        state=swarming_rpcs.TaskStateQuery.COMPLETED_SUCCESS)
-    self.call_api('list', body=message_to_dict(request), status=400)
 
   @parameterized.expand(['list', 'count'])
   def test_list_realm_permission(self, api):
@@ -1807,61 +1778,49 @@ class TasksApiTest(BaseTest):
         # (<Using start, end or tags>, TaskStateQuery, TaskSort)
         (None, TaskStateQuery.BOT_DIED, TaskSort.ABANDONED_TS),
         (None, TaskStateQuery.BOT_DIED, TaskSort.COMPLETED_TS),
-        (None, TaskStateQuery.BOT_DIED, TaskSort.MODIFIED_TS),
         (None, TaskStateQuery.BOT_DIED, TaskSort.STARTED_TS),
         (None, TaskStateQuery.CANCELED, TaskSort.ABANDONED_TS),
         (None, TaskStateQuery.CANCELED, TaskSort.COMPLETED_TS),
-        (None, TaskStateQuery.CANCELED, TaskSort.MODIFIED_TS),
         (None, TaskStateQuery.CANCELED, TaskSort.STARTED_TS),
+        (None, TaskStateQuery.CLIENT_ERROR, TaskSort.COMPLETED_TS),
+        (None, TaskStateQuery.CLIENT_ERROR, TaskSort.ABANDONED_TS),
+        (None, TaskStateQuery.CLIENT_ERROR, TaskSort.STARTED_TS),
         (None, TaskStateQuery.COMPLETED, TaskSort.ABANDONED_TS),
         (None, TaskStateQuery.COMPLETED, TaskSort.COMPLETED_TS),
-        (None, TaskStateQuery.COMPLETED, TaskSort.MODIFIED_TS),
         (None, TaskStateQuery.COMPLETED, TaskSort.STARTED_TS),
         (None, TaskStateQuery.COMPLETED_FAILURE, TaskSort.ABANDONED_TS),
         (None, TaskStateQuery.COMPLETED_FAILURE, TaskSort.COMPLETED_TS),
-        (None, TaskStateQuery.COMPLETED_FAILURE, TaskSort.MODIFIED_TS),
         (None, TaskStateQuery.COMPLETED_FAILURE, TaskSort.STARTED_TS),
         (None, TaskStateQuery.COMPLETED_SUCCESS, TaskSort.ABANDONED_TS),
         (None, TaskStateQuery.COMPLETED_SUCCESS, TaskSort.COMPLETED_TS),
-        (None, TaskStateQuery.COMPLETED_SUCCESS, TaskSort.MODIFIED_TS),
         (None, TaskStateQuery.COMPLETED_SUCCESS, TaskSort.STARTED_TS),
         (None, TaskStateQuery.DEDUPED, TaskSort.ABANDONED_TS),
         (None, TaskStateQuery.DEDUPED, TaskSort.COMPLETED_TS),
-        (None, TaskStateQuery.DEDUPED, TaskSort.MODIFIED_TS),
         (None, TaskStateQuery.DEDUPED, TaskSort.STARTED_TS),
         (None, TaskStateQuery.EXPIRED, TaskSort.ABANDONED_TS),
         (None, TaskStateQuery.EXPIRED, TaskSort.COMPLETED_TS),
-        (None, TaskStateQuery.EXPIRED, TaskSort.MODIFIED_TS),
         (None, TaskStateQuery.EXPIRED, TaskSort.STARTED_TS),
         (None, TaskStateQuery.KILLED, TaskSort.ABANDONED_TS),
         (None, TaskStateQuery.KILLED, TaskSort.COMPLETED_TS),
-        (None, TaskStateQuery.KILLED, TaskSort.MODIFIED_TS),
         (None, TaskStateQuery.KILLED, TaskSort.STARTED_TS),
         (None, TaskStateQuery.NO_RESOURCE, TaskSort.ABANDONED_TS),
         (None, TaskStateQuery.NO_RESOURCE, TaskSort.COMPLETED_TS),
-        (None, TaskStateQuery.NO_RESOURCE, TaskSort.MODIFIED_TS),
         (None, TaskStateQuery.NO_RESOURCE, TaskSort.STARTED_TS),
         (None, TaskStateQuery.PENDING, TaskSort.ABANDONED_TS),
         (None, TaskStateQuery.PENDING, TaskSort.COMPLETED_TS),
-        (None, TaskStateQuery.PENDING, TaskSort.MODIFIED_TS),
         (None, TaskStateQuery.PENDING, TaskSort.STARTED_TS),
         (None, TaskStateQuery.PENDING_RUNNING, TaskSort.ABANDONED_TS),
         (None, TaskStateQuery.PENDING_RUNNING, TaskSort.COMPLETED_TS),
-        (None, TaskStateQuery.PENDING_RUNNING, TaskSort.MODIFIED_TS),
         (None, TaskStateQuery.PENDING_RUNNING, TaskSort.STARTED_TS),
         (None, TaskStateQuery.RUNNING, TaskSort.ABANDONED_TS),
         (None, TaskStateQuery.RUNNING, TaskSort.COMPLETED_TS),
-        (None, TaskStateQuery.RUNNING, TaskSort.MODIFIED_TS),
         (None, TaskStateQuery.RUNNING, TaskSort.STARTED_TS),
         (None, TaskStateQuery.TIMED_OUT, TaskSort.ABANDONED_TS),
         (None, TaskStateQuery.TIMED_OUT, TaskSort.COMPLETED_TS),
-        (None, TaskStateQuery.TIMED_OUT, TaskSort.MODIFIED_TS),
         (None, TaskStateQuery.TIMED_OUT, TaskSort.STARTED_TS),
         (True, TaskStateQuery.ALL, TaskSort.ABANDONED_TS),
         (True, TaskStateQuery.ALL, TaskSort.COMPLETED_TS),
-        (True, TaskStateQuery.ALL, TaskSort.MODIFIED_TS),
         (True, TaskStateQuery.ALL, TaskSort.STARTED_TS),
-        (None, TaskStateQuery.ALL, TaskSort.MODIFIED_TS),
     ]
     _, _, now_120, start, end = self._gen_two_tasks()
     for state in TaskStateQuery:
@@ -1923,31 +1882,29 @@ class TasksApiTest(BaseTest):
     entity.modified_ts = now_120
     entity.put()
 
-    first = self.gen_result_summary(
-        bot_idle_since_ts=fmtdate(self.now),
-        completed_ts=fmtdate(self.now),
-        costs_usd=[0.1],
-        created_ts=fmtdate(self.now),
-        duration=0.1,
-        exit_code=u'0',
-        modified_ts=fmtdate(now_120),
-        name=u'first',
-        performance_stats=self.gen_perf_stats(),
-        started_ts=fmtdate(self.now),
-        tags=[
-            u'authenticated:user:user@example.com',
-            u'commit:post',
-            u'os:Amiga',
-            u'pool:default',
-            u'priority:20',
-            u'project:yay',
-            u'realm:none',
-            u'service_account:none',
-            u'swarming.pool.template:none',
-            u'swarming.pool.version:pools_cfg_rev',
-            u'user:joe@localhost',
-        ],
-        try_number=u'1')
+    first = self.gen_result_summary(bot_idle_since_ts=fmtdate(self.now),
+                                    completed_ts=fmtdate(self.now),
+                                    costs_usd=[0.1],
+                                    created_ts=fmtdate(self.now),
+                                    duration=0.1,
+                                    exit_code=u'0',
+                                    modified_ts=fmtdate(now_120),
+                                    name=u'first',
+                                    performance_stats=self.gen_perf_stats(),
+                                    started_ts=fmtdate(self.now),
+                                    tags=[
+                                        u'authenticated:user:user@example.com',
+                                        u'commit:post',
+                                        u'os:Amiga',
+                                        u'pool:default',
+                                        u'priority:20',
+                                        u'project:yay',
+                                        u'realm:none',
+                                        u'service_account:none',
+                                        u'swarming.pool.template:none',
+                                        u'swarming.pool.version:pools_cfg_rev',
+                                        u'user:joe@localhost',
+                                    ])
     deduped = self.gen_result_summary(
         bot_idle_since_ts=fmtdate(self.now),
         completed_ts=fmtdate(self.now),
@@ -2153,8 +2110,7 @@ class TaskApiTest(BaseTest):
             u'swarming.pool.template:none',
             u'swarming.pool.version:pools_cfg_rev',
             u'user:joe@localhost',
-        ],
-        try_number=u'1')
+        ])
     self.assertEqual(expected, self.client_get_results(task_id))
 
     # Denied if kill_running == False.
@@ -2199,8 +2155,7 @@ class TaskApiTest(BaseTest):
             u'swarming.pool.template:none',
             u'swarming.pool.version:pools_cfg_rev',
             u'user:joe@localhost',
-        ],
-        try_number=u'1')
+        ])
     self.assertEqual(expected, self.client_get_results(task_id))
 
     # Bot terminates the task.
@@ -2236,8 +2191,7 @@ class TaskApiTest(BaseTest):
             u'swarming.pool.template:none',
             u'swarming.pool.version:pools_cfg_rev',
             u'user:joe@localhost',
-        ],
-        try_number=u'1')
+        ])
     self.assertEqual(expected, self.client_get_results(task_id))
 
   def test_result_unknown(self):
@@ -2501,6 +2455,7 @@ class QueuesApiTest(BaseTest):
     # queues and one termination task. The termination task should not be
     # reported.
     self.mock(random, 'getrandbits', lambda _: 0x88)
+    self.mock(random, 'uniform', lambda a, b: (a + b) / 2.0)
     self.mock_default_pool_acl([])
     self.set_as_user()
     self.client_create_task_raw(
@@ -2554,7 +2509,7 @@ class QueuesApiTest(BaseTest):
                        {'bot_id': 'bot1'})
 
     # There's four task queues.
-    self.assertEqual(4, task_queues.TaskDimensions.query().count())
+    self.assertEqual(4, task_queues.TaskDimensionsInfo.query().count())
 
     # Only three are returned, in two pages due to limit=2.
     self.mock_now(self.now, 5)
@@ -2562,16 +2517,15 @@ class QueuesApiTest(BaseTest):
         u'items': [
             {
                 u'dimensions': [u'id:bot123', u'pool:default'],
-                # This is a function of expiration_secs and
-                # task_queues._EXTEND_VALIDITY.
-                u'valid_until_ts': u'2010-01-03T07:14:07',
+                u'valid_until_ts': u'2010-01-03T07:19:07',
             },
             {
                 u'dimensions': [u'os:Amiga', u'pool:default'],
-                u'valid_until_ts': u'2010-01-03T07:14:05',
+                u'valid_until_ts': u'2010-01-03T07:19:05',
             },
         ],
-        u'now': u'2010-01-02T03:04:10',
+        u'now':
+        u'2010-01-02T03:04:10',
     }
     request = handlers_endpoints.TaskQueuesRequest.combined_message_class(
         limit=2)
@@ -2581,11 +2535,14 @@ class QueuesApiTest(BaseTest):
     self.assertEqual(expected, actual)
 
     expected = {
-        u'items': [{
-            u'dimensions': [u'os:Atari', u'pool:template'],
-            u'valid_until_ts': u'2010-01-03T07:14:06',
-        },],
-        u'now': u'2010-01-02T03:04:10',
+        u'items': [
+            {
+                u'dimensions': [u'os:Atari', u'pool:template'],
+                u'valid_until_ts': u'2010-01-03T07:19:06',
+            },
+        ],
+        u'now':
+        u'2010-01-02T03:04:10',
     }
     request = handlers_endpoints.TaskQueuesRequest.combined_message_class(
         cursor=cursor, limit=2)
@@ -2959,79 +2916,6 @@ class BotsApiTest(BaseTest):
         dimensions=['bad'])
     self.call_api('count', body=message_to_dict(request), status=400)
 
-  def test_dimensions_all(self):
-    """Asserts that BotsDimensions is returned with the right data."""
-    self.set_as_privileged_user()
-
-    bot_management.DimensionAggregation(
-        key=bot_management.DimensionAggregation.KEY,
-        dimensions=[
-            bot_management.DimensionValues(
-                dimension='foo', values=['alpha', 'beta']),
-            bot_management.DimensionValues(
-                dimension='bar', values=['gamma', 'delta', 'epsilon']),
-        ],
-        ts=self.now).put()
-
-    expected = {
-        u'bots_dimensions': [
-            {
-                u'key': u'foo',
-                u'value': [u'alpha', u'beta'],
-            },
-            {
-                u'key': u'bar',
-                u'value': [u'gamma', u'delta', u'epsilon'],
-            },
-        ],
-        u'ts': unicode(self.now.strftime(DATETIME_NO_MICRO)),
-    }
-    self.assertEqual(expected, self.call_api('dimensions', body={}).json)
-
-  def test_dimensions_pool(self):
-    self.set_as_user()
-    self.mock_auth_db([
-        auth.Permission('swarming.pools.listBots'),
-    ])
-
-    bot_management.DimensionAggregation(
-        key=bot_management.get_aggregation_key('default'),
-        dimensions=[
-            bot_management.DimensionValues(
-                dimension='foo', values=['alpha', 'beta']),
-        ],
-        ts=self.now).put()
-
-    expected = {
-        u'bots_dimensions': [{
-            u'key': u'foo',
-            u'value': [u'alpha', u'beta'],
-        },],
-        u'ts': unicode(self.now.strftime(DATETIME_NO_MICRO)),
-    }
-    self.assertEqual(expected,
-                     self.call_api('dimensions', body={
-                         'pool': 'default'
-                     }).json)
-
-  def test_dimensions_forbidden(self):
-    self.set_as_user()
-    self.mock_auth_db([])
-
-    # the user doesn't have permission to get dimensions.
-    self.call_api('dimensions', body={}, status=403)
-    self.call_api('dimensions', body={'pool': 'default'}, status=403)
-
-    # pool permission isn't sufficient to get all dimensions.
-    self.mock_auth_db([
-        auth.Permission('swarming.pools.listBots'),
-    ])
-    self.call_api('dimensions', body={}, status=403)
-
-  def test_dimensions_not_found(self):
-    self.set_as_privileged_user()
-    self.call_api('dimensions', body={'pool': 'unknown'}, status=404)
-
   @parameterized.expand([
       'list',
       'count',
@@ -3322,24 +3206,34 @@ class BotApiTest(BaseTest):
   def test_events(self):
     # Run one task, push an event manually.
     self.mock(random, 'getrandbits', lambda _: 0x88)
+    first_ticker = test_case.Ticker(self.now, datetime.timedelta(seconds=1))
+    t1 = self.mock_now(first_ticker())
 
     self.set_as_bot()
-    params = self.do_handshake(do_first_poll=True)
+    params = self.do_handshake()
+    t2 = self.mock_now(first_ticker())
+
+    self.bot_poll(params=params)
     self.set_as_user()
     self.client_create_task_raw()
     self.set_as_bot()
+    t3 = self.mock_now(first_ticker())
+
     res = self.bot_poll(params=params)
-    now_60 = self.mock_now(self.now, 60)
+    now_60 = first_ticker.last() + datetime.timedelta(seconds=60)
+    second_ticker = test_case.Ticker(now_60, datetime.timedelta(seconds=1))
+    t4 = self.mock_now(second_ticker())
+
     response = self.bot_complete_task(task_id=res['manifest']['task_id'])
     self.assertEqual({u'must_stop': False, u'ok': True}, response)
-
     params['event'] = 'bot_rebooting'
     params['message'] = 'for the best'
+    t5 = self.mock_now(second_ticker())
+
     response = self.post_json('/swarming/api/v1/bot/event', params)
     self.assertEqual({}, response)
-
-    start = utils.datetime_to_timestamp(self.now) / 1000000.
-    end = utils.datetime_to_timestamp(now_60) / 1000000.
+    start = utils.datetime_to_timestamp(first_ticker.first()) / 1000000.
+    end = utils.datetime_to_timestamp(second_ticker.last()) / 1000000.
     self.set_as_privileged_user()
     body = message_to_dict(
         handlers_endpoints.BotEventsRequest.combined_message_class(
@@ -3360,83 +3254,80 @@ class BotApiTest(BaseTest):
         },
     ]
     state_dict = {
-        'bot_group_cfg_version': 'default',
         'running_time': 1234.,
         'sleep_streak': 0,
         'started_ts': 1410990411.111,
     }
     state = unicode(
         json.dumps(state_dict, sort_keys=True, separators=(',', ':')))
-    state_dict.pop('bot_group_cfg_version')
-    state_no_cfg_ver = unicode(
+    state_dict['handshaking'] = True
+    state_handshake = unicode(
         json.dumps(state_dict, sort_keys=True, separators=(',', ':')))
-    expected = {
-        u'items': [
-            {
-                u'authenticated_as': u'bot:whitelisted-ip',
-                u'dimensions': dimensions,
-                u'event_type': u'bot_rebooting',
-                u'external_ip': unicode(self.source_ip),
-                u'message': u'for the best',
-                u'quarantined': False,
-                u'state': state,
-                u'ts': fmtdate(now_60),
-                u'version': unicode(self.bot_version),
-            },
-            {
-                u'authenticated_as': u'bot:whitelisted-ip',
-                u'dimensions': dimensions,
-                u'event_type': u'task_completed',
-                u'external_ip': unicode(self.source_ip),
-                u'quarantined': False,
-                u'state': state,
-                u'task_id': u'5cee488008811',
-                u'ts': fmtdate(now_60),
-                u'version': unicode(self.bot_version),
-            },
-            {
-                u'authenticated_as': u'bot:whitelisted-ip',
-                u'dimensions': dimensions,
-                u'event_type': u'request_task',
-                u'external_ip': unicode(self.source_ip),
-                u'quarantined': False,
-                u'state': state,
-                u'task_id': u'5cee488008811',
-                u'ts': fmtdate(self.now),
-                u'version': unicode(self.bot_version),
-            },
-            {
-                u'authenticated_as': u'bot:whitelisted-ip',
-                u'dimensions': dimensions,
-                u'event_type': u'request_sleep',
-                u'external_ip': unicode(self.source_ip),
-                u'quarantined': False,
-                u'state': state,
-                u'ts': fmtdate(self.now),
-                u'version': unicode(self.bot_version),
-            },
-            {
-                u'authenticated_as': u'bot:whitelisted-ip',
-                u'dimensions': dimensions,
-                u'event_type': u'bot_connected',
-                u'external_ip': unicode(self.source_ip),
-                u'quarantined': False,
-                u'state': state_no_cfg_ver,
-                u'ts': fmtdate(self.now),
-                u'version': u'123',
-            },
-        ],
-        u'now': fmtdate(now_60),
-    }
-    self.assertEqual(expected, response.json)
+    expected = [
+        {
+            u'authenticated_as': u'bot:whitelisted-ip',
+            u'dimensions': dimensions,
+            u'event_type': u'bot_rebooting',
+            u'external_ip': unicode(self.source_ip),
+            u'message': u'for the best',
+            u'quarantined': False,
+            u'state': state,
+            u'ts': fmtdate(t5),
+            u'version': unicode(self.bot_version),
+        },
+        {
+            u'authenticated_as': u'bot:whitelisted-ip',
+            u'dimensions': dimensions,
+            u'event_type': u'task_completed',
+            u'external_ip': unicode(self.source_ip),
+            u'quarantined': False,
+            u'state': state,
+            u'task_id': res['manifest']['task_id'],
+            u'ts': fmtdate(t4),
+            u'version': unicode(self.bot_version),
+        },
+        {
+            u'authenticated_as': u'bot:whitelisted-ip',
+            u'dimensions': dimensions,
+            u'event_type': u'request_task',
+            u'external_ip': unicode(self.source_ip),
+            u'quarantined': False,
+            u'state': state,
+            u'task_id': res['manifest']['task_id'],
+            u'ts': fmtdate(t3),
+            u'version': unicode(self.bot_version),
+        },
+        {
+            u'authenticated_as': u'bot:whitelisted-ip',
+            u'dimensions': dimensions,
+            u'event_type': u'request_sleep',
+            u'external_ip': unicode(self.source_ip),
+            u'quarantined': False,
+            u'state': state,
+            u'ts': fmtdate(t2),
+            u'version': unicode(self.bot_version),
+        },
+        {
+            u'authenticated_as': u'bot:whitelisted-ip',
+            u'dimensions': dimensions,
+            u'event_type': u'bot_connected',
+            u'external_ip': unicode(self.source_ip),
+            u'quarantined': False,
+            u'state': state_handshake,
+            u'ts': fmtdate(t1),
+            u'version': u'123',
+        },
+    ]
+    self.assertEqual(expected, response.json['items'])
 
     # Now test with a subset.
+    start = utils.datetime_to_timestamp(second_ticker.first()) / 1000000.
+    end = utils.datetime_to_timestamp(second_ticker.last()) / 1000000.
     body = message_to_dict(
         handlers_endpoints.BotEventsRequest.combined_message_class(
-            bot_id='bot1', start=end, end=end + 1))
+            bot_id='bot1', start=start, end=end + 1))
     response = self.call_api('events', body=body)
-    expected['items'] = expected['items'][:2]
-    self.assertEqual(expected, response.json)
+    self.assertEqual(expected[:2], response.json['items'])
 
   def test_terminate_admin(self):
     self.set_as_bot()

@@ -19,7 +19,7 @@ def make_bot(remote=None):
   return bot.Bot(remote, {'dimensions': {
       'id': ['bot1'],
       'pool': ['private']
-  }}, 'https://localhost:1', '1234-1a2b3c4-tainted-joe', 'base_dir', None)
+  }}, 'https://localhost:1', 'base_dir', None)
 
 
 class TestBot(unittest.TestCase):
@@ -35,14 +35,24 @@ class TestBot(unittest.TestCase):
   def test_post_error(self):
     # Not looking at the actual stack since the file name is call dependent and
     # the line number will change as the code is modified.
-    prefix = ('US has failed us\n' 'Calling stack:\n' '  0  ')
+    prefix = 'US has failed us\nCalling stack:\n  0  '
     calls = []
+
     class FakeRemote(object):
       # pylint: disable=no-self-argument
       def post_bot_event(self2, event_type, message, attributes):
         try:
           self.assertEqual('bot_error', event_type)
-          expected = {'dimensions': {'id': ['bot1'], 'pool': ['private']}}
+          expected = {
+              'dimensions': {
+                  'id': ['bot1'],
+                  'pool': ['private']
+              },
+              'state': {
+                  'rbe_instance': None,
+              },
+              'version': 'unknown',
+          }
           self.assertEqual(expected, attributes)
           self.assertTrue(message.startswith(prefix), repr(message))
           calls.append(event_type)
@@ -62,20 +72,30 @@ class TestBot(unittest.TestCase):
   def test_bot(self):
     obj = make_bot()
     self.assertEqual({'id': ['bot1'], 'pool': ['private']}, obj.dimensions)
-    self.assertEqual(
-        os.path.join(obj.base_dir, 'swarming_bot.zip'), obj.swarming_bot_zip)
-    self.assertEqual('1234-1a2b3c4-tainted-joe', obj.server_version)
+    self.assertEqual(os.path.join(obj.base_dir, 'swarming_bot.zip'),
+                     obj.swarming_bot_zip)
     self.assertEqual('base_dir', obj.base_dir)
 
   def test_attribute_updates(self):
     obj = make_bot()
-    obj._update_bot_group_cfg('cfg_ver', {'dimensions': {'pool': ['A']}})
+
+    with obj.mutate_internals() as mut:
+      mut.update_bot_group_cfg({'dimensions': {'pool': ['A']}})
     self.assertEqual({'id': ['bot1'], 'pool': ['A']}, obj.dimensions)
-    self.assertEqual({'bot_group_cfg_version': 'cfg_ver'}, obj.state)
+    self.assertEqual({'rbe_instance': None}, obj.state)
 
     # Dimension in bot_group_cfg ('A') wins over custom one ('B').
-    obj._update_dimensions({'foo': ['baz'], 'pool': ['B']})
+    with obj.mutate_internals() as mut:
+      mut.update_dimensions({'foo': ['baz'], 'pool': ['B']})
     self.assertEqual({'foo': ['baz'], 'pool': ['A']}, obj.dimensions)
+
+  def test_exit_hook_update(self):
+    obj = make_bot()
+    hook = lambda _: None
+    with obj.mutate_internals() as mut:
+      mut.set_exit_hook(hook)
+    with obj.mutate_internals() as mut:
+      self.assertEqual(hook, mut.get_exit_hook())
 
 
 if __name__ == '__main__':

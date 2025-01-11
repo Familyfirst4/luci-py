@@ -13,7 +13,7 @@ from google.appengine.ext import ndb
 
 
 # Mask to TaskRequest key ids so they become decreasing numbers.
-TASK_REQUEST_KEY_ID_MASK = int(2L**63-1)
+TASK_REQUEST_KEY_ID_MASK = int(2**63 - 1)
 
 
 ### Entities relationships.
@@ -33,11 +33,17 @@ def request_key_to_secret_bytes_key(request_key):
   return ndb.Key('SecretBytes', 1, parent=request_key)
 
 
-def request_key_to_build_token_key(request_key):
-  """Returns the BuildToken ndb.Key for this TaskRequest.key."""
+def request_key_to_build_task_key(request_key):
+  """Returns the BuildTask ndb.Key for this TaskRequest.key."""
   assert request_key.kind() == 'TaskRequest', request_key
   assert request_key.integer_id(), request_key
-  return ndb.Key('BuildToken', 1, parent=request_key)
+  return ndb.Key('BuildTask', 1, parent=request_key)
+
+
+def request_key_to_run_result_key(request_key):
+  """Returns the TaskRunResult ndb.Key for this TaskRequest.key."""
+  return result_summary_key_to_run_result_key(
+      request_key_to_result_summary_key(request_key))
 
 
 def result_summary_key_to_request_key(result_summary_key):
@@ -46,35 +52,20 @@ def result_summary_key_to_request_key(result_summary_key):
   return result_summary_key.parent()
 
 
-def result_summary_key_to_run_result_key(result_summary_key, try_number):
-  """Returns the TaskRunResult ndb.Key for this TaskResultSummary.key.
-
-  Arguments:
-    result_summary_key: ndb.Key for a TaskResultSummary entity.
-    try_number: the try on which TaskRunResult was created for. The first try
-        is 1, the second is 2, etc.
-
-  Returns:
-    ndb.Key for the corresponding TaskRunResult entity.
-  """
+def result_summary_key_to_run_result_key(result_summary_key):
+  """Returns the TaskRunResult ndb.Key for this TaskResultSummary.key."""
   assert result_summary_key.kind() == 'TaskResultSummary', result_summary_key
-  if try_number < 1:
-    raise ValueError('Try number(%d) must be above 0' % try_number)
-  if try_number > 2:
-    raise ValueError('Try number(%d) > 2 is not supported' % try_number)
-  return ndb.Key('TaskRunResult', try_number, parent=result_summary_key)
+  return ndb.Key('TaskRunResult', 1, parent=result_summary_key)
 
 
 def run_result_key_to_result_summary_key(run_result_key):
-  """Returns the TaskResultSummary ndb.Key for this TaskRunResult.key.
-  """
+  """Returns the TaskResultSummary ndb.Key for this TaskRunResult.key."""
   assert run_result_key.kind() == 'TaskRunResult', run_result_key
   return run_result_key.parent()
 
 
 def run_result_key_to_performance_stats_key(run_result_key):
-  """Returns the PerformanceStats ndb.Key for this TaskRunResult.key.
-  """
+  """Returns the PerformanceStats ndb.Key for this TaskRunResult.key."""
   assert run_result_key.kind() == 'TaskRunResult', run_result_key
   return ndb.Key('PerformanceStats', 1, parent=run_result_key)
 
@@ -145,15 +136,13 @@ def unpack_request_key(request_id):
   assert isinstance(request_id, basestring)
   if not request_id:
     raise ValueError('Invalid null key')
-  c = request_id[-1]
-  if c == '1':
-    # The key id is the reverse of the value.
-    task_id_int = int(request_id, 16)
-    if task_id_int < 0:
-      raise ValueError('Invalid task id (overflowed)')
-    return ndb.Key('TaskRequest', task_id_int ^ TASK_REQUEST_KEY_ID_MASK)
-  else:
+  if request_id[-1] != '1':
     raise ValueError('Invalid key %r' % request_id)
+  # The key id is the reverse of the value.
+  task_id_int = int(request_id, 16)
+  if task_id_int < 0:
+    raise ValueError('Invalid task id (overflowed)')
+  return ndb.Key('TaskRequest', task_id_int ^ TASK_REQUEST_KEY_ID_MASK)
 
 
 def unpack_result_summary_key(packed_key):
@@ -174,8 +163,5 @@ def unpack_run_result_key(packed_key):
   The expected format of |packed_key| is %x.
   """
   request_key = unpack_request_key(packed_key[:-1])
-  try_number = int(packed_key[-1], 16)
-  if not try_number:
-    raise ValueError('Can\'t reference to the overall task result.')
   result_summary_key = request_key_to_result_summary_key(request_key)
-  return result_summary_key_to_run_result_key(result_summary_key, try_number)
+  return result_summary_key_to_run_result_key(result_summary_key)

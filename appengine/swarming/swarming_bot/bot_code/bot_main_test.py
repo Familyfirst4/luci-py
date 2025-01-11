@@ -8,6 +8,7 @@ import datetime
 import json
 import logging
 import os
+import random
 import sys
 import tempfile
 import textwrap
@@ -27,6 +28,7 @@ from api import bot
 from api import os_utilities
 from api.platforms import gce
 from bot_code import bot_main
+from bot_code import clock
 from bot_code import remote_client
 from depot_tools import fix_encoding
 from utils import file_path
@@ -44,21 +46,38 @@ REQUEST_UUID = '7905e667-d415-48f1-9df7-f914541d6331'
 
 
 class FakeThreadingEvent(object):
+  def __init__(self):
+    self.signaled = False
+    self.slept = []
+    self.now = 1234.0
 
   def is_set(self):
-    return False
+    return self.signaled
 
-  def wait(self, timeout=None):
-    pass
+  def wait(self, timeout):
+    self.slept.append(timeout)
+    # Add extra time to emulate "real" sleeps and avoid floating point epsilon
+    # issues when comparing how long we slept.
+    self.now += max(0.0, timeout) + 0.0001
+    return self.signaled
+
+  def set(self):
+    self.signaled = True
+
+  def reset(self):
+    self.signaled = False
+    del self.slept[:]
 
 
 class TestBotBase(net_utils.TestCase):
+  maxDiff = None
 
   def setUp(self):
     super(TestBotBase, self).setUp()
+    tools.clear_cache_all()
     # Throw away all swarming environ if running the test on Swarming. It may
     # interfere with the test.
-    for k in os.environ.keys():
+    for k in os.environ:
       if k.startswith('SWARMING_'):
         os.environ.pop(k)
     self.root_dir = tempfile.mkdtemp(prefix='bot_main')
@@ -72,14 +91,31 @@ class TestBotBase(net_utils.TestCase):
             'pool': ['default'],
         },
         'state': {
-            'bot_group_cfg_version': None,
             'cost_usd_hour': 3600.,
+            'rbe_instance': None,
             'sleep_streak': 0,
         },
         'version': '123',
     }
-    self.bot = self.make_bot()
-    tools.clear_cache_all()
+    self.mock(bot, '_gen_session_id', lambda: 'fake-session-id')
+    self.mock(uuid, 'uuid4', lambda: uuid.UUID(REQUEST_UUID))
+    self.mock(os_utilities,
+              'get_dimensions', lambda: self.attributes['dimensions'])
+    self.mock(os_utilities, 'get_state', lambda *_: self.attributes['state'])
+    self.mock(
+        bot_main, 'get_config', lambda: {
+            'server': self.url,
+            'server_version': 'must-be-ignored',
+        })
+    self.orig_update_lkgbc = bot_main._update_lkgbc
+    self.mock(bot_main, '_update_lkgbc', lambda _bot: False)
+    self.mock(bot_main, '_TRAP_ALL_EXCEPTIONS', False)
+    self.quit_bit = None  # see make_bot
+    self.bot = None  # see make_bot
+    self.clock = None  # see make_bot
+    self.loop_state = None  # see make_bot
+    self.expected_rbe_worker_props = None
+    self.make_bot()
 
   def tearDown(self):
     os.chdir(self.old_cwd)
@@ -87,16 +123,147 @@ class TestBotBase(net_utils.TestCase):
     super(TestBotBase, self).tearDown()
 
   def make_bot(self, auth_headers_cb=None):
-    return bot.Bot(
-        remote_client.createRemoteClient('https://localhost:1', auth_headers_cb,
-                                         'localhost', self.root_dir),
-        copy.deepcopy(self.attributes), 'https://localhost:1', 'version1',
-        self.root_dir, self.fail)
+    self.quit_bit = FakeThreadingEvent()
+    self.bot = bot.Bot(
+        remote_client.RemoteClientNative(self.url, auth_headers_cb, 'localhost',
+                                         self.root_dir), self.attributes,
+        self.url, self.root_dir, self.fail)
+    with self.bot.mutate_internals() as mut:
+      mut.update_session_token('fake-session-token')
+    bot_main._update_bot_attributes(self.bot, 0)
+    self.clock = clock.Clock(self.quit_bit)
+    self.clock._now_impl = lambda: self.quit_bit.now
+    self.loop_state = bot_main._BotLoopState(self.bot, None, None,
+                                             self.quit_bit, self.clock)
+
+  def mock_rbe_worker_properties(self):
+    with self.bot.mutate_internals() as mut:
+      props = remote_client.WorkerProperties('rbe-pool-id', 'rbe-pool-version')
+      mut.update_rbe_worker_properties(props)
+      self.attributes['state']['rbe_worker_props'] = props.to_dict()
+    self.expected_rbe_worker_props = props.to_dict()
+
+  def poll_once(self):
+    self.quit_bit.reset()
+    self.loop_state.run(test_hook=lambda: False)
+
+  def prep_hybrid_mode(self, rbe_params, scheduler='swarming'):
+    self.loop_state.rbe_enable(rbe_params)
+    self.loop_state._next_scheduler = scheduler
+    self.loop_state._swarming_poll_timer.reset(0.0)
+
+  def expected_poll_request(self,
+                            response,
+                            rbe_idle=None,
+                            sleep_streak=None,
+                            force=False,
+                            extra_headers=None):
+    data = self.attributes
+
+    def on_request(kwargs):
+      self.assertEqual(kwargs['data']['session'], 'fake-session-token')
+      self.assertEqual(kwargs['data']['request_uuid'], REQUEST_UUID)
+      self.assertEqual(kwargs['data']['dimensions'], data['dimensions'])
+      if rbe_idle is not None:
+        self.assertEqual(kwargs['data']['state']['rbe_idle'], rbe_idle)
+      if sleep_streak is not None:
+        self.assertEqual(kwargs['data']['state']['sleep_streak'], sleep_streak)
+      self.assertEqual(kwargs['data'].get('force', False), force)
+      if extra_headers is not None:
+        with_extra = dict(kwargs['headers'])
+        with_extra.update(extra_headers)
+        self.assertEqual(kwargs['headers'], with_extra)
+
+    return 'https://localhost:1/swarming/api/v1/bot/poll', on_request, response
+
+  def expected_claim_request(self, claim_id, task_id, task_to_run_shard,
+                             task_to_run_id, response):
+    data = self.attributes
+
+    def on_request(kwargs):
+      self.assertEqual(kwargs['data']['dimensions'], data['dimensions'])
+      self.assertEqual(kwargs['data']['state'], data['state'])
+      self.assertEqual(kwargs['data']['claim_id'], claim_id)
+      self.assertEqual(kwargs['data']['task_id'], task_id)
+      self.assertEqual(kwargs['data']['task_to_run_shard'], task_to_run_shard)
+      self.assertEqual(kwargs['data']['task_to_run_id'], task_to_run_id)
+
+    return 'https://localhost:1/swarming/api/v1/bot/claim', on_request, response
+
+  def expected_task_update_request(self, task_id):
+    def on_request(kwargs):
+      self.assertEqual(kwargs['data']['task_id'], task_id)
+
+    return (
+        'https://localhost:1/swarming/api/v1/bot/task_update/' + task_id,
+        on_request,
+        {},
+    )
+
+  def expect_bot_event_request(self, event, message):
+
+    def on_request(kwargs):
+      self.assertEqual(kwargs['data']['event'], event)
+      self.assertEqual(kwargs['data']['message'], message)
+
+    return (
+        'https://localhost:1/swarming/api/v1/bot/event',
+        on_request,
+        {
+            'ok': True
+        },
+    )
+
+  def expected_rbe_create_request(self, fail=False):
+    data = {'session': 'fake-session-token'}
+    if self.expected_rbe_worker_props:
+      data['worker_properties'] = self.expected_rbe_worker_props
+
+    def on_request(kwargs):
+      self.assertEqual(kwargs['data'], data)
+
+    return (
+        'https://localhost:1/swarming/api/v1/bot/rbe/session/create',
+        on_request,
+        None if fail else {
+            'session_id': 'fake-rbe-session-id',
+        },
+    )
+
+  def expected_rbe_update_request(self,
+                                  status_in='OK',
+                                  status_out='OK',
+                                  lease_in=None,
+                                  lease_out=None,
+                                  blocking=False):
+    data = {
+        'status': status_in,
+        'session': 'fake-session-token',
+    }
+    if self.expected_rbe_worker_props:
+      data['worker_properties'] = self.expected_rbe_worker_props
+    if lease_in:
+      data['lease'] = lease_in
+    if not blocking:
+      data['nonblocking'] = True
+
+    def on_request(kwargs):
+      self.assertEqual(kwargs['data'], data)
+      # Emulate RBE blocking waiting for a lease.
+      self.clock.sleep(10.0)
+
+    response = {'status': status_out}
+    if lease_out:
+      response['lease'] = lease_out
+
+    return (
+        'https://localhost:1/swarming/api/v1/bot/rbe/session/update',
+        on_request,
+        response,
+    )
 
 
 class TestBotMain(TestBotBase):
-  maxDiff = 2000
-
   def setUp(self):
     super(TestBotMain, self).setUp()
     # __main__ does it for us.
@@ -107,11 +274,7 @@ class TestBotMain(TestBotBase):
     self.mock(subprocess42, 'call', self.fail)
     self.mock(time, 'time', lambda: 100.)
     self.mock(remote_client, 'make_appengine_id', lambda *a: 42)
-    config_path = os.path.join(
-        test_env_bot_code.BOT_DIR, 'config', 'config.json')
-    with open(config_path, 'rb') as f:
-      config = json.load(f)
-    self.mock(bot_main, 'get_config', lambda: config)
+    self.mock(random, 'uniform', lambda a, _b: a)
     self.mock(bot_main, '_bot_restart', self.fail)
     self.mock(bot_main, 'THIS_FILE',
               os.path.join(test_env_bot_code.BOT_DIR, 'swarming_bot.zip'))
@@ -135,10 +298,9 @@ class TestBotMain(TestBotBase):
 
   def test_hook_restart(self):
     from config import bot_config
-    obj = self.make_bot()
     def get_dimensions(botobj):
-      self.assertEqual(obj, botobj)
-      obj.bot_restart('Yo')
+      self.assertEqual(self.bot, botobj)
+      self.bot.bot_restart('Yo')
       return {'id': ['foo'], 'pool': ['bar']}
     self.mock(bot_config, 'get_dimensions', get_dimensions)
     restarts = []
@@ -146,52 +308,48 @@ class TestBotMain(TestBotBase):
     expected = {
         'id': ['foo'],
         'pool': ['bar'],
-        'server_version': ['version1']
     }
-    self.assertEqual(expected, bot_main._get_dimensions(obj))
-    self.assertEqual('Yo', obj.bot_restart_msg())
-    self.assertEqual([(obj, 'Yo')], restarts)
+    self.assertEqual(expected, bot_main._get_dimensions(self.bot))
+    self.assertEqual('Yo', self.bot.bot_restart_msg())
+    self.assertEqual([(self.bot, 'Yo')], restarts)
 
   def test_get_dimensions(self):
     from config import bot_config
-    obj = self.make_bot()
     def get_dimensions(botobj):
-      self.assertEqual(obj, botobj)
+      self.assertEqual(self.bot, botobj)
       return {'yo': ['dawh']}
 
     self.mock(bot_config, 'get_dimensions', get_dimensions)
-    expected = {'server_version': ['version1'], 'yo': ['dawh']}
-    self.assertEqual(expected, bot_main._get_dimensions(obj))
+    expected = {'yo': ['dawh']}
+    self.assertEqual(expected, bot_main._get_dimensions(self.bot))
 
   def test_get_dimensions_extra(self):
     from config import bot_config
-    obj = self.make_bot()
     def get_dimensions(botobj):
-      self.assertEqual(obj, botobj)
+      self.assertEqual(self.bot, botobj)
       return {'yo': ['dawh']}
     self.mock(bot_config, 'get_dimensions', get_dimensions)
 
     # The extra version takes priority.
     class extra(object):
       def get_dimensions(self2, botobj): # pylint: disable=no-self-argument
-        self.assertEqual(obj, botobj)
+        self.assertEqual(self.bot, botobj)
         return {'alternative': ['truth']}
     self.mock(bot_main, '_EXTRA_BOT_CONFIG', extra())
-    expected = {'alternative': ['truth'], 'server_version': ['version1']}
-    self.assertEqual(expected, bot_main._get_dimensions(obj))
+    expected = {'alternative': ['truth']}
+    self.assertEqual(expected, bot_main._get_dimensions(self.bot))
 
   def test_generate_version(self):
     self.assertEqual('123', bot_main.generate_version())
 
   def test_get_state(self):
     from config import bot_config
-    obj = self.make_bot()
     def get_state(botobj):
-      self.assertEqual(obj, botobj)
+      self.assertEqual(self.bot, botobj)
       return {'yo': 'dawh'}
     self.mock(bot_config, 'get_state', get_state)
     expected = {'sleep_streak': 0.1, 'yo': 'dawh'}
-    self.assertEqual(expected, bot_main._get_state(obj, 0.1))
+    self.assertEqual(expected, bot_main._get_state(self.bot, 0.1))
 
   def test_get_state_quarantine(self):
     botobj = bot_main.get_bot(bot_main.get_config())
@@ -241,11 +399,11 @@ class TestBotMain(TestBotBase):
   def test_get_state_quarantine_sticky(self):
     # A crash in get_dimensions() causes sticky quarantine in get_state.
     from config import bot_config
-    obj = self.make_bot()
 
     def get_dimensions(botobj):
-      self.assertEqual(obj, botobj)
-      return 'invalid'
+      self.assertEqual(self.bot, botobj)
+      # Non-JSON serializable.
+      return {'invalid': b'blob'}
 
     self.mock(bot_config, 'get_dimensions', get_dimensions)
 
@@ -254,22 +412,22 @@ class TestBotMain(TestBotBase):
 
     self.mock(os_utilities, 'get_dimensions', get_dimensions_os)
     def get_state(botobj):
-      self.assertEqual(obj, botobj)
+      self.assertEqual(self.bot, botobj)
       return {'yo': 'dawh'}
     self.mock(bot_config, 'get_state', get_state)
 
     expected = {
         'os': ['safe'],
         'quarantined': ['1'],
-        'server_version': ['version1'],
     }
-    self.assertEqual(expected, bot_main._get_dimensions(obj))
+    self.assertEqual(expected, bot_main._get_dimensions(self.bot))
     expected = {
-        'quarantined': "get_dimensions(): expected a dict, got 'invalid'",
+        'quarantined':
+        "get_dimensions(): expected a JSON dict, got {'invalid': b'blob'}",
         'sleep_streak': 0.1,
         'yo': 'dawh',
     }
-    self.assertEqual(expected, bot_main._get_state(obj, 0.1))
+    self.assertEqual(expected, bot_main._get_state(self.bot, 0.1))
 
   def test_get_disks_quarantine_empty(self):
     root = 'c:\\' if sys.platform == 'win32' else '/'
@@ -387,52 +545,56 @@ class TestBotMain(TestBotBase):
   def test_post_error_task(self):
     self.mock(time, 'time', lambda: 126.0)
     self.mock(logging, 'error', lambda *_, **_kw: None)
-    self.mock(
-        bot_main, 'get_config',
-        lambda: {'server': self.url, 'server_version': '1'})
-    expected_attribs = bot_main.get_attributes(None)
-    botobj = bot_main.get_bot(bot_main.get_config())
+    self.assertEqual('localhost', self.bot.id)
     self.expected_requests([
         (
             'https://localhost:1/swarming/api/v1/bot/task_error/23',
             {
                 'data': {
-                    'id': expected_attribs['dimensions']['id'][0],
+                    'id': self.bot.id,
                     'message': 'error',
+                    'client_error': {
+                        'missing_cas': [],
+                        'missing_cipd': [],
+                    },
                     'task_id': 23,
+                    'session': 'fake-session-token',
                 },
                 'expected_error_codes': None,
                 'follow_redirects': False,
                 'headers': {
                     'Cookie': 'GOOGAPPUID=42',
-                    'X-Luci-Swarming-Bot-ID': botobj.id,
+                    'X-Luci-Swarming-Bot-ID': 'localhost',
                 },
                 'timeout': remote_client.NET_CONNECTION_TIMEOUT_SEC,
+                'max_attempts': remote_client.NET_MAX_ATTEMPTS,
             },
             {
                 'resp': 1
             },
         ),
     ])
-    botobj.remote.bot_id = botobj.id
-    self.assertEqual(True, bot_main._post_error_task(botobj, 'error', 23))
+    self.assertEqual(True, bot_main._post_error_task(self.bot, 'error', 23))
 
   def test_do_handshake(self):
     # Ensures the injected code was called. Ensures the injected name is
     # 'injected', that it can imports the base one.
-    quit_bit = threading.Event()
-    obj = self.make_bot()
 
     # Hack into bot_config.
     bot_config = bot_main._get_bot_config()
     bot_config.base_func = lambda: 'yo'
     try:
-      def do_handshake(attributes):
+
+      def do_handshake(attributes, _session_id):
         return {
-          'bot_version': attributes['version'],
-          'bot_group_cfg_version': None,
-          'bot_group_cfg': None,
-          'bot_config': textwrap.dedent("""
+            'session':
+            'fake-session-token',
+            'bot_version':
+            attributes['version'],
+            'bot_group_cfg':
+            None,
+            'bot_config':
+            textwrap.dedent("""
               from config import bot_config
               def get_dimensions(_):
                 return {
@@ -442,16 +604,17 @@ class TestBotMain(TestBotBase):
                 }
               """),
         }
-      self.mock(obj.remote, 'do_handshake', do_handshake)
-      bot_main._do_handshake(obj, quit_bit)
-      self.assertFalse(quit_bit.is_set())
-      self.assertEqual(None, obj.bot_restart_msg())
+
+      self.mock(self.bot.remote, 'do_handshake', do_handshake)
+      bot_main._do_handshake(self.bot, self.quit_bit)
+      self.assertEqual(None, self.bot.bot_restart_msg())
       expected = {
           'alternative': 'injected',
           'bot_config': bot_config.__file__,
           'called': 'yo',
       }
-      self.assertEqual(expected, bot_main._EXTRA_BOT_CONFIG.get_dimensions(obj))
+      self.assertEqual(expected,
+                       bot_main._EXTRA_BOT_CONFIG.get_dimensions(self.bot))
     finally:
       del bot_config.base_func
 
@@ -460,61 +623,28 @@ class TestBotMain(TestBotBase):
     first = threading.Event()
     second = threading.Event()
     from config import bot_config
-    obj = self.make_bot()
     def on_bot_shutdown_1(botobj):
-      self.assertEqual(obj, botobj)
+      self.assertEqual(self.bot, botobj)
       first.set()
     self.mock(bot_config, 'on_bot_shutdown', on_bot_shutdown_1)
 
     class extra(object):
       def on_bot_shutdown(self2, botobj): # pylint: disable=no-self-argument
-        self.assertEqual(obj, botobj)
+        self.assertEqual(self.bot, botobj)
         second.set()
     self.mock(bot_main, '_EXTRA_BOT_CONFIG', extra())
-    bot_main._call_hook(True, obj, 'on_bot_shutdown')
+    bot_main._call_hook(True, self.bot, 'on_bot_shutdown')
     self.assertTrue(first.is_set())
     self.assertTrue(second.is_set())
 
   def test_run_bot(self):
-    self.mock(threading, 'Event', FakeThreadingEvent)
-
     # Test the run_bot() loop. Does not use self.bot.
-    self.mock(time, 'time', lambda: 126.0)
-    class Foo(Exception):
-      pass
-
-    def poll_server(botobj, _quit_bit, _last_action):
-      sleep_streak = botobj.state['sleep_streak']
-      self.assertEqual(self.url, botobj.server)
-      if sleep_streak == 5:
-        raise Exception('Jumping out of the loop')
-      return False
-
-    self.mock(bot_main, '_poll_server', poll_server)
-
-    def post_error(botobj, e):
-      self.assertEqual(self.url, botobj.server)
-      lines = e.splitlines()
-      self.assertEqual('Jumping out of the loop', lines[0])
-      self.assertEqual('Traceback (most recent call last):', lines[1])
-      raise Foo('Necessary to get out of the loop')
-
-    self.mock(bot.Bot, 'post_error', post_error)
-
-    orig = bot_main.get_bot
-    botobj = [None]
-    def get_bot(config):
-      botobj[0] = orig(config)
-      return botobj[0]
-
-    self.mock(bot_main, 'get_bot', get_bot)
-
-    self.mock(bot_main, 'get_config', lambda: {
-        'server': self.url,
-        'server_version': '1',})
-    self.mock(
-        bot_main, '_get_dimensions', lambda _: self.attributes['dimensions'])
-    self.mock(os_utilities, 'get_state', lambda *_: self.attributes['state'])
+    fake_event = FakeThreadingEvent()
+    fake_clock = clock.Clock(fake_event)
+    fake_clock._now_impl = lambda: fake_event.now
+    self.mock(threading, 'Event', lambda: fake_event)
+    self.mock(clock, 'Clock', lambda _: fake_clock)
+    self.mock(time, 'time', lambda: fake_event.now)
 
     # pylint: disable=unused-argument
     class Popen(object):
@@ -540,6 +670,52 @@ class TestBotMain(TestBotBase):
         return '', None
     self.mock(subprocess42, 'Popen', Popen)
 
+    orig = bot_main.get_bot
+    botobj = [None]
+
+    def get_bot(config):
+      botobj[0] = orig(config)
+      return botobj[0]
+
+    self.mock(bot_main, 'get_bot', get_bot)
+
+    # Polling will happen with an extra dimensions returned in the handshake.
+    def payload(sleep_streak, extra):
+      attrs = copy.deepcopy(self.attributes)
+      attrs['dimensions']['bot_side'] = ['A']
+      attrs['state'] = {
+          'bot_config': {
+              'name': None,
+              'revision': None
+          },
+          'cost_usd_hour': 3600.0,
+          'rbe_instance': None,
+          'sleep_streak': sleep_streak,
+      }
+      attrs['session'] = 'fake-session-token'
+      attrs.update(extra)
+      return attrs
+
+    def expect_poll(sleep_streak, resp):
+      return (
+          'https://localhost:1/swarming/api/v1/bot/poll',
+          {
+              'data': payload(sleep_streak, {'request_uuid': REQUEST_UUID}),
+              'expected_error_codes': None,
+              'follow_redirects': False,
+              'headers': {
+                  'Cookie': 'GOOGAPPUID=42',
+                  'X-Luci-Swarming-Bot-ID': 'localhost',
+              },
+              'timeout': remote_client.NET_CONNECTION_TIMEOUT_SEC,
+              'max_attempts': 1,
+          },
+          resp,
+      )
+
+    handshake_attrs = self.attributes.copy()
+    handshake_attrs['session_id'] = 'fake-session-id'
+
     self.expected_requests([
         (
             'https://localhost:1/swarming/api/v1/bot/server_ping',
@@ -550,32 +726,36 @@ class TestBotMain(TestBotBase):
         (
             'https://localhost:1/swarming/api/v1/bot/handshake',
             {
-                'data': self.attributes,
+                'data': handshake_attrs,
                 'expected_error_codes': None,
                 'follow_redirects': False,
                 'headers': {
-                    'Cookie': 'GOOGAPPUID=42'
+                    'Cookie': 'GOOGAPPUID=42',
+                    'X-Luci-Swarming-Bot-ID': 'localhost',
                 },
                 'timeout': remote_client.NET_CONNECTION_TIMEOUT_SEC,
+                'max_attempts': remote_client.NET_MAX_ATTEMPTS,
             },
             None,  # fails, gets retried
         ),
         (
             'https://localhost:1/swarming/api/v1/bot/handshake',
             {
-                'data': self.attributes,
+                'data': handshake_attrs,
                 'expected_error_codes': None,
                 'follow_redirects': False,
                 'headers': {
-                    'Cookie': 'GOOGAPPUID=42'
+                    'Cookie': 'GOOGAPPUID=42',
+                    'X-Luci-Swarming-Bot-ID': 'localhost',
                 },
                 'timeout': remote_client.NET_CONNECTION_TIMEOUT_SEC,
+                'max_attempts': remote_client.NET_MAX_ATTEMPTS,
             },
             {
                 'bot_version': '123',
+                'session': 'fake-session-token',
                 'server': self.url,
                 'server_version': 1,
-                'bot_group_cfg_version': 'abc:def',
                 'bot_group_cfg': {
                     'dimensions': {
                         'bot_side': ['A']
@@ -583,123 +763,196 @@ class TestBotMain(TestBotBase):
                 },
             },
         ),
+        expect_poll(0, {
+            'cmd': 'sleep',
+            'duration': 1.0
+        }),
+        expect_poll(1, {
+            'cmd': 'sleep',
+            'duration': 1.0
+        }),
+        expect_poll(2, None),  # fails, gets retried
+        expect_poll(2, None),  # fails, gets retried
+        expect_poll(2, {
+            'cmd': 'sleep',
+            'duration': 1.0
+        }),
+        expect_poll(3, {
+            'cmd': 'terminate',
+            'task_id': 'terminate-id'
+        }),
+        # Reports the termination task as finished.
+        (
+            'https://localhost:1/swarming/api/v1/bot/task_update/terminate-id',
+            {
+                'data': {
+                    'id': 'localhost',
+                    'task_id': 'terminate-id',
+                    'duration': 0,
+                    'exit_code': 0,
+                    'session': 'fake-session-token',
+                },
+                'expected_error_codes': None,
+                'follow_redirects': False,
+                'headers': {
+                    'Cookie': 'GOOGAPPUID=42',
+                    'X-Luci-Swarming-Bot-ID': 'localhost',
+                },
+                'timeout': remote_client.NET_CONNECTION_TIMEOUT_SEC,
+                'max_attempts': remote_client.NET_MAX_ATTEMPTS,
+            },
+            {
+                'ok': True,
+            },
+        ),
+        # Reports that the bot is shutting down.
+        (
+            'https://localhost:1/swarming/api/v1/bot/event',
+            {
+                'data':
+                payload(3, {
+                    'event': 'bot_shutdown',
+                    'message': 'Signal was received',
+                }),
+                'expected_error_codes':
+                None,
+                'follow_redirects':
+                False,
+                'headers': {
+                    'Cookie': 'GOOGAPPUID=42',
+                    'X-Luci-Swarming-Bot-ID': 'localhost',
+                },
+                'timeout':
+                remote_client.NET_CONNECTION_TIMEOUT_SEC,
+                'max_attempts':
+                remote_client.NET_MAX_ATTEMPTS,
+            },
+            {
+                'ok': True,
+            },
+        ),
     ])
 
-    with self.assertRaises(Foo):
-      bot_main._run_bot(None)
+    bot_main._run_bot(None)
+
     self.assertEqual(self.attributes['dimensions']['id'][0],
                      os.environ['SWARMING_BOT_ID'])
 
-    self.assertEqual({
-        'bot_side': ['A'],
-        'foo': ['bar'],
-        'id': ['localhost'],
-        'pool': ['default'],
-    }, botobj[0].dimensions)
+    self.assertEqual(
+        {
+            'bot_side': ['A'],
+            'foo': ['bar'],
+            'id': ['localhost'],
+            'pool': ['default'],
+        }, botobj[0].dimensions)
 
-  def test_poll_server_sleep(self):
-    slept = []
-    bit = threading.Event()
-    self.mock(bit, 'wait', slept.append)
+  def test_poll_server_unexpected_exception(self):
+    # Enable it back, we want to test it now.
+    self.mock(bot_main, '_TRAP_ALL_EXCEPTIONS', True)
+
     self.mock(bot_main, '_run_manifest', self.fail)
     self.mock(bot_main, '_update_bot', self.fail)
+    self.mock(self.bot, 'host_reboot', self.fail)
+
+    def mocked_restart(*_args):
+      raise Exception('Totally random exception')
+
+    self.mock(bot_main, '_bot_restart', mocked_restart)
+
+    errs = []
+    self.mock(self.bot, 'post_error', errs.append)
+
+    self.expected_requests([
+        self.expected_poll_request({
+            'cmd': 'bot_restart',
+            'message': 'Restart now',
+        }),
+    ])
+    self.poll_once()
+
+    # Reported the error.
+    self.assertEqual(1, len(errs))
+    self.assertTrue(errs[0].startswith(
+        'Exception in cmd_bot_restart: Totally random exception\n'))
+    del errs[:]
+
+    # Do it again. The error should be dedupped.
+    self.expected_requests([
+        self.expected_poll_request({
+            'cmd': 'bot_restart',
+            'message': 'Restart now',
+        }),
+    ])
+    self.poll_once()
+    self.assertEqual(0, len(errs))
+
+    # >10 min later, the error is reported again.
+    self.quit_bit.reset()
+    self.clock.sleep(601)
+    self.expected_requests([
+        self.expected_poll_request({
+            'cmd': 'bot_restart',
+            'message': 'Restart now',
+        }),
+    ])
+    self.poll_once()
+    self.assertEqual(1, len(errs))
+
+  def test_poll_server_sleep(self):
+    self.mock(bot_main, '_run_manifest', self.fail)
+    self.mock(bot_main, '_update_bot', self.fail)
+
     from config import bot_config
     called = []
     self.mock(bot_config, 'on_bot_idle', lambda _bot, _s: called.append(1))
-    self.mock(uuid, 'uuid4', lambda: uuid.UUID(REQUEST_UUID))
 
-    data = self.attributes.copy()
-    data['request_uuid'] = REQUEST_UUID
     self.expected_requests([
-        (
-            'https://localhost:1/swarming/api/v1/bot/poll',
-            {
-                'data': data,
-                'expected_error_codes': None,
-                'follow_redirects': False,
-                'headers': {
-                    'Cookie': 'GOOGAPPUID=42'
-                },
-                'timeout': remote_client.NET_CONNECTION_TIMEOUT_SEC,
-            },
-            {
-                'cmd': 'sleep',
-                'duration': 1.24,
-            },
-        ),
+        self.expected_poll_request({
+            'cmd': 'sleep',
+            'duration': 123,
+        }),
     ])
-    self.assertFalse(bot_main._poll_server(self.bot, bit, 2))
-    self.assertEqual([1.24], slept)
+
+    self.poll_once()
+    self.assertEqual([123], self.quit_bit.slept)
     self.assertEqual([1], called)
 
   def test_poll_server_sleep_with_auth(self):
-    slept = []
-    bit = threading.Event()
-    self.mock(bit, 'wait', slept.append)
     self.mock(bot_main, '_run_manifest', self.fail)
     self.mock(bot_main, '_update_bot', self.fail)
-    self.mock(uuid, 'uuid4', lambda: uuid.UUID(REQUEST_UUID))
 
-    self.bot = self.make_bot(lambda: ({'A': 'a'}, time.time() + 3600))
+    self.make_bot(lambda: ({'A': 'a'}, time.time() + 3600))
 
-    data = self.attributes.copy()
-    data['request_uuid'] = REQUEST_UUID
+    # Expect the additional header.
+    req = {
+        'cmd': 'sleep',
+        'duration': 123,
+    }
     self.expected_requests([
-        (
-            'https://localhost:1/swarming/api/v1/bot/poll',
-            {
-                'data': data,
-                'expected_error_codes': None,
-                'follow_redirects': False,
-                'headers': {
-                    'A': 'a',
-                    'Cookie': 'GOOGAPPUID=42'
-                },
-                'timeout': remote_client.NET_CONNECTION_TIMEOUT_SEC,
-            },
-            {
-                'cmd': 'sleep',
-                'duration': 1.24,
-            },
-        ),
+        self.expected_poll_request(req, extra_headers={'A': 'a'}),
     ])
-    self.assertFalse(bot_main._poll_server(self.bot, bit, 0))
-    self.assertEqual([1.24], slept)
+    self.poll_once()
+    self.assertEqual([123], self.quit_bit.slept)
 
   def test_poll_server_run(self):
     manifest = []
     clean = []
-    bit = threading.Event()
-    self.mock(bit, 'wait', self.fail)
+
     self.mock(bot_main, '_run_manifest', lambda *args: manifest.append(args))
     self.mock(bot_main, '_clean_cache', lambda *args: clean.append(args))
     self.mock(bot_main, '_update_bot', self.fail)
-    self.mock(uuid, 'uuid4', lambda: uuid.UUID(REQUEST_UUID))
 
-    data = self.bot._attributes.copy()
-    data['request_uuid'] = REQUEST_UUID
     self.expected_requests([
-        (
-            'https://localhost:1/swarming/api/v1/bot/poll',
-            {
-                'data': data,
-                'expected_error_codes': None,
-                'follow_redirects': False,
-                'headers': {
-                    'Cookie': 'GOOGAPPUID=42'
-                },
-                'timeout': remote_client.NET_CONNECTION_TIMEOUT_SEC,
+        self.expected_poll_request({
+            'cmd': 'run',
+            'manifest': {
+                'foo': 'bar'
             },
-            {
-                'cmd': 'run',
-                'manifest': {
-                    'foo': 'bar'
-                },
-            },
-        ),
+        }),
     ])
-    self.assertTrue(bot_main._poll_server(self.bot, bit, 0))
-    expected = [(self.bot, {'foo': 'bar'}, time.time())]
+    self.poll_once()
+
+    expected = [(self.bot, {'foo': 'bar'}, None)]
     self.assertEqual(expected, manifest)
     expected = [(self.bot,)]
     self.assertEqual(expected, clean)
@@ -707,111 +960,903 @@ class TestBotMain(TestBotBase):
 
   def test_poll_server_update(self):
     update = []
-    bit = threading.Event()
-    self.mock(bit, 'wait', self.fail)
+
     self.mock(bot_main, '_run_manifest', self.fail)
     self.mock(bot_main, '_update_bot', lambda *args: update.append(args))
-    self.mock(uuid, 'uuid4', lambda: uuid.UUID(REQUEST_UUID))
 
-    data = self.attributes.copy()
-    data['request_uuid'] = REQUEST_UUID
     self.expected_requests([
-        (
-            'https://localhost:1/swarming/api/v1/bot/poll',
-            {
-                'data': data,
-                'expected_error_codes': None,
-                'follow_redirects': False,
-                'headers': {
-                    'Cookie': 'GOOGAPPUID=42'
-                },
-                'timeout': remote_client.NET_CONNECTION_TIMEOUT_SEC,
-            },
-            {
-                'cmd': 'update',
-                'version': '123',
-            },
-        ),
+        self.expected_poll_request({
+            'cmd': 'update',
+            'version': '123',
+        }),
     ])
-    self.assertTrue(bot_main._poll_server(self.bot, bit, 0))
+    self.poll_once()
+
     self.assertEqual([(self.bot, '123')], update)
     self.assertEqual(None, self.bot.bot_restart_msg())
 
   def test_poll_server_restart(self):
     restarts = []
-    bit = threading.Event()
-    self.mock(bit, 'wait', self.fail)
+
     self.mock(bot_main, '_run_manifest', self.fail)
     self.mock(bot_main, '_update_bot', self.fail)
     self.mock(self.bot, 'host_reboot', self.fail)
     self.mock(bot_main, '_bot_restart', lambda obj, x: restarts.append(x))
-    self.mock(uuid, 'uuid4', lambda: uuid.UUID(REQUEST_UUID))
 
-    data = self.attributes.copy()
-    data['request_uuid'] = REQUEST_UUID
     self.expected_requests([
-        (
-            'https://localhost:1/swarming/api/v1/bot/poll',
-            {
-                'data': data,
-                'expected_error_codes': None,
-                'follow_redirects': False,
-                'headers': {
-                    'Cookie': 'GOOGAPPUID=42'
-                },
-                'timeout': remote_client.NET_CONNECTION_TIMEOUT_SEC,
-            },
-            {
-                'cmd': 'bot_restart',
-                'message': 'Please restart now',
-            },
-        ),
+        self.expected_poll_request({
+            'cmd': 'bot_restart',
+            'message': 'Please restart now',
+        }),
     ])
-    self.assertTrue(bot_main._poll_server(self.bot, bit, 0))
+    self.poll_once()
+
     self.assertEqual(['Please restart now'], restarts)
     self.assertEqual(None, self.bot.bot_restart_msg())
 
   def test_poll_server_reboot(self):
     reboots = []
-    bit = threading.Event()
-    self.mock(bit, 'wait', self.fail)
+
     self.mock(bot_main, '_run_manifest', self.fail)
     self.mock(bot_main, '_update_bot', self.fail)
     self.mock(self.bot, 'host_reboot', lambda *args: reboots.append(args))
-    self.mock(uuid, 'uuid4', lambda: uuid.UUID(REQUEST_UUID))
 
-    data = self.attributes.copy()
-    data['request_uuid'] = REQUEST_UUID
     self.expected_requests([
-        (
-            'https://localhost:1/swarming/api/v1/bot/poll',
-            {
-                'data': data,
-                'expected_error_codes': None,
-                'follow_redirects': False,
-                'headers': {
-                    'Cookie': 'GOOGAPPUID=42'
-                },
-                'timeout': remote_client.NET_CONNECTION_TIMEOUT_SEC,
+        self.expected_poll_request({
+            'cmd': 'host_reboot',
+            'message': 'Please die now',
+        }),
+    ])
+    self.poll_once()
+
+    self.assertEqual([('Please die now',)], reboots)
+    self.assertEqual(None, self.bot.bot_restart_msg())
+
+  def test_rbe_mode_idle(self):
+    self.mock_rbe_worker_properties()
+
+    # Switches into the RBE mode, creates and polls the session. Gets nothing.
+    self.expected_requests([
+        self.expected_poll_request({
+            'cmd': 'rbe',
+            'rbe': {
+                'instance': 'instance_0',
+                'hybrid_mode': False,
+                'sleep': 0.0,
             },
+        }),
+        self.expected_rbe_create_request(),
+        self.expected_rbe_update_request(),
+    ])
+    self.poll_once()
+
+    # Wants to report the idle status to Swarming right away. Also polls RBE
+    # as always.
+    self.assertTrue(self.loop_state._swarming_poll_timer.firing)
+    self.expected_requests([
+        self.expected_poll_request(
             {
-                'cmd': 'host_reboot',
-                'message': 'Please die now',
+                'cmd': 'rbe',
+                'rbe': {
+                    'instance': 'instance_0',
+                    'hybrid_mode': False,
+                    'sleep': 0.0,
+                },
+            },
+            rbe_idle=True,
+            sleep_streak=1),
+        self.expected_rbe_update_request(blocking=True),
+    ])
+    self.poll_once()
+
+    # Does a bunch of RBE polls until it is time to poll Swarming again. The
+    # exact number depends on sleep timings (which are all mocked in the test).
+    polls = 0
+    while not self.loop_state._swarming_poll_timer.firing:
+      self.assertTrue(self.loop_state._rbe_poll_timer.firing)
+      polls += 1
+      self.expected_requests([
+          self.expected_rbe_update_request(blocking=True),
+      ])
+      self.poll_once()
+    self.assertEqual(polls, 9)
+
+    # Reports the idle state again, but gets the Swarming command to terminate.
+    self.expected_requests([
+        self.expected_poll_request(
+            {
+                'cmd': 'terminate',
+                'task_id': 'terminate-id',
+            },
+            rbe_idle=True,
+            sleep_streak=11),
+        self.expected_rbe_update_request('BOT_TERMINATING', blocking=True),
+        self.expected_task_update_request('terminate-id'),
+    ])
+    self.poll_once()
+
+    # When the bot shuts down, rbe_disable doesn't do anything, since the
+    # session is already closed.
+    self.loop_state.rbe_disable(remote_client.RBESessionStatus.BOT_TERMINATING)
+
+  def test_rbe_mode_rbe_termination(self):
+    self.mock_rbe_worker_properties()
+
+    # Switches into the RBE mode, creates and polls the session. Gets nothing.
+    self.expected_requests([
+        self.expected_poll_request({
+            'cmd': 'rbe',
+            'rbe': {
+                'instance': 'instance_0',
+                'hybrid_mode': False,
+                'sleep': 0.0,
+            },
+        }),
+        self.expected_rbe_create_request(),
+        self.expected_rbe_update_request(),
+    ])
+    self.poll_once()
+
+    # Polls RBE and gets an RBE termination request. Posts the termination
+    # notification to Swarming.
+    self.expected_requests([
+        self.expected_poll_request(
+            {
+                'cmd': 'rbe',
+                'rbe': {
+                    'instance': 'instance_0',
+                    'hybrid_mode': False,
+                    'sleep': 0.0,
+                },
+            },
+            rbe_idle=True,
+            sleep_streak=1),
+        self.expected_rbe_update_request(status_out='BOT_TERMINATING',
+                                         blocking=True),
+        self.expect_bot_event_request('bot_shutdown', 'Terminated by RBE'),
+    ])
+    self.poll_once()
+
+    # Wanting to terminate now.
+    self.assertTrue(self.loop_state._rbe_termination_pending)
+
+    # When the bot shuts down it acknowledges the session is terminating. It
+    # doesn't post another bot_shutdown event.
+    self.expected_requests([
+        self.expected_rbe_update_request('BOT_TERMINATING', blocking=True),
+    ])
+    self.loop_state.on_bot_exit()
+
+  def test_rbe_mode_idle_dimensions_change(self):
+    # Switches into the RBE mode, creates and polls the session. Gets nothing.
+    self.expected_requests([
+        self.expected_poll_request({
+            'cmd': 'rbe',
+            'rbe': {
+                'instance': 'instance_0',
+                'hybrid_mode': False,
+                'sleep': 0.0,
+            },
+        }),
+        self.expected_rbe_create_request(),
+        self.expected_rbe_update_request(),
+    ])
+    self.poll_once()
+
+    # Wants to report the idle status to Swarming right away. Also polls RBE
+    # as always.
+    self.assertTrue(self.loop_state._swarming_poll_timer.firing)
+    self.expected_requests([
+        self.expected_poll_request(
+            {
+                'cmd': 'rbe',
+                'rbe': {
+                    'instance': 'instance_0',
+                    'hybrid_mode': False,
+                    'sleep': 0.0,
+                },
+            },
+            rbe_idle=True,
+            sleep_streak=1),
+        self.expected_rbe_update_request(blocking=True),
+    ])
+    self.poll_once()
+
+    # Swarming is scheduled to be called at some later time.
+    self.assertFalse(self.loop_state._swarming_poll_timer.firing)
+
+    # Dimensions suddenly change.
+    self.attributes['dimensions']['extra'] = ['1']
+
+    # Swarming should be called right away (followed by an RBE poll).
+    self.expected_requests([
+        self.expected_poll_request(
+            {
+                'cmd': 'rbe',
+                'rbe': {
+                    'instance': 'instance_0',
+                    'hybrid_mode': False,
+                    'sleep': 0.0,
+                },
+            },
+            rbe_idle=True,
+            sleep_streak=2),
+        self.expected_rbe_update_request(blocking=True),
+    ])
+    self.poll_once()
+
+    # Swarming is again scheduled to be called at some later time.
+    self.assertFalse(self.loop_state._swarming_poll_timer.firing)
+
+  def test_rbe_mode_swarming_task(self):
+    self.mock(bot_main, '_run_manifest', lambda *_args: True)
+    self.mock(bot_main, '_clean_cache', lambda *_args: None)
+
+    # Switches into the RBE mode, creates and polls the session. Gets nothing.
+    self.expected_requests([
+        self.expected_poll_request({
+            'cmd': 'rbe',
+            'rbe': {
+                'instance': 'instance_0',
+                'hybrid_mode': False,
+                'sleep': 0.0,
+            },
+        }),
+        self.expected_rbe_create_request(),
+        self.expected_rbe_update_request(),
+    ])
+    self.poll_once()
+
+    # Reports the idle status to Swarming right away but suddenly gets a task.
+    # This forces the bot to shutdown the session.
+    self.assertTrue(self.loop_state._swarming_poll_timer.firing)
+    self.expected_requests([
+        self.expected_poll_request(
+            {
+                'cmd': 'run',
+                'manifest': {
+                    'task_id': 'task-id',
+                },
+            },
+            rbe_idle=True,
+            sleep_streak=1),
+        self.expected_rbe_update_request('BOT_TERMINATING', blocking=True),
+    ])
+    self.poll_once()
+
+    # On the next poll the bot is still in the Swarming mode.
+    self.assertTrue(self.loop_state._swarming_poll_timer.firing)
+    self.expected_requests([
+        self.expected_poll_request({
+            'cmd': 'sleep',
+            'duration': 5.0,
+        }),
+    ])
+    self.poll_once()
+
+    # On the next poll opens a new RBE session.
+    self.expected_requests([
+        self.expected_poll_request({
+            'cmd': 'rbe',
+            'rbe': {
+                'instance': 'instance_1',
+                'hybrid_mode': False,
+                'sleep': 0.0,
+            },
+        }),
+        self.expected_rbe_create_request(),
+        self.expected_rbe_update_request(blocking=True),
+    ])
+    self.poll_once()
+
+  def test_rbe_mode_unhealthy_session(self):
+    self.mock(self.loop_state, 'report_exception', lambda *_args: None)
+
+    # Switches into the RBE mode. Tries to open a session and fails.
+    self.expected_requests([
+        self.expected_poll_request({
+            'cmd': 'rbe',
+            'rbe': {
+                'instance': 'instance_0',
+                'hybrid_mode': False,
+                'sleep': 0.0,
+            },
+        }),
+        self.expected_rbe_create_request(fail=True),
+    ])
+    self.poll_once()
+
+    # This is recognized as an error.
+    self.assertEqual(self.loop_state._rbe_consecutive_errors, 1)
+
+    # On the next poll tries to open the session again. It succeeds, but then
+    # the poll reports the session is gone.
+    self.expected_requests([
+        self.expected_poll_request({
+            'cmd': 'rbe',
+            'rbe': {
+                'instance': 'instance_0',
+                'hybrid_mode': False,
+                'sleep': 0.0,
+            },
+        }),
+        self.expected_rbe_create_request(),  # resets cons. errors
+        self.expected_rbe_update_request(status_out='BOT_TERMINATING',
+                                         blocking=True),
+    ])
+    self.poll_once()
+
+    # This is also recognized as an error.
+    self.assertEqual(self.loop_state._rbe_consecutive_errors, 1)
+
+    # Termination doesn't do anything, there's no session.
+    self.loop_state.rbe_disable(remote_client.RBESessionStatus.BOT_TERMINATING)
+
+  def test_rbe_mode_switching_instance(self):
+    # Switches into the RBE mode, creates and polls the session. Gets nothing.
+    self.expected_requests([
+        self.expected_poll_request({
+            'cmd': 'rbe',
+            'rbe': {
+                'instance': 'instance_0',
+                'hybrid_mode': False,
+                'sleep': 0.0,
+            },
+        }),
+        self.expected_rbe_create_request(),
+        self.expected_rbe_update_request(),
+    ])
+    self.poll_once()
+
+    # Wants to report it as idle, but suddenly told to use another instance.
+    # Closes the old session and opens the new one.
+    self.expected_requests([
+        self.expected_poll_request(
+            {
+                'cmd': 'rbe',
+                'rbe': {
+                    'instance': 'instance_1',
+                    'hybrid_mode': False,
+                    'sleep': 0.0,
+                },
+            },
+            rbe_idle=True,
+            sleep_streak=1),
+        self.expected_rbe_update_request('BOT_TERMINATING', blocking=True),
+        self.expected_rbe_create_request(),
+        self.expected_rbe_update_request(blocking=True),
+    ])
+    self.poll_once()
+
+  def test_rbe_mode_handling_noop_leases(self):
+    finished = []
+    self.mock(self.loop_state, 'on_task_completed', finished.append)
+
+    # Switches into the RBE mode, creates and polls the session. Gets a lease
+    # right away.
+    cur_lease_id = 0
+    self.expected_requests([
+        self.expected_poll_request({
+            'cmd': 'rbe',
+            'rbe': {
+                'instance': 'instance_0',
+                'hybrid_mode': False,
+                'sleep': 0.0,
+            },
+        }),
+        self.expected_rbe_create_request(),
+        self.expected_rbe_update_request(
+            lease_out={
+                'id': 'lease-%d' % cur_lease_id,
+                'payload': {
+                    'noop': True
+                },
+                'state': 'PENDING',
+            }),
+    ])
+    self.poll_once()
+
+    # Did something.
+    self.assertEqual(len(finished), 1)
+    self.assertFalse(self.loop_state.idle)
+
+    # Keeps spinning finishing leases back to back until it is time to call
+    # Swarming to see what to do next.
+    while not self.loop_state._swarming_poll_timer.firing:
+      self.assertTrue(self.loop_state._rbe_poll_timer.firing)
+      self.assertEqual(len(finished), cur_lease_id + 1)
+      self.assertFalse(self.loop_state.idle)
+      self.expected_requests([
+          self.expected_rbe_update_request(
+              lease_in={
+                  'id': 'lease-%d' % cur_lease_id,
+                  'result': {},
+                  'state': 'COMPLETED',
+              },
+              lease_out={
+                  'id': 'lease-%d' % (cur_lease_id + 1),
+                  'payload': {
+                      'noop': True
+                  },
+                  'state': 'PENDING',
+              },
+          ),
+      ])
+      self.poll_once()
+      cur_lease_id += 1
+
+    # This number depends on mocked sleep timings.
+    self.assertEqual(cur_lease_id, 9)
+
+    # Tells Swarming the bot is busy doing RBE leases. Also reports the result
+    # of the last lease and gets the next one.
+    self.expected_requests([
+        self.expected_poll_request(
+            {
+                'cmd': 'rbe',
+                'rbe': {
+                    'instance': 'instance_0',
+                    'hybrid_mode': False,
+                    'sleep': 0.0,
+                },
+            },
+            rbe_idle=False,
+            sleep_streak=0),
+        self.expected_rbe_update_request(
+            lease_in={
+                'id': 'lease-%d' % cur_lease_id,
+                'result': {},
+                'state': 'COMPLETED',
+            },
+            lease_out={
+                'id': 'lease-%d' % (cur_lease_id + 1),
+                'payload': {
+                    'noop': True
+                },
+                'state': 'PENDING',
             },
         ),
     ])
-    self.assertTrue(bot_main._poll_server(self.bot, bit, 0))
-    self.assertEqual([('Please die now',)], reboots)
-    self.assertEqual(None, self.bot.bot_restart_msg())
+    self.poll_once()
+    cur_lease_id += 1
+
+    # Finally RBE tells there are no more leases.
+    self.expected_requests([
+        self.expected_rbe_update_request(lease_in={
+            'id': 'lease-%d' % cur_lease_id,
+            'result': {},
+            'state': 'COMPLETED',
+        }, ),
+    ])
+    self.poll_once()
+
+    # The bot is idle now and want to report this to Swarming ASAP.
+    self.assertTrue(self.loop_state.idle)
+    self.expected_requests([
+        self.expected_poll_request(
+            {
+                'cmd': 'rbe',
+                'rbe': {
+                    'instance': 'instance_0',
+                    'hybrid_mode': False,
+                    'sleep': 0.0,
+                },
+            },
+            rbe_idle=True,
+            sleep_streak=1),
+        self.expected_rbe_update_request(blocking=True),
+    ])
+    self.poll_once()
+
+  def expected_rbe_poll_and_claim(self, lease_id, claim_resp, blocking=False):
+    return [
+        self.expected_poll_request({
+            'cmd': 'rbe',
+            'rbe': {
+                'instance': 'instance',
+                'hybrid_mode': False,
+                'sleep': 0.0,
+            },
+        }),
+        self.expected_rbe_create_request(),
+        self.expected_rbe_update_request(blocking=blocking,
+                                         lease_out={
+                                             'id': lease_id,
+                                             'payload': {
+                                                 'task_id': 'some-task-id',
+                                                 'task_to_run_shard': 5,
+                                                 'task_to_run_id': 6,
+                                             },
+                                             'state': 'PENDING',
+                                         }),
+        self.expected_claim_request(lease_id, 'some-task-id', 5, 6, claim_resp),
+    ]
+
+  def test_rbe_mode_claim_skip(self):
+    finished = []
+    self.mock(self.loop_state, 'on_task_completed', finished.append)
+
+    # Switches into the RBE mode, creates and polls the session. Gets a lease
+    # right away, proceeds to claiming it, discovers it should be skipped.
+    self.expected_requests(
+        self.expected_rbe_poll_and_claim('lease-id', {
+            'cmd': 'skip',
+            'reason': 'Just skip',
+        }))
+    self.poll_once()
+
+    # On the next cycle reports the lease was skipped.
+    self.expected_requests([
+        self.expected_rbe_update_request(lease_in={
+            'id': 'lease-id',
+            'result': {
+                'skip_reason': 'Just skip'
+            },
+            'state': 'COMPLETED',
+        }, ),
+    ])
+    self.poll_once()
+
+    # This doesn't count as a completed task.
+    self.assertFalse(finished)
+
+  def test_rbe_mode_claim_terminate(self):
+    # Switches into the RBE mode, creates and polls the session. Gets a lease
+    # right away, proceeds to claiming it, discovers it is termination, executes
+    # it.
+    self.expected_requests(
+        self.expected_rbe_poll_and_claim('lease-id', {
+            'cmd': 'terminate',
+            'task_id': 'terminate-id',
+        }) + [self.expected_task_update_request('terminate-id')])
+    self.poll_once()
+
+    # Stopped now.
+    self.assertTrue(self.quit_bit.is_set())
+
+    # On shutdown reports the reservation as completed.
+    self.expected_requests([
+        self.expected_rbe_update_request(
+            status_in='BOT_TERMINATING',
+            lease_in={
+                'id': 'lease-id',
+                'result': {},
+                'state': 'COMPLETED',
+            },
+            blocking=True,
+        ),
+    ])
+    self.loop_state.rbe_disable(remote_client.RBESessionStatus.BOT_TERMINATING)
+
+  def test_rbe_mode_claim_run(self):
+    ran = []
+
+    def run_manifest(_bot, manifest, rbe_session):
+      rbe_session.finish_active_lease({})
+      ran.append(manifest)
+      return True
+
+    self.mock(bot_main, '_run_manifest', run_manifest)
+
+    finished = []
+    self.mock(self.loop_state, 'on_task_completed', finished.append)
+
+    # Switches into the RBE mode, creates and polls the session. Gets a lease
+    # right away, proceeds to claiming it, discovers it is a real task, executes
+    # it.
+    self.expected_requests(
+        self.expected_rbe_poll_and_claim('lease-id', {
+            'cmd': 'run',
+            'manifest': {
+                'fake': 'manifest'
+            },
+        }))
+    self.poll_once()
+
+    # Ran the task.
+    self.assertEqual(ran, [{'fake': 'manifest'}])
+    self.assertEqual(finished, [True])
+
+    # Reports the lease is finished on completion.
+    self.expected_requests([
+        self.expected_rbe_update_request(lease_in={
+            'id': 'lease-id',
+            'result': {},
+            'state': 'COMPLETED',
+        }, ),
+    ])
+    self.poll_once()
+
+  def test_rbe_mode_claim_and_crash(self):
+    def run_manifest(_bot, _manifest, _rbe_session):
+      raise Exception('BOOM')
+
+    self.mock(bot_main, '_run_manifest', run_manifest)
+
+    self.mock(self.loop_state, 'on_task_completed',
+              lambda _: self.fail('must not be called'))
+
+    errors = []
+    self.mock(self.bot, 'post_error', errors.append)
+
+    # Switches into the RBE mode, creates and polls the session. Gets a lease
+    # right away, proceeds to claiming it, discovers it is a real task, tries to
+    # execute it and blows up due to a Swarming bot bug.
+    self.expected_requests(
+        self.expected_rbe_poll_and_claim('lease-id', {
+            'cmd': 'run',
+            'manifest': {
+                'fake': 'manifest'
+            },
+        }))
+    try:
+      self.poll_once()
+    except Exception as exc:
+      self.assertEqual(str(exc), 'BOOM')
+
+    # Reports the lease as abandoned.
+    self.expected_requests([
+        self.expected_rbe_update_request(lease_in={
+            'id': 'lease-id',
+            'result': {
+                'bot_internal_error': 'Bot crashed before finishing the lease',
+            },
+            'state': 'COMPLETED',
+        }, ),
+    ])
+    self.poll_once()
+
+    # Reports the error.
+    self.assertEqual(errors, ['Orphaned RBE lease, bot loop crashing?'])
+
+  def test_hybrid_mode_idle(self):
+    # Starting in hybrid mode, polling Swarming next.
+    self.prep_hybrid_mode({
+        'instance': 'instance_0',
+        'hybrid_mode': True,
+        'sleep': 1.0,
+    })
+
+    # Makes a forced Swarming poll, gets nothing. Opens an RBE session and makes
+    # maintenance poll.
+    self.assertEqual(self.loop_state._next_scheduler, 'swarming')
+    self.expected_requests([
+        self.expected_poll_request(
+            {
+                'cmd': 'rbe',
+                'rbe': {
+                    'instance': 'instance_0',
+                    'hybrid_mode': True,
+                    'sleep': 5.0,
+                },
+            },
+            force=True),
+        self.expected_rbe_create_request(),
+        self.expected_rbe_update_request(status_in='MAINTENANCE'),
+    ])
+    self.poll_once()
+    self.assertEqual(self.loop_state._consecutive_idle_cycles, 0)
+
+    # The next poll is from RBE scheduler. Makes a non-forced Swarming poll,
+    # gets nothing. Makes a full RBE poll.
+    self.assertEqual(self.loop_state._next_scheduler, 'rbe')
+    self.expected_requests([
+        self.expected_poll_request(
+            {
+                'cmd': 'rbe',
+                'rbe': {
+                    'instance': 'instance_0',
+                    'hybrid_mode': True,
+                    'sleep': 10.0,
+                },
+            },
+            rbe_idle=False,
+            sleep_streak=0,
+            force=False),
+        self.expected_rbe_update_request(),
+    ])
+    self.poll_once()
+    self.assertEqual(self.loop_state._consecutive_idle_cycles, 1)
+
+    # Swarming's turn again. Reports idle status now.
+    self.assertEqual(self.loop_state._next_scheduler, 'swarming')
+    self.expected_requests([
+        self.expected_poll_request(
+            {
+                'cmd': 'rbe',
+                'rbe': {
+                    'instance': 'instance_0',
+                    'hybrid_mode': True,
+                    'sleep': 5.0,
+                },
+            },
+            rbe_idle=True,
+            sleep_streak=1,
+            force=True),
+        self.expected_rbe_update_request(status_in='MAINTENANCE'),
+    ])
+    self.poll_once()
+    self.assertEqual(self.loop_state._consecutive_idle_cycles, 1)
+
+  def test_hybrid_mode_swarming_scheduler_task(self):
+    self.mock(bot_main, '_run_manifest', lambda *args: True)
+
+    finished = []
+    self.mock(self.loop_state, 'on_task_completed', finished.append)
+
+    # Starting in hybrid mode, polling Swarming next.
+    self.prep_hybrid_mode({
+        'instance': 'instance_0',
+        'hybrid_mode': True,
+        'sleep': 1.0,
+    })
+
+    # Makes a forced Swarming poll, gets a task. Nevertheless opens an RBE
+    # session and makes a maintenance poll.
+    self.assertEqual(self.loop_state._next_scheduler, 'swarming')
+    self.expected_requests([
+        self.expected_poll_request(
+            {
+                'cmd': 'run',
+                'manifest': {
+                    'task_id': 'some-task-id',
+                },
+                'rbe': {
+                    'instance': 'instance_0',
+                    'hybrid_mode': True,
+                    'sleep': 5.0,
+                },
+            },
+            force=True),
+        self.expected_rbe_create_request(),
+        self.expected_rbe_update_request(status_in='MAINTENANCE'),
+    ])
+    self.poll_once()
+    self.assertEqual(self.loop_state._consecutive_idle_cycles, 0)
+
+    # Ran the task.
+    self.assertEqual(len(finished), 1)
+
+    # The next poll is from RBE scheduler. Makes a non-forced Swarming poll,
+    # gets nothing. Makes a full RBE poll.
+    self.assertEqual(self.loop_state._next_scheduler, 'rbe')
+    self.expected_requests([
+        self.expected_poll_request(
+            {
+                'cmd': 'rbe',
+                'rbe': {
+                    'instance': 'instance_0',
+                    'hybrid_mode': True,
+                    'sleep': 10.0,
+                },
+            },
+            rbe_idle=False,
+            sleep_streak=0,
+            force=False),
+        self.expected_rbe_update_request(),
+    ])
+    self.poll_once()
+    self.assertEqual(self.loop_state._consecutive_idle_cycles, 0)
+
+  def test_hybrid_mode_rbe_scheduler_task(self):
+    def run_manifest(_bot, _manifest, rbe_session):
+      rbe_session.finish_active_lease({})
+      return True
+
+    self.mock(bot_main, '_run_manifest', run_manifest)
+
+    finished = []
+    self.mock(self.loop_state, 'on_task_completed', finished.append)
+
+    # Starting in hybrid mode, polling RBE next.
+    self.prep_hybrid_mode(
+        {
+            'instance': 'instance_0',
+            'hybrid_mode': True,
+            'sleep': 1.0,
+        }, 'rbe')
+
+    # Makes a maintenance Swarming poll, gets nothing. Opens an RBE session and
+    # makes a full poll getting a lease.
+    self.assertEqual(self.loop_state._next_scheduler, 'rbe')
+    self.expected_requests([
+        self.expected_poll_request(
+            {
+                'cmd': 'rbe',
+                'rbe': {
+                    'instance': 'instance_0',
+                    'hybrid_mode': True,
+                    'sleep': 5.0,
+                },
+            },
+            force=False),
+        self.expected_rbe_create_request(),
+        self.expected_rbe_update_request(
+            lease_out={
+                'id': 'lease-id',
+                'payload': {
+                    'task_id': 'some-task-id',
+                    'task_to_run_shard': 5,
+                    'task_to_run_id': 6,
+                },
+                'state': 'PENDING',
+            }),
+        self.expected_claim_request('lease-id', 'some-task-id', 5, 6, {
+            'cmd': 'run',
+            'manifest': {
+                'fake': 'manifest'
+            },
+        }),
+    ])
+    self.poll_once()
+    self.assertEqual(self.loop_state._consecutive_idle_cycles, 0)
+
+    # Ran the task.
+    self.assertEqual(len(finished), 1)
+
+    # The next poll is from Swarming scheduler. Still making a maintenance poll
+    # of RBE, reporting the result of the previously executed lease.
+    self.assertEqual(self.loop_state._next_scheduler, 'swarming')
+    self.expected_requests([
+        self.expected_poll_request(
+            {
+                'cmd': 'rbe',
+                'rbe': {
+                    'instance': 'instance_0',
+                    'hybrid_mode': True,
+                    'sleep': 10.0,
+                },
+            },
+            rbe_idle=False,
+            sleep_streak=0,
+            force=True),
+        self.expected_rbe_update_request(status_in='MAINTENANCE',
+                                         lease_in={
+                                             'id': 'lease-id',
+                                             'result': {},
+                                             'state': 'COMPLETED',
+                                         }),
+    ])
+    self.poll_once()
+    self.assertEqual(self.loop_state._consecutive_idle_cycles, 0)
+
+  def test_hybrid_mode_update(self):
+    update = []
+    self.mock(bot_main, '_update_bot', lambda *args: update.append(args))
+
+    # Starting in hybrid mode, polling RBE next.
+    self.prep_hybrid_mode(
+        {
+            'instance': 'instance_0',
+            'hybrid_mode': True,
+            'sleep': 1.0,
+        }, 'rbe')
+
+    # Immediately gets `update` command. Does NOT open an RBE session.
+    self.assertEqual(self.loop_state._next_scheduler, 'rbe')
+    self.expected_requests([
+        self.expected_poll_request({
+            'cmd': 'update',
+            'version': '123',
+        },
+                                   force=False),
+    ])
+    self.poll_once()
+
+    # Updated.
+    self.assertEqual(len(update), 1)
 
   def _mock_popen(self,
                   returncode=0,
                   exit_code=0,
-                  url='https://localhost:1',
-                  expected_auth_params_json=None):
+                  expected_auth_params_json=None,
+                  expected_session_json=None,
+                  internal_error=None,
+                  internal_error_reported=False):
     result = {
         'exit_code': exit_code,
-        'must_signal_internal_failure': None,
+        'internal_error': internal_error,
+        'internal_error_reported': internal_error_reported,
         'version': 3,
     }
     # Method should have "self" as first argument - pylint: disable=E0213
@@ -824,27 +1869,42 @@ class TestBotMain(TestBotBase):
                                        'task_runner_out.json')
         cmd = cmd[:]
         expected = [
-          sys.executable, bot_main.THIS_FILE, 'task_runner',
-          '--swarming-server', url,
-          '--in-file',
-          os.path.join(self.root_dir, 'w', 'task_runner_in.json'),
-          '--out-file', self2._out_file,
-          '--cost-usd-hour', '3600.0', '--start', '100.0',
-          '--bot-file',
+            sys.executable,
+            bot_main.THIS_FILE,
+            'task_runner',
+            '--swarming-server',
+            self.url,
+            '--in-file',
+            os.path.join(self.root_dir, 'w', 'task_runner_in.json'),
+            '--out-file',
+            self2._out_file,
+            '--cost-usd-hour',
+            '3600.0',
+            '--start',
+            '100.0',
         ]
+
+        self.assertEqual(cmd[:len(expected)], expected)
+        del cmd[:len(expected)]
+
         # After than there may be --bot-file and --auth-params-file. Then --
         # will be used to mark the separation of flags meant to be sent to
         # run_isolated.
-        self.assertEqual(cmd[:len(expected)], expected)
-        del cmd[:len(expected)]
-        self.assertTrue(cmd.pop(0).endswith('.json'))
-        if expected_auth_params_json:
-          auth_params_file = os.path.join(self.root_dir, 'w',
-                                          'bot_auth_params.json')
-          with open(auth_params_file, 'rb') as f:
-            actual_auth_params = json.load(f)
-          self.assertEqual(expected_auth_params_json, actual_auth_params)
-          self.assertEqual(cmd[:2], ['--auth-params-file', auth_params_file])
+        while cmd and cmd[0] != '--':
+          flag = cmd.pop(0)
+          self.assertIn(
+              flag,
+              ('--bot-file', '--auth-params-file', '--session-state-file'))
+          with open(cmd[0], 'rb') as f:
+            body = f.read()
+          cmd.pop(0)
+          if flag == '--bot-file':
+            self.assertEqual(b'', body)
+          if flag == '--auth-params-file' and expected_auth_params_json:
+            self.assertEqual(expected_auth_params_json, json.loads(body))
+          if flag == '--session-state-file' and expected_session_json:
+            self.assertEqual(expected_session_json, json.loads(body))
+
         self.assertEqual(True, detached)
         self.assertEqual(self.bot.base_dir, cwd)
         self.assertEqual('24', env['SWARMING_TASK_ID'])
@@ -869,7 +1929,8 @@ class TestBotMain(TestBotBase):
 
   def test_run_manifest(self):
     self.mock(bot_main, '_post_error_task', self.print_err_and_fail)
-    def call_hook(botobj, name, *args):
+
+    def call_hook(_chained, botobj, name, *args):
       if name == 'on_after_task':
         failure, internal_failure, dimensions, summary = args
         self.assertEqual(self.attributes['dimensions'], botobj.dimensions)
@@ -878,7 +1939,12 @@ class TestBotMain(TestBotBase):
         self.assertEqual({'os': 'Amiga', 'pool': 'default'}, dimensions)
         self.assertEqual(result, summary)
     self.mock(bot_main, '_call_hook', call_hook)
-    result = self._mock_popen(url='https://localhost:3')
+    result = self._mock_popen(
+        expected_session_json={
+            'session_id': 'fake-session-id',
+            'session_token': 'fake-session-token',
+            'rbe_session': None,
+        })
 
     manifest = {
         'command': ['echo', 'hi'],
@@ -893,15 +1959,14 @@ class TestBotMain(TestBotBase):
         'task_id': '24',
     }
     self.assertEqual(self.root_dir, self.bot.base_dir)
-    bot_main._run_manifest(self.bot, manifest, time.time())
+    bot_main._run_manifest(self.bot, manifest, None)
 
   def test_run_manifest_with_auth_headers(self):
-    self.bot = self.make_bot(
-        auth_headers_cb=lambda: ({'A': 'a'}, time.time() + 3600))
+    self.make_bot(auth_headers_cb=lambda: ({'A': 'a'}, time.time() + 3600))
 
     self.mock(bot_main, '_post_error_task', self.print_err_and_fail)
 
-    def call_hook(botobj, name, *args):
+    def call_hook(_chained, botobj, name, *args):
       if name == 'on_after_task':
         failure, internal_failure, dimensions, summary = args
         self.assertEqual(self.attributes['dimensions'], botobj.dimensions)
@@ -911,7 +1976,6 @@ class TestBotMain(TestBotBase):
         self.assertEqual(result, summary)
     self.mock(bot_main, '_call_hook', call_hook)
     result = self._mock_popen(
-        url='https://localhost:3',
         expected_auth_params_json={
             'bot_id': 'localhost',
             'task_id': '24',
@@ -921,7 +1985,7 @@ class TestBotMain(TestBotBase):
             'swarming_http_headers_exp': int(time.time() + 3600),
             'bot_service_account': 'none',
             'system_service_account':
-                'robot@example.com',  # as in task manifest
+            'robot@example.com',  # as in task manifest
             'task_service_account': 'bot',
         })
 
@@ -946,12 +2010,47 @@ class TestBotMain(TestBotBase):
         'task_id': '24',
     }
     self.assertEqual(self.root_dir, self.bot.base_dir)
-    bot_main._run_manifest(self.bot, manifest, time.time())
+    bot_main._run_manifest(self.bot, manifest, None)
+
+  def test_run_manifest_with_rbe(self):
+    self.mock(bot_main, '_post_error_task', self.print_err_and_fail)
+
+    rbe_session = remote_client.RBESession(self.bot.remote, 'rbe-instance',
+                                           'bot_version', None, 'session-id')
+    rbe_session._active_lease = remote_client.RBELease(
+        'id', remote_client.RBELeaseState.ACTIVE)
+    rbe_results = []
+    self.mock(rbe_session, 'finish_active_lease',
+              lambda res, **_kwargs: rbe_results.append(res))
+
+    self._mock_popen(
+        expected_session_json={
+            'session_id': 'fake-session-id',
+            'session_token': 'fake-session-token',
+            'rbe_session': rbe_session.to_dict(),
+        })
+
+    manifest = {
+        'command': ['echo', 'hi'],
+        'dimensions': {
+            'os': 'Amiga',
+            'pool': 'default'
+        },
+        'grace_period': 30,
+        'hard_timeout': 60,
+        'io_timeout': None,
+        'host': 'https://localhost:3',
+        'task_id': '24',
+    }
+    self.assertEqual(self.root_dir, self.bot.base_dir)
+    bot_main._run_manifest(self.bot, manifest, rbe_session)
+
+    self.assertTrue(rbe_results)
 
   def test_run_manifest_task_failure(self):
     self.mock(bot_main, '_post_error_task', self.print_err_and_fail)
 
-    def call_hook(_botobj, name, *args):
+    def call_hook(_chained, _botobj, name, *args):
       if name == 'on_after_task':
         failure, internal_failure, dimensions, summary = args
         self.assertEqual(True, failure)
@@ -972,12 +2071,13 @@ class TestBotMain(TestBotBase):
         'io_timeout': 60,
         'task_id': '24',
     }
-    bot_main._run_manifest(self.bot, manifest, time.time())
+    bot_main._run_manifest(self.bot, manifest, None)
 
   def test_run_manifest_internal_failure(self):
     posted = []
     self.mock(bot_main, '_post_error_task', lambda *args: posted.append(args))
-    def call_hook(_botobj, name, *args):
+
+    def call_hook(_chained, _botobj, name, *args):
       if name == 'on_after_task':
         failure, internal_failure, dimensions, summary = args
         self.assertEqual(False, failure)
@@ -998,9 +2098,38 @@ class TestBotMain(TestBotBase):
         'io_timeout': 60,
         'task_id': '24',
     }
-    bot_main._run_manifest(self.bot, manifest, time.time())
+    bot_main._run_manifest(self.bot, manifest, None)
     expected = [(self.bot, 'Execution failed: internal error (1).', '24')]
     self.assertEqual(expected, posted)
+
+  def test_run_manifest_internal_error_reported(self):
+    posted = []
+    self.mock(bot_main, '_post_error_task', lambda *args: posted.append(args))
+
+    def call_hook(_chained, _botobj, name, *args):
+      if name == 'on_after_task':
+        failure, internal_failure, dimensions, summary = args
+        self.assertEqual(False, failure)
+        self.assertEqual(True, internal_failure)
+        self.assertEqual({'pool': 'default'}, dimensions)
+        self.assertEqual(result, summary)
+
+    self.mock(bot_main, '_call_hook', call_hook)
+    result = self._mock_popen(returncode=0,
+                              internal_error='there is an error',
+                              internal_error_reported=True)
+
+    manifest = {
+        'command': ['echo', 'hi'],
+        'dimensions': {
+            'pool': 'default'
+        },
+        'grace_period': 30,
+        'hard_timeout': 60,
+        'io_timeout': 60,
+        'task_id': '24',
+    }
+    bot_main._run_manifest(self.bot, manifest, None)
 
   def test_run_manifest_exception(self):
     posted = []
@@ -1010,7 +2139,7 @@ class TestBotMain(TestBotBase):
 
     self.mock(bot_main, '_post_error_task', post_error_task)
 
-    def call_hook(_botobj, name, *args):
+    def call_hook(_chained, _botobj, name, *args):
       if name == 'on_after_task':
         failure, internal_failure, dimensions, summary = args
         self.assertEqual(False, failure)
@@ -1035,8 +2164,8 @@ class TestBotMain(TestBotBase):
         'io_timeout': None,
         'task_id': '24',
     }
-    bot_main._run_manifest(self.bot, manifest, time.time())
-    expected = [(self.bot, 'Internal exception occured: Dang', '24')]
+    bot_main._run_manifest(self.bot, manifest, None)
+    expected = [(self.bot, 'Internal exception occurred: Dang', '24')]
     self.assertEqual(expected, posted)
 
   def test_update_bot(self):
@@ -1107,32 +2236,7 @@ class TestBotMain(TestBotBase):
       f.write(b'ab')
     self.mock(bot_main, 'THIS_FILE', cur)
 
-    self.assertEqual(True, bot_main._update_lkgbc(self.bot))
-    with open(lkgbc, 'rb') as f:
-      self.assertEqual(b'ab', f.read())
-
-  def test_maybe_update_lkgbc(self):
-    # Create LKGBC with a timestamp from 1h ago.
-    lkgbc = os.path.join(self.bot.base_dir, 'swarming_bot.zip')
-    with open(lkgbc, 'wb') as f:
-      f.write(b'a')
-    past = time.time() - 60 * 60
-    os.utime(lkgbc, (past, past))
-
-    cur = os.path.join(self.bot.base_dir, 'swarming_bot.1.zip')
-    with open(cur, 'wb') as f:
-      f.write(b'ab')
-    self.mock(bot_main, 'THIS_FILE', cur)
-
-    # No update even if they mismatch, LKGBC is not old enough.
-    self.assertEqual(False, bot_main._maybe_update_lkgbc(self.bot))
-    with open(lkgbc, 'rb') as f:
-      self.assertEqual(b'a', f.read())
-
-    # Fast forward a little more than 7 days.
-    now = time.time()
-    self.mock(time, 'time', lambda: now + 7 * 24 * 60 * 60 + 10)
-    self.assertEqual(True, bot_main._maybe_update_lkgbc(self.bot))
+    self.assertEqual(True, self.orig_update_lkgbc(self.bot))
     with open(lkgbc, 'rb') as f:
       self.assertEqual(b'ab', f.read())
 
@@ -1146,6 +2250,7 @@ class TestBotNotMocked(TestBotBase):
       calls.append(args)
       return 23
     self.mock(bot_main.common, 'exec_python', exec_python)
+
     # pylint: disable=unused-argument
     class Popen(object):
       def __init__(self2, cmd, cwd, stdin, stdout, stderr, detached, **kwargs):
@@ -1169,6 +2274,9 @@ class TestBotNotMocked(TestBotBase):
         return '', None
     self.mock(subprocess42, 'Popen', Popen)
 
+    self.mock(time, 'sleep', lambda _: None)
+    self.mock(self.bot, 'post_event', lambda *_args: None)
+
     with self.assertRaises(SystemExit) as e:
       bot_main._bot_restart(self.bot, 'Yo', bot_main.THIS_FILE)
     self.assertEqual(23, e.exception.code)
@@ -1176,10 +2284,27 @@ class TestBotNotMocked(TestBotBase):
     self.assertEqual([[bot_main.THIS_FILE, 'start_slave', '--survive']], calls)
 
 
+class TestRBEWorkerProperties(TestBotBase):
+
+  def test_works(self):
+    self.mock(
+        gce, 'get_metadata', lambda: {
+            'instance': {
+                'attributes': {
+                    'pool_id': 'rbe-pool-id',
+                    'pool_version': 'rbe-pool-version',
+                },
+            },
+        })
+    props = bot_main._get_rbe_worker_properties()
+    self.assertEqual(props.to_dict(), {
+        'pool_id': 'rbe-pool-id',
+        'pool_version': 'rbe-pool-version'
+    })
+
+
 if __name__ == '__main__':
   fix_encoding.fix_encoding()
-  if '-v' in sys.argv:
-    TestBotMain.maxDiff = None
   logging.basicConfig(
       level=logging.DEBUG if '-v' in sys.argv else logging.CRITICAL)
   unittest.main()

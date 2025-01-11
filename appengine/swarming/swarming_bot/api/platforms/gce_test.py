@@ -159,7 +159,7 @@ class TestGCE(auto_stub.TestCase):
     self.assertEqual(gce.get_machine_type(), 'n1-standard-8')
 
   def test_get_cpuinfo(self):
-    self.assertEqual(gce.get_cpuinfo(), {
+    self.assertEqual(gce.get_cpuinfo_uncached(), {
         'name': 'Intel(R) Xeon(R) CPU Broadwell GCE',
         'vendor': 'GenuineIntel'
     })
@@ -170,9 +170,31 @@ class TestGCE(auto_stub.TestCase):
             'cpuPlatform': 'AMD Rome'
         }
     }
-    self.assertEqual(gce.get_cpuinfo(), {
+    self.assertEqual(gce.get_cpuinfo_uncached(), {
         'name': 'AMD Rome GCE',
         'vendor': 'AuthenticAMD'
+    })
+
+  def test_get_cpuinfo_ampere(self):
+    self.mock_get_metadata.return_value = {
+        'instance': {
+            'cpuPlatform': 'Ampere Altra',
+        }
+    }
+    self.assertEqual(gce.get_cpuinfo_uncached(), {
+        'name': 'Ampere Altra GCE',
+        'vendor': 'ARM'
+    })
+
+  def test_get_cpuinfo_google_axion(self):
+    self.mock_get_metadata.return_value = {
+        'instance': {
+            'cpuPlatform': 'Google Axion',
+        }
+    }
+    self.assertEqual(gce.get_cpuinfo_uncached(), {
+        'name': 'Google Axion GCE',
+        'vendor': 'ARM'
     })
 
   def test_get_tags(self):

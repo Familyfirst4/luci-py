@@ -5,7 +5,9 @@
 """remote.Provider reads configs from a remote config service."""
 
 import base64
+import cStringIO
 import datetime
+import gzip
 import logging
 import math
 import random
@@ -20,12 +22,17 @@ utils.fix_protobuf_package()
 
 from google import protobuf
 from google.appengine.ext import ndb
+from google.protobuf import field_mask_pb2
 
 from components import net
 from components import utils
+from components.prpc import client
+from components.prpc import codes
 
 from . import common
 from . import validation
+from .proto import config_service_pb2
+from .proto import config_service_prpc_pb2
 
 
 MEMCACHE_PREFIX = 'components.config/v2/'
@@ -66,6 +73,10 @@ class Provider(object):
     assert service_hostname
     self.service_hostname = service_hostname
 
+  def _is_v1_host(self):
+    """Returns True if it's a V1 Config Service hostname."""
+    return self.service_hostname.endswith('.appspot.com')
+
   @ndb.tasklet
   def _api_call_async(self, path, allow_not_found=True, **kwargs):
     assert path
@@ -83,8 +94,69 @@ class Provider(object):
       logging.warning('%s response: %s', ex.status_code, ex.response)
       raise
 
+  def _config_v2_client(self):
+    """Returns a prpc client pointing to the V2 Config Service."""
+    assert not self._is_v1_host(
+    ), 'Should not create a prpc client for v1 Config Service'
+    return client.Client(self.service_hostname,
+                         config_service_prpc_pb2.ConfigsServiceDescription)
+
   @ndb.tasklet
-  def get_config_by_hash_async(self, content_hash):
+  def _get_config_v2_async(self, req, allow_not_found=True):
+    """Make a GetConfig rpc call to V2 Config Service
+
+    Returns:
+      a config_service_pb2.Config or None if no such config and allow_not_found
+      arg is set to True.
+      If the rpc response has a signed url, the content will be downloaded from
+      that signed url and be populted it into the
+      config_service_pb2.Config.raw_content.
+    """
+    assert isinstance(req, config_service_pb2.GetConfigRequest), req
+
+    try:
+      res = yield self._config_v2_client().GetConfigAsync(
+          req, credentials=client.service_account_credentials())
+    except client.RpcError as rpce:
+      if rpce.status_code == codes.StatusCode.NOT_FOUND and allow_not_found:
+        raise ndb.Return(None)
+      logging.error('RpcError for GetConfig(%s): %s\n' % (req, rpce))
+      raise rpce
+
+    if res.signed_url:
+      try:
+        headers = {}
+        blob = yield net.request_async(
+            url=res.signed_url,
+            method='GET',
+            params=net.PARAMS_IN_URL,  # GCS signed urls usually include params.
+            headers={'Accept-Encoding': 'gzip'},
+            response_headers=headers,
+        )
+        headers = {k.lower(): v for k, v in headers.items()}
+        if blob and headers.get('content-encoding', '').lower() == 'gzip':
+          res.raw_content = gzip.GzipFile(
+              fileobj=cStringIO.StringIO(blob)).read()
+        else:
+          res.raw_content = blob
+      except net.Error as ex:
+        logging.error(
+            'Error when downloading content from the signed url: HTTP %s - %s',
+            ex.status_code, ex.response)
+        raise
+    raise ndb.Return(res)
+
+  def _check_content_hash_match(self, content_hash):
+    """"Check if content_hash matches the format in the setted service version.
+
+      In Luci-config v1, the content_hash format is v1:<sha>.
+      In v2, it is a pure sha256 string.
+    """
+    assert content_hash
+    return content_hash.startswith('v1:') if self._is_v1_host() else True
+
+  @ndb.tasklet
+  def get_config_by_hash_async(self, content_hash, config_set):
     """Returns a config blob by its hash. Memcaches results."""
     assert content_hash
     cache_key = '%sconfig_by_hash/%s' % (MEMCACHE_PREFIX, content_hash)
@@ -93,8 +165,18 @@ class Provider(object):
     if content is not None:
       raise ndb.Return(zlib.decompress(content))
 
-    res = yield self._api_call_async('config/%s' % content_hash)
-    content = base64.b64decode(res.get('content')) if res else None
+    if self._is_v1_host():
+      res = yield self._api_call_async('config/%s' % content_hash)
+      content = base64.b64decode(res.get('content')) if res else None
+    else:
+      assert config_set
+      res = yield self._get_config_v2_async(
+          config_service_pb2.GetConfigRequest(
+              config_set=config_set,
+              content_sha256=content_hash,
+              fields=field_mask_pb2.FieldMask(paths=['content']),
+          ))
+      content = res.raw_content if res else None
     if content is not None:
       yield ctx.memcache_set(cache_key, zlib.compress(content))
     raise ndb.Return(content)
@@ -120,18 +202,30 @@ class Provider(object):
       revision, content_hash = (
           (yield ctx.memcache_get(cache_key)) or (revision, None))
 
-    if not content_hash:
+    if content_hash and self._check_content_hash_match(content_hash):
+      raise ndb.Return(revision, content_hash)
+
+    if self._is_v1_host():
       url_path = format_url('config_sets/%s/config/%s', config_set, path)
       params = {'hash_only': True}
       if revision:
         params['revision'] = revision
       res = yield self._api_call_async(url_path, params=params)
-      if res:
-        revision = res['revision']
-        content_hash = res['content_hash']
-        if content_hash and use_memcache:
-          yield ctx.memcache_set(
-              cache_key, (revision, content_hash), time=60 if get_latest else 0)
+      revision = res['revision'] if res else revision
+      content_hash = res['content_hash'] if res else None
+    else:
+      res = yield self._get_config_v2_async(
+          config_service_pb2.GetConfigRequest(
+              config_set=config_set,
+              path=path,
+              fields=field_mask_pb2.FieldMask(
+                  paths=['revision', 'content_sha256'])))
+      revision = res.revision if res else revision
+      content_hash = res.content_sha256 if res else None
+
+    if content_hash and use_memcache:
+      yield ctx.memcache_set(cache_key, (revision, content_hash),
+                             time=60 if get_latest else 0)
     raise ndb.Return(revision, content_hash)
 
   @ndb.tasklet
@@ -155,26 +249,50 @@ class Provider(object):
         config_set, path, revision=revision)
     content = None
     if content_hash:
-      content = yield self.get_config_by_hash_async(content_hash)
+      content = yield self.get_config_by_hash_async(content_hash, config_set)
     config = common._convert_config(content, dest_type)
     raise ndb.Return(revision, config)
 
   @ndb.tasklet
-  def _get_configs_multi(self, url_path):
+  def _get_configs_multi(self, cfg_path):
     """Returns a map config_set -> (revision, content)."""
-    assert url_path
+    assert cfg_path
+
+    def to_config_dict(cfg):
+      assert isinstance(cfg, config_service_pb2.Config), cfg
+      return {
+          'config_set': cfg.config_set,
+          'revision': cfg.revision,
+          'content_hash': cfg.content_sha256
+      }
 
     # Response must return a dict with 'configs' key which is a list of configs.
     # Each config has keys 'config_set', 'revision' and 'content_hash'.
-    res = yield self._api_call_async(
-        url_path, params={'hashes_only': True}, allow_not_found=False)
-    configs = res.get('configs', [])
+    if self._is_v1_host():
+      res = yield self._api_call_async(format_url('configs/projects/%s',
+                                                  cfg_path),
+                                       params={'hashes_only': True},
+                                       allow_not_found=False)
+      configs = res.get('configs', [])
+    else:
+      try:
+        res = yield self._config_v2_client().GetProjectConfigsAsync(
+            config_service_pb2.GetProjectConfigsRequest(
+                path=cfg_path,
+                fields=field_mask_pb2.FieldMask(
+                    paths=['config_set', 'revision', 'content_sha256'])),
+            credentials=client.service_account_credentials())
+      except client.RpcError as rpce:
+        logging.error('RpcError for GetProjectConfigs(%s): %s\n' %
+                      (cfg_path, rpce))
+        raise rpce
+      configs = [to_config_dict(cfg) for cfg in res.configs]
 
     # Load config contents. Most of them will come from memcache.
     for cfg in configs:
       cfg['project_id'] = cfg['config_set'].split('/', 1)[1]
       cfg['get_content_future'] = self.get_config_by_hash_async(
-          cfg['content_hash'])
+          cfg['content_hash'], cfg['config_set'])
 
     for cfg in configs:
       cfg['content'] = yield cfg['get_content_future']
@@ -195,20 +313,36 @@ class Provider(object):
     Returns:
       {"config_set -> (revision, content)} map.
     """
-    return self._get_configs_multi(format_url('configs/projects/%s', path))
-
-  def get_ref_configs_async(self, path):
-    """Reads a config file in all refs of all projects.
-
-    Returns:
-      {"config_set -> (revision, content)} map.
-    """
-    return self._get_configs_multi(format_url('configs/refs/%s', path))
+    return self._get_configs_multi(path)
 
   @ndb.tasklet
   def get_projects_async(self):
-    res = yield self._api_call_async('projects', allow_not_found=False)
-    raise ndb.Return(res.get('projects', []))
+    """Returns a list of registered projects.
+
+    Returns: a list of project_dicts, where a project_dict has keys
+    'repo_type', 'id', 'repo_url' and 'name'.
+    """
+    if self._is_v1_host():
+      res = yield self._api_call_async('projects', allow_not_found=False)
+      raise ndb.Return(res.get('projects', []))
+
+    try:
+      res = yield self._config_v2_client().ListConfigSetsAsync(
+          config_service_pb2.ListConfigSetsRequest(domain='PROJECT'),
+          credentials=client.service_account_credentials())
+    except client.RpcError as rpce:
+      logging.error('RpcError for listing projects: %s\n' % rpce)
+      raise rpce
+    project_dicts = []
+    for cs in res.config_sets:
+      project_dicts.append({
+          # V2 only supports GITILES for now.
+          'repo_type': 'GITILES',
+          'id': cs.name.split('/', 1)[1],
+          'name': cs.name.split('/', 1)[1],  # V2 treats name and id the same.
+          'repo_url': cs.url,
+      })
+    raise ndb.Return(project_dicts)
 
   @ndb.tasklet
   def get_config_set_location_async(self, config_set):
@@ -218,13 +352,30 @@ class Provider(object):
       URL or None if no such config set.
     """
     assert config_set
-    res = yield self._api_call_async(
-        'mapping', params={'config_set': config_set})
-    if not res:
-      raise ndb.Return(None)
-    for entry in res.get('mappings', []):
-      if entry.get('config_set') == config_set:
-        raise ndb.Return(entry.get('location'))
+    if self._is_v1_host():
+      res = yield self._api_call_async('mapping',
+                                       params={'config_set': config_set})
+      if not res:
+        raise ndb.Return(None)
+      for entry in res.get('mappings', []):
+        if entry.get('config_set') == config_set:
+          raise ndb.Return(entry.get('location'))
+    else:
+      try:
+        res = yield self._config_v2_client().GetConfigSetAsync(
+            config_service_pb2.GetConfigSetRequest(
+                config_set=config_set,
+                fields=field_mask_pb2.FieldMask(paths=['url'])),
+            credentials=client.service_account_credentials())
+      except client.RpcError as rpce:
+        if rpce.status_code == codes.StatusCode.NOT_FOUND:
+          logging.warning('config_set(%s) is not found in Config Service')
+          raise ndb.Return(None)
+        logging.error('RpcError in getting config_set(%s) location: %s\n' %
+                      (config_set, rpce))
+        raise rpce
+      raise ndb.Return(res.url)
+
     raise ndb.Return(None)
 
   @ndb.tasklet
@@ -247,13 +398,15 @@ class Provider(object):
 
     binary_missing = (
       current.proto_message_name and not current.content_binary)
-    if current.revision == revision and not binary_missing:
-      assert current.content_hash == content_hash
+    # Ensure content_hashes are the same. It will help to force an update during
+    # the short transition time window from v1 to v2.
+    if (current.revision == revision and not binary_missing
+        and current.content_hash == content_hash):
       return
 
     content = None
     if current.content_hash != content_hash:
-      content = yield self.get_config_by_hash_async(content_hash)
+      content = yield self.get_config_by_hash_async(content_hash, config_set)
       if content is None:
         logging.warning(
             'Could not fetch config content %s by hash %s',
@@ -339,8 +492,6 @@ def _get_last_good_async(config_set, path, dest_type):
       not last_good.last_access_ts or
       _maybe_update_last_access_ts(now-last_good.last_access_ts) or
       last_good.proto_message_name != proto_message_name):
-    # pylint does not like this usage of transactional_tasklet
-    # pylint: disable=no-value-for-parameter
     @ndb.transactional_tasklet
     def update():
       last_good = yield LastGoodConfig.get_by_id_async(last_good_id)

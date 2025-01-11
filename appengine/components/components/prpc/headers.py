@@ -3,6 +3,7 @@
 # that can be found in the LICENSE file.
 
 import base64
+import binascii
 import collections
 import re
 
@@ -25,6 +26,8 @@ def _parse_media_type(media_type):
   if media_type == 'application/prpc; encoding=json':
     return encoding.Encoding.JSON
   if media_type == 'application/json':
+    return encoding.Encoding.JSON
+  if media_type.startswith('application/json;'):  # e.g. '...; charset=utf-8'
     return encoding.Encoding.JSON
   if media_type == 'application/prpc; encoding=text':
     return encoding.Encoding.TEXT
@@ -102,7 +105,7 @@ def parse_headers(headers):
     if header.endswith('-bin'):
       try:
         value = base64.b64decode(value)
-      except TypeError:
+      except (TypeError, binascii.Error):
         raise ValueError('Received invalid base64 string in header %s' % header)
       header = header[:-len('-bin')]
     invocation_metadata.append((header, value))

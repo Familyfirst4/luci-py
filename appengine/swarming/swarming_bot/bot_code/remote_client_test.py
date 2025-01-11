@@ -5,7 +5,10 @@
 
 import datetime
 import logging
+import os
+import shutil
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -13,9 +16,7 @@ import unittest
 import test_env_bot_code
 test_env_bot_code.setup_test_env()
 
-# TODO(github.com/wolever/parameterized/issues/91)
-# use parameterized after the bug is resolved.
-from nose2.tools import params
+from parameterized import parameterized
 
 from depot_tools import auto_stub
 
@@ -119,16 +120,20 @@ class TestRemoteClient(auto_stub.TestCase):
     c = remote_client.RemoteClientNative('http://localhost:1', None,
                                          'localhost', '/')
     c.bot_id = 'bot_id'
+    c.session_token = 'session-token'
 
-    def mocked_call(url_path, data, expected_error_codes):
+    def mocked_call(url_path, data, expected_error_codes, retry_transient=True):
       self.assertEqual('/swarming/api/v1/bot/oauth_token', url_path)
-      self.assertEqual({
-          'account_id': 'account_id',
-          'id': 'bot_id',
-          'scopes': ['a', 'b'],
-          'task_id': 'task_id',
-      }, data)
-      self.assertEqual((400,), expected_error_codes)
+      self.assertEqual(
+          {
+              'account_id': 'account_id',
+              'id': 'bot_id',
+              'scopes': ['a', 'b'],
+              'session': 'session-token',
+              'task_id': 'task_id',
+          }, data)
+      self.assertEqual((400, ), expected_error_codes)
+      self.assertTrue(retry_transient)
       return fake_resp
     self.mock(c, '_url_read_json', mocked_call)
 
@@ -145,26 +150,29 @@ class TestRemoteClient(auto_stub.TestCase):
     c = remote_client.RemoteClientNative('http://localhost:1', None,
                                          'localhost', '/')
     c.bot_id = 'bot_id'
+    c.session_token = 'session-token'
 
     def mocked_call(url_path, data, expected_error_codes):
       self.assertEqual('/swarming/api/v1/bot/id_token', url_path)
-      self.assertEqual({
-          'account_id': 'account_id',
-          'audience': 'https://example.com',
-          'id': 'bot_id',
-          'task_id': 'task_id',
-      }, data)
-      self.assertEqual((400,), expected_error_codes)
+      self.assertEqual(
+          {
+              'account_id': 'account_id',
+              'audience': 'https://example.com',
+              'id': 'bot_id',
+              'session': 'session-token',
+              'task_id': 'task_id',
+          }, data)
+      self.assertEqual((400, ), expected_error_codes)
       return fake_resp
     self.mock(c, '_url_read_json', mocked_call)
 
     resp = c.mint_id_token('task_id', 'account_id', 'https://example.com')
     self.assertEqual(fake_resp, resp)
 
-  @params(
+  @parameterized.expand([
       ('mint_oauth_token', ['scope-a', 'scope-b']),
       ('mint_id_token', 'https://audience.example.com'),
-  )
+  ])
   def test_mint_token_transient_err(self, method, arg):
     c = remote_client.RemoteClientNative('http://localhost:1', None,
                                          'localhost', '/')
@@ -175,10 +183,10 @@ class TestRemoteClient(auto_stub.TestCase):
     with self.assertRaises(remote_client.InternalError):
       getattr(c, method)('task_id', 'account_id', arg)
 
-  @params(
+  @parameterized.expand([
       ('mint_oauth_token', ['scope-a', 'scope-b']),
       ('mint_id_token', 'https://audience.example.com'),
-  )
+  ])
   def test_mint_token_fatal_err(self, method, arg):
     c = remote_client.RemoteClientNative('http://localhost:1', None,
                                          'localhost', '/')
@@ -189,6 +197,703 @@ class TestRemoteClient(auto_stub.TestCase):
     self.mock(c, '_url_read_json', mocked_call)
     with self.assertRaises(remote_client.MintTokenError):
       getattr(c, method)('task_id', 'account_id', arg)
+
+  def test_rbe_create_session_ok(self):
+    c = remote_client.RemoteClientNative('http://localhost:1', None,
+                                         'localhost', '/')
+    c.session_token = 'swarming-session-token'
+
+    def mocked_call(_url, data, retry_transient):
+      self.assertEqual(
+          {
+              'bot_version': 'bot_version',
+              'worker_properties': {
+                  'pool_id': 'pool_id',
+                  'pool_version': 'pool_version',
+              },
+              'session': 'swarming-session-token',
+          }, data)
+      self.assertFalse(retry_transient)
+      return {'session_id': 'sid', 'session': 'refreshed-swarming-session'}
+
+    self.mock(c, '_url_read_json', mocked_call)
+
+    wp = remote_client.WorkerProperties('pool_id', 'pool_version')
+    resp = c.rbe_create_session('bot_version', wp, False)
+    self.assertEqual('sid', resp.session_id)
+    self.assertEqual('refreshed-swarming-session', c.session_token)
+
+  @parameterized.expand([
+      (None, ),
+      ('not a dict', ),
+      ({}, ),
+      ({
+          'session_id': None,
+      }, ),
+      ({
+          'session_id': '',
+      }, ),
+      ({
+          'session_id': 123,
+      }, ),
+  ])
+  def test_rbe_create_session_bad_resp(self, dct):
+    c = remote_client.RemoteClientNative('http://localhost:1', None,
+                                         'localhost', '/')
+
+    self.mock(c, '_url_read_json', lambda *_args, **_kwargs: dct)
+
+    with self.assertRaises(remote_client.RBEServerError):
+      c.rbe_create_session('bot_version', None)
+
+  def test_rbe_update_session_full_ok(self):
+    c = remote_client.RemoteClientNative('http://localhost:1', None,
+                                         'localhost', '/')
+    c.session_token = 'swarming-session-token'
+
+    def mocked_call(_url, data, retry_transient):
+      self.assertEqual(
+          {
+              'session': 'swarming-session-token',
+              'status': 'OK',
+              'bot_version': 'bot_version',
+              'lease': {
+                  'id': 'lease-id',
+                  'state': 'ACTIVE'
+              },
+              'worker_properties': {
+                  'pool_id': 'pool_id',
+                  'pool_version': 'pool_version',
+              },
+              'nonblocking': True,
+          }, data)
+      self.assertFalse(retry_transient)
+      return {
+          'session': 'refreshed-swarming-session',
+          'status': 'BOT_TERMINATING',
+          'lease': {
+              'id': 'another-lease-id',
+              'state': 'PENDING',
+          },
+      }
+
+    self.mock(c, '_url_read_json', mocked_call)
+
+    resp = c.rbe_update_session(
+        remote_client.RBESessionStatus.OK,
+        'bot_version',
+        remote_client.WorkerProperties('pool_id', 'pool_version'),
+        remote_client.RBELease('lease-id', remote_client.RBELeaseState.ACTIVE),
+        False,
+        False,
+    )
+
+    self.assertEqual(remote_client.RBESessionStatus.BOT_TERMINATING,
+                     resp.status)
+    self.assertIsInstance(resp.lease, remote_client.RBELease)
+    self.assertEqual('another-lease-id', resp.lease.id)
+    self.assertEqual(remote_client.RBELeaseState.PENDING, resp.lease.state)
+    self.assertEqual('refreshed-swarming-session', c.session_token)
+
+  @parameterized.expand([
+      (None, ),
+      ('not a dict', ),
+      ({}, ),
+      ({
+          'status': 'WRONG_ENUM',
+      }, ),
+      ({
+          'status': 'OK',
+          'lease': 'not-a-dict',
+      }, ),
+      ({
+          'status': 'OK',
+          'lease': {
+              'id': None
+          },
+      }, ),
+  ])
+  def test_rbe_update_session_bad_resp(self, dct):
+    c = remote_client.RemoteClientNative('http://localhost:1', None,
+                                         'localhost', '/')
+
+    self.mock(c, '_url_read_json', lambda *_args, **_kwargs: dct)
+
+    with self.assertRaises(remote_client.RBEServerError):
+      c.rbe_update_session(remote_client.RBESessionStatus.OK, None, None)
+
+
+class TestRBELease(unittest.TestCase):
+  def test_to_dict_simple(self):
+    lease = remote_client.RBELease('some-id',
+                                   remote_client.RBELeaseState.PENDING)
+    self.assertEqual({'id': 'some-id', 'state': 'PENDING'}, lease.to_dict())
+
+  def test_to_dict_result_payload(self):
+    lease = remote_client.RBELease('some-id',
+                                   remote_client.RBELeaseState.ACTIVE,
+                                   {'payload': '123'}, {'result': '456'})
+    self.assertEqual(
+        {
+            'id': 'some-id',
+            'state': 'ACTIVE',
+            'payload': {
+                'payload': '123'
+            },
+            'result': {
+                'result': '456'
+            },
+        }, lease.to_dict())
+    self.assertEqual(
+        {
+            'id': 'some-id',
+            'state': 'ACTIVE',
+            'result': {
+                'result': '456'
+            },
+        }, lease.to_dict(omit_payload=True))
+
+  @parameterized.expand([
+      ({
+          'id': 'some-id',
+          'state': 'ACTIVE',
+          'payload': {
+              'payload': '123'
+          },
+          'result': {
+              'result': '456'
+          },
+      }, ),
+      ({
+          'id': 'some-id',
+          'state': 'ACTIVE',
+          'payload': {},
+          'result': {},
+      }, ),
+      ({
+          'id': 'some-id',
+          'state': 'ACTIVE',
+          'payload': None,
+          'result': None,
+      }, ),
+      ({
+          'id': 'some-id',
+          'state': 'ACTIVE',
+      }, ),
+  ])
+  def test_from_dict_ok(self, dct):
+    expected = dct.copy()
+    if expected.get('result') is None:
+      expected.pop('result', None)
+    if expected.get('payload') is None:
+      expected.pop('payload', None)
+    self.assertEqual(expected, remote_client.RBELease.from_dict(dct).to_dict())
+
+  @parameterized.expand([
+      ('not a dict', ),
+      ({
+          'id': 123,
+          'state': 'ACTIVE',
+      }, ),
+      ({
+          'id': 'some-id',
+          'state': 123,
+      }, ),
+      ({
+          'id': 'some-id',
+          'state': 'ACTIVE',
+          'payload': 123,
+      }, ),
+      ({
+          'id': 'some-id',
+          'state': 'ACTIVE',
+          'result': 123,
+      }, ),
+  ])
+  def test_from_dict_type_error(self, dct):
+    with self.assertRaises(TypeError):
+      remote_client.RBELease.from_dict(dct)
+
+  @parameterized.expand([
+      ({
+          'state': 'ACTIVE',
+      }, ),
+      ({
+          'id': '',
+          'state': 'ACTIVE',
+      }, ),
+      ({
+          'id': 'some-id',
+      }, ),
+      ({
+          'id': 'some-id',
+          'state': '',
+      }, ),
+      ({
+          'id': 'some-id',
+          'state': 'WRONG_ENUM',
+      }, ),
+  ])
+  def test_from_dict_value_error(self, dct):
+    with self.assertRaises(ValueError):
+      remote_client.RBELease.from_dict(dct)
+
+
+class MockedRBERemote:
+
+  def __init__(self):
+    self.last_bot_version = None
+    self.last_worker_properties = None
+    self.last_blocking = None
+    self.last_retry_transient = None
+    self.last_status = None
+    self.last_lease = None
+    self.next_session_id = 'mocked_session_id'
+    self.next_status = None
+    self.next_lease = None
+
+  def mock_next_response(self, status, lease):
+    self.next_status = status
+    self.next_lease = lease
+
+  def rbe_create_session(self,
+                         bot_version,
+                         worker_properties,
+                         retry_transient=False):
+    self.last_bot_version = bot_version
+    self.last_worker_properties = worker_properties
+    self.last_retry_transient = retry_transient
+    return remote_client.RBECreateSessionResponse(self.next_session_id)
+
+  def rbe_update_session(self,
+                         status,
+                         bot_version,
+                         worker_properties,
+                         lease=None,
+                         blocking=True,
+                         retry_transient=False):
+    if self.next_status is None:
+      raise AssertionError('Unexpected rbe_update_session call')
+
+    self.last_status = status
+    self.last_bot_version = bot_version
+    self.last_worker_properties = worker_properties
+    self.last_lease = lease.clone() if lease else None
+    self.last_blocking = blocking
+    self.last_retry_transient = retry_transient
+
+    status, self.next_status = self.next_status, None
+    lease, self.next_lease = self.next_lease, None
+
+    return remote_client.RBEUpdateSessionResponse(status, lease)
+
+
+class TestRBESession(unittest.TestCase):
+  def setUp(self):
+    super().setUp()
+    self.temp_dir = tempfile.mkdtemp(prefix='swarming')
+
+  def tearDown(self):
+    shutil.rmtree(self.temp_dir)
+    super().tearDown()
+
+  def check_serialization_works(self, session):
+    dump = session.to_dict()
+    loaded = remote_client.RBESession.from_dict(session._remote, dump)
+    self.assertEqual(session._instance, loaded._instance)
+    self.assertEqual(session._bot_version, loaded._bot_version)
+    self.assertEqual(session._worker_properties, loaded._worker_properties)
+    self.assertEqual(session._session_id, loaded._session_id)
+    self.assertEqual(session._last_acked_status, loaded._last_acked_status)
+    self.assertEqual(session._active_lease, loaded._active_lease)
+    self.assertEqual(session._finished_lease, loaded._finished_lease)
+    # Just confirm `restore` doesn't crash.
+    loaded.restore(dump)
+
+  def test_full_flow(self):
+    remote = MockedRBERemote()
+    wp = remote_client.WorkerProperties('rbe-pool-id', 'rbe-pool-version')
+
+    s = remote_client.RBESession(remote, 'some-instance', 'bot_version', wp)
+
+    # In the initial state.
+    self.assertEqual('some-instance', s.instance)
+    self.assertEqual('mocked_session_id', s.session_id)
+    self.assertTrue(s.alive)
+    self.assertIsNone(s.active_lease)
+    # Called `rbe_create_session`.
+    self.assertEqual('bot_version', remote.last_bot_version)
+    self.assertEqual(wp, remote.last_worker_properties)
+
+    # Can be serialized/restored in this state.
+    self.check_serialization_works(s)
+
+    # Calling ping_active_lease without a lease is not allowed.
+    with self.assertRaises(remote_client.RBESessionException):
+      s.ping_active_lease()
+
+    # Wait for a lease, get none.
+    remote.mock_next_response(remote_client.RBESessionStatus.OK, None)
+    lease = s.update(remote_client.RBESessionStatus.OK)
+    self.assertIsNone(lease)
+    self.assertTrue(s.alive)
+    self.assertIsNone(s.active_lease)
+    # Called `rbe_update_session`.
+    self.assertEqual(remote_client.RBESessionStatus.OK, remote.last_status)
+    self.assertEqual('bot_version', remote.last_bot_version)
+    self.assertEqual(wp, remote.last_worker_properties)
+    self.assertIsNone(remote.last_lease)
+    self.assertTrue(remote.last_blocking)
+    self.assertFalse(remote.last_retry_transient)
+
+    # Wait for a lease and get some!
+    remote.mock_next_response(
+        remote_client.RBESessionStatus.OK,
+        remote_client.RBELease(
+            'some-lease',
+            remote_client.RBELeaseState.PENDING,
+            {'payload': '123'},
+            None,
+        ),
+    )
+    lease = s.update(remote_client.RBESessionStatus.OK)
+    self.assertIsNotNone(lease)
+    self.assertIs(lease, s.active_lease)
+    self.assertEqual(
+        {
+            'id': 'some-lease',
+            'payload': {
+                'payload': '123'
+            },
+            'state': 'PENDING'
+        }, lease.to_dict())
+    self.assertTrue(s.alive)
+
+    # Can be serialized/restored in this state.
+    self.check_serialization_works(s)
+
+    # Calling update while holding onto a lease is not allowed.
+    with self.assertRaises(remote_client.RBESessionException):
+      s.update(remote_client.RBESessionStatus.OK)
+
+    # Ping the active lease, keep it ACTIVE to keep working on it.
+    remote.mock_next_response(
+        remote_client.RBESessionStatus.OK,
+        remote_client.RBELease(
+            'some-lease',
+            remote_client.RBELeaseState.ACTIVE,
+            None,
+            None,
+        ),
+    )
+    self.assertTrue(s.ping_active_lease())
+    self.assertIsNotNone(s.active_lease)
+    self.assertTrue(s.alive)
+    # Called `rbe_update_session` correctly.
+    self.assertEqual(remote_client.RBESessionStatus.OK, remote.last_status)
+    self.assertFalse(remote.last_retry_transient)
+    self.assertEqual('some-lease', remote.last_lease.id)
+    self.assertEqual(remote_client.RBELeaseState.ACTIVE,
+                     remote.last_lease.state)
+
+    # Mark the lease as done.
+    s.finish_active_lease({'result': 'xxx'})
+    self.assertIsNone(s.active_lease)
+    self.assertTrue(s.alive)
+
+    # Can be serialized/restored in this state.
+    self.check_serialization_works(s)
+
+    # Finishing the least twice is not allowed.
+    with self.assertRaises(remote_client.RBESessionException):
+      s.finish_active_lease({'result': 'zzz'})
+
+    # Report the lease result, discover there's no new leases.
+    remote.mock_next_response(remote_client.RBESessionStatus.OK, None)
+    lease = s.update(remote_client.RBESessionStatus.OK)
+    self.assertIsNone(lease)
+    self.assertTrue(s.alive)
+    self.assertIsNone(s.active_lease)
+    # Passed the lease result to `rbe_update_session`.
+    self.assertEqual(
+        {
+            'id': 'some-lease',
+            'payload': {
+                'payload': '123'
+            },
+            'result': {
+                'result': 'xxx'
+            },
+            'state': 'COMPLETED'
+        }, remote.last_lease.to_dict())
+
+    # One more idle cycle. Doesn't report the finished lease result anymore.
+    remote.mock_next_response(remote_client.RBESessionStatus.OK, None)
+    lease = s.update(remote_client.RBESessionStatus.OK)
+    self.assertIsNone(lease)
+    self.assertTrue(s.alive)
+    self.assertIsNone(s.active_lease)
+    # Passed no leases to `rbe_update_session`.
+    self.assertIsNone(remote.last_lease)
+
+    # Setting non-OK status effectively closes the session. Note that the
+    # backend still replies with OK status even if the bot wants the session
+    # gone!
+    remote.mock_next_response(remote_client.RBESessionStatus.OK, None)
+    lease = s.update(remote_client.RBESessionStatus.BOT_TERMINATING)
+    self.assertIsNone(lease)
+    self.assertFalse(s.alive)
+    # Passed correct status to `rbe_update_session`.
+    self.assertEqual(remote_client.RBESessionStatus.BOT_TERMINATING,
+                     remote.last_status)
+
+    # Calling update with dead session is not allowed.
+    with self.assertRaises(remote_client.RBESessionException):
+      s.update(remote_client.RBESessionStatus.OK)
+
+    # Can be serialized/restored in this state.
+    self.check_serialization_works(s)
+
+    # This doesn't actually do much, since the session is already closed.
+    # There's a separate test for it.
+    s.terminate()
+
+    # Verify a session can be recreated.
+    remote.next_session_id = 'new_session_id'
+    remote.last_worker_properties = None
+    s.recreate()
+    self.assertEqual(wp, remote.last_worker_properties)
+    self.assertEqual('some-instance', s.instance)
+    self.assertEqual('new_session_id', s.session_id)
+    self.assertTrue(s.alive)
+    self.assertIsNone(s.active_lease)
+
+  def test_no_idle_time(self):
+    remote = MockedRBERemote()
+
+    s = remote_client.RBESession(remote, 'some-instance', 'bot_version', None)
+
+    # Get a task.
+    remote.mock_next_response(
+        remote_client.RBESessionStatus.OK,
+        remote_client.RBELease(
+            'lease-0',
+            remote_client.RBELeaseState.PENDING,
+            {},
+            None,
+        ),
+    )
+    s.update(remote_client.RBESessionStatus.OK)
+    self.assertEqual('lease-0', s.active_lease.id)
+
+    # Finish it right away.
+    s.finish_active_lease({'result': 0})
+    self.assertIsNone(s.active_lease)
+
+    # Report the result, get the next task.
+    remote.mock_next_response(
+        remote_client.RBESessionStatus.OK,
+        remote_client.RBELease(
+            'lease-1',
+            remote_client.RBELeaseState.PENDING,
+            {},
+            None,
+        ),
+    )
+    s.update(remote_client.RBESessionStatus.OK)
+    self.assertEqual('lease-1', s.active_lease.id)
+    # Reported the task result.
+    self.assertEqual(
+        {
+            'id': 'lease-0',
+            'payload': {},
+            'result': {
+                'result': 0
+            },
+            'state': 'COMPLETED'
+        }, remote.last_lease.to_dict())
+
+    # Finish it right away.
+    s.finish_active_lease({'result': 1})
+    self.assertIsNone(s.active_lease)
+
+    # Terminate the session. This reports the last task result.
+    remote.mock_next_response(remote_client.RBESessionStatus.OK, None)
+    s.terminate()
+    self.assertFalse(s.alive)
+    # Called `rbe_update_session` correctly.
+    self.assertEqual(remote_client.RBESessionStatus.BOT_TERMINATING,
+                     remote.last_status)
+    # Reported the task result.
+    self.assertEqual(
+        {
+            'id': 'lease-1',
+            'payload': {},
+            'result': {
+                'result': 1
+            },
+            'state': 'COMPLETED'
+        }, remote.last_lease.to_dict())
+
+  def test_server_side_session_expiry(self):
+    remote = MockedRBERemote()
+
+    s = remote_client.RBESession(remote, 'some-instance', 'bot_version', None)
+
+    # The session is marked as being terminated.
+    remote.mock_next_response(remote_client.RBESessionStatus.BOT_TERMINATING,
+                              None)
+    s.update(remote_client.RBESessionStatus.OK)
+    self.assertIsNone(s.active_lease)
+    self.assertTrue(s.alive)
+    self.assertTrue(s.terminating)
+
+    # Terminate closes the session for good.
+    remote.mock_next_response(remote_client.RBESessionStatus.BOT_TERMINATING,
+                              None)
+    s.terminate()
+    self.assertFalse(s.alive)
+
+  def test_server_side_session_expiry_with_active_lease(self):
+    remote = MockedRBERemote()
+
+    s = remote_client.RBESession(remote, 'some-instance', 'bot_version', None)
+
+    # Get a task.
+    remote.mock_next_response(
+        remote_client.RBESessionStatus.OK,
+        remote_client.RBELease(
+            'lease-0',
+            remote_client.RBELeaseState.PENDING,
+            {},
+            None,
+        ),
+    )
+    s.update(remote_client.RBESessionStatus.OK)
+    self.assertEqual('lease-0', s.active_lease.id)
+
+    # Send a ping and discover the session is gone and the lease is lost.
+    remote.mock_next_response(remote_client.RBESessionStatus.BOT_TERMINATING,
+                              None)
+    self.assertFalse(s.ping_active_lease())
+    self.assertTrue(s.alive)
+    self.assertTrue(s.terminating)
+    self.assertIsNone(s.active_lease)
+
+    # Terminate closes the session for good.
+    remote.mock_next_response(remote_client.RBESessionStatus.BOT_TERMINATING,
+                              None)
+    s.terminate()
+    self.assertFalse(s.alive)
+
+  def test_lease_server_cancellation(self):
+    remote = MockedRBERemote()
+
+    s = remote_client.RBESession(remote, 'some-instance', 'bot_version', None)
+
+    # Get a task.
+    remote.mock_next_response(
+        remote_client.RBESessionStatus.OK,
+        remote_client.RBELease(
+            'lease-0',
+            remote_client.RBELeaseState.PENDING,
+            {},
+            None,
+        ),
+    )
+    s.update(remote_client.RBESessionStatus.OK)
+    self.assertEqual('lease-0', s.active_lease.id)
+
+    # Send a ping and discover the lease is canceled.
+    remote.mock_next_response(
+        remote_client.RBESessionStatus.OK,
+        remote_client.RBELease(
+            'lease-0',
+            remote_client.RBELeaseState.CANCELLED,
+            None,
+            None,
+        ),
+    )
+    self.assertFalse(s.ping_active_lease())
+    self.assertTrue(s.alive)
+    self.assertIsNotNone(s.active_lease)
+
+    # Canceled leases still needs to be reported as finished though, perhaps
+    # with empty result.
+    s.finish_active_lease(None)
+    self.assertIsNone(s.active_lease)
+
+    # The Next update reports the lease as done.
+    remote.mock_next_response(remote_client.RBESessionStatus.OK, None)
+    s.update(remote_client.RBESessionStatus.OK)
+    self.assertEqual({
+        'id': 'lease-0',
+        'payload': {},
+        'state': 'COMPLETED'
+    }, remote.last_lease.to_dict())
+
+  def test_lease_lost(self):
+    remote = MockedRBERemote()
+
+    s = remote_client.RBESession(remote, 'some-instance', 'bot_version', None)
+
+    # Get a task.
+    remote.mock_next_response(
+        remote_client.RBESessionStatus.OK,
+        remote_client.RBELease(
+            'lease-0',
+            remote_client.RBELeaseState.PENDING,
+            {},
+            None,
+        ),
+    )
+    s.update(remote_client.RBESessionStatus.OK)
+    self.assertEqual('lease-0', s.active_lease.id)
+
+    # Send a ping and discover the lease is lost.
+    remote.mock_next_response(
+        remote_client.RBESessionStatus.OK,
+        None,
+    )
+    self.assertFalse(s.ping_active_lease())
+    self.assertTrue(s.alive)
+    self.assertIsNone(s.active_lease)
+
+    # The next update doesn't report the lost lease.
+    remote.mock_next_response(remote_client.RBESessionStatus.OK, None)
+    s.update(remote_client.RBESessionStatus.OK)
+    self.assertIsNone(remote.last_lease)
+
+  def test_finish_active_lease_flush(self):
+    remote = MockedRBERemote()
+
+    s = remote_client.RBESession(remote, 'some-instance', 'bot_version', None)
+
+    # Get a task.
+    remote.mock_next_response(
+        remote_client.RBESessionStatus.OK,
+        remote_client.RBELease(
+            'lease-0',
+            remote_client.RBELeaseState.PENDING,
+            {},
+            None,
+        ),
+    )
+    s.update(remote_client.RBESessionStatus.OK)
+    self.assertEqual('lease-0', s.active_lease.id)
+
+    # Finish it and flush the result right away.
+    remote.mock_next_response(remote_client.RBESessionStatus.OK, None)
+    s.finish_active_lease({}, flush=True)
+    self.assertIsNone(s.active_lease)
+    self.assertTrue(s.alive)
+
+    # Check the call arguments.
+    self.assertEqual(remote_client.RBESessionStatus.MAINTENANCE,
+                     remote.last_status)
+    self.assertEqual('lease-0', remote.last_lease.id)
+    self.assertEqual(remote_client.RBELeaseState.COMPLETED,
+                     remote.last_lease.state)
 
 
 if __name__ == '__main__':

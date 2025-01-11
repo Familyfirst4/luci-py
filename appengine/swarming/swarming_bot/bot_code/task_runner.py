@@ -14,14 +14,20 @@ up to the calling process (bot_main.py) to signal that there was an internal
 failure and to cancel this task run and ask the server to retry it.
 """
 
+import base64
 import json
 import logging
 import optparse
 import os
+import random
 import signal
 import sys
+import tempfile
 import time
 import traceback
+
+from google.protobuf.json_format import MessageToJson
+from google.protobuf.message import DecodeError
 
 from api import os_utilities
 from bot_code import bot_auth
@@ -32,6 +38,8 @@ from utils import net
 from utils import on_error
 from utils import subprocess42
 from utils import zip_package
+
+from bb.go.chromium.org.luci.buildbucket.proto import launcher_pb2
 
 # Path to this file or the zip containing this file.
 THIS_FILE = os.path.abspath(zip_package.get_main_script_path())
@@ -103,6 +111,9 @@ def get_isolated_args(work_dir, task_details, isolated_result,
           c['hint'],
       ])
 
+  # always set the cipd cache to be the bot_dir/cipd_cache
+  cmd.extend(['--cipd-cache', os.path.join(bot_dir, 'cipd_cache')])
+
   # Expected output files:
   for output in task_details.outputs:
     cmd.extend(['--output', output])
@@ -113,11 +124,9 @@ def get_isolated_args(work_dir, task_details, isolated_result,
     for pkg in task_details.cipd_input.get('packages', []):
       cmd.extend([
           '--cipd-package',
-          '%s:%s:%s' % (pkg['path'], pkg['package_name'], pkg['version'])
+          '%s:%s:%s' % (pkg['path'], pkg['package_name'], pkg['version']),
       ])
     cmd.extend([
-        '--cipd-cache',
-        os.path.join(bot_dir, 'cipd_cache'),
         '--cipd-client-package',
         task_details.cipd_input['client_package']['package_name'],
         '--cipd-client-version',
@@ -164,7 +173,7 @@ def get_isolated_args(work_dir, task_details, isolated_result,
   return cmd
 
 
-class Containment(object):
+class Containment:
   """Containment details."""
   _EXPECTED = frozenset((
       'containment_type',
@@ -184,13 +193,14 @@ class Containment(object):
     return out
 
 
-class TaskDetails(object):
+class TaskDetails:
   """A task_runner specific view of the server's TaskProperties.
 
   It only contains what the bot needs to know.
   """
   _EXPECTED = frozenset((
       'bot_authenticated_as',
+      'bot_dimensions',
       'bot_id',
       'caches',
       'cas_input_root',
@@ -222,6 +232,7 @@ class TaskDetails(object):
           'Unexpected keys: %s != %s' % (sorted(data), sorted(self._EXPECTED)))
 
     # Get all the data first so it fails early if the task details is invalid.
+    self.bot_dimensions = data['bot_dimensions']
     self.bot_id = data['bot_id']
 
     # Raw command.
@@ -267,8 +278,33 @@ class InternalError(Exception):
   """Raised on unrecoverable errors that abort task with 'internal error'."""
 
 
+def tmp_bb_agent_context_file(secret_bytes, task_id, workdir):
+  if secret_bytes is None:
+    logging.error(
+        'Failed to create BuildbucketAgentContext file. secret_bytes is None.')
+    raise InternalError("secret_bytes is None")
+
+  tf = tempfile.NamedTemporaryFile(mode='w+b',
+                                   prefix='bb_agent_ctx.',
+                                   suffix='.json',
+                                   delete=False,
+                                   dir=workdir)
+  logging.debug('Writing BuildbuckerAgentContext file %r', tf.name)
+  try:
+    secrets = launcher_pb2.BuildSecrets()
+    secrets.ParseFromString(base64.b64decode(secret_bytes))
+  except (DecodeError, TypeError):
+    raise InternalError("could not decode secret_bytes")
+  content = launcher_pb2.BuildbucketAgentContext(task_id=task_id,
+                                                 secrets=secrets)
+  tf.write(MessageToJson(content).encode("utf-8"))
+  tf.flush()
+  return tf
+
+
 def load_and_run(in_file, swarming_server, cost_usd_hour, start, out_file,
-                 run_isolated_flags, bot_file, auth_params_file):
+                 run_isolated_flags, bot_file, auth_params_file,
+                 session_state_file):
   """Loads the task's metadata, prepares auth environment and executes the task.
 
   This may throw all sorts of exceptions in case of failure. It's up to the
@@ -276,7 +312,11 @@ def load_and_run(in_file, swarming_server, cost_usd_hour, start, out_file,
   'failure' from a TaskRunResult standpoint.
   """
   auth_system = None
+  bb_ctx_tf = None
   local_auth_context = None
+  session = None
+  remote = None
+  rbe_session = None
   task_result = None
   work_dir = os.path.dirname(out_file)
 
@@ -323,11 +363,24 @@ def load_and_run(in_file, swarming_server, cost_usd_hour, start, out_file,
         },
       }
 
-      # Extend existing LUCI_CONTEXT['swarming'], if any.
+      # TODO (randymaldonado): remove swarming from LUCI_CONTEXT
+      # Override LUCI_CONTEXT['swarming'].
+      bot_dimensions = []
+      for k, vs in task_details.bot_dimensions.items():
+        bot_dimensions.extend('%s:%s' % (k, v) for v in vs)
+      bot_dimensions.sort()
+      result_summary_id = task_details.task_id[:-1] + '0'
+      swarming = {
+          'task': {
+              'server': swarming_server,
+              # Uses the result_summary_id instead of run_id in the context.
+              'task_id': result_summary_id,
+              'bot_dimensions': bot_dimensions,
+          },
+      }
       if task_details.secret_bytes is not None:
-        swarming = luci_context.read('swarming') or {}
         swarming['secret_bytes'] = task_details.secret_bytes
-        context_edits['swarming'] = swarming
+      context_edits['swarming'] = swarming
 
       # Extend existing LUCI_CONTEXT['realm'], if any.
       if task_details.realm is not None:
@@ -341,7 +394,6 @@ def load_and_run(in_file, swarming_server, cost_usd_hour, start, out_file,
         resultdb.update(task_details.resultdb)
         context_edits['resultdb'] = resultdb
 
-
       # Returns bot authentication headers dict or raises InternalError.
       def headers_cb():
         try:
@@ -351,13 +403,24 @@ def load_and_run(in_file, swarming_server, cost_usd_hour, start, out_file,
         except bot_auth.AuthSystemError as e:
           raise InternalError('Failed to grab bot auth headers: %s' % e)
 
-      # The hostname and work dir provided here don't really matter, since the
-      # task runner is always called with a specific versioned URL.
-      remote = remote_client.createRemoteClient(
+      # Deserialize the session state (including the RBESession inside).
+      session = remote_client.SessionState.load(session_state_file)
+      logging.info('Swarming bot session ID: %s', session.session_id)
+
+      # The client to use to make backend RPCs. It will also refresh the session
+      # token as a side effect of some RPC calls.
+      remote = remote_client.RemoteClientNative(
           swarming_server, headers_cb, os_utilities.get_hostname_short(),
           work_dir)
       remote.initialize()
       remote.bot_id = task_details.bot_id
+      remote.session_token = session.session_token
+
+      # If running in RBE mode, deserialize the RBESession object to use it to
+      # send pings to RBE.
+      if session.rbe_session:
+        rbe_session = remote_client.RBESession.from_dict(
+            remote, session.rbe_session)
 
       # Let AuthSystem know it can now send RPCs to Swarming (to grab OAuth
       # tokens). There's a circular dependency here! AuthSystem will be
@@ -366,12 +429,20 @@ def load_and_run(in_file, swarming_server, cost_usd_hour, start, out_file,
       if auth_system:
         auth_system.set_remote_client(remote)
 
+      # If the build is using a buildbucket agent, we must write the custom
+      # context file for the agent to use.
+      if '${BUILDBUCKET_AGENT_CONTEXT_FILE}' in task_details.command:
+        bb_ctx_tf = tmp_bb_agent_context_file(task_details.secret_bytes,
+                                              result_summary_id, work_dir)
+        idx = task_details.command.index('${BUILDBUCKET_AGENT_CONTEXT_FILE}')
+        task_details.command[idx] = bb_ctx_tf.name
+
       # Auth environment is up, start the command. task_result is dumped to
       # disk in 'finally' block.
       with luci_context.stage(_tmpdir=work_dir, **context_edits) as ctx_file:
-        task_result = run_command(
-            remote, task_details, work_dir, cost_usd_hour,
-            start, run_isolated_flags, bot_file, ctx_file)
+        task_result = run_command(remote, rbe_session, task_details, work_dir,
+                                  cost_usd_hour, start, run_isolated_flags,
+                                  bot_file, ctx_file)
   except (ExitSignal, InternalError, remote_client.InternalError) as e:
     # This normally means run_command() didn't get the chance to run, as it
     # itself traps exceptions and will report accordingly. In this case, we want
@@ -382,10 +453,19 @@ def load_and_run(in_file, swarming_server, cost_usd_hour, start, out_file,
           'exit_code': -1,
           'hard_timeout': False,
           'io_timeout': False,
-          'must_signal_internal_failure': str(e) or 'unknown error',
+          'internal_error': str(e) or 'unknown error',
+          'internal_error_reported': False,
           'version': OUT_VERSION,
       }
   finally:
+    # If the task is using a buildbucket agent, close the temp context file.
+    if bb_ctx_tf:
+      try:
+        bb_ctx_tf.close()
+        os.unlink(bb_ctx_tf.name)
+      except Exception as ex:
+        logging.exception("could not close buildbucket context file. %s" %
+                          str(ex))
     # We've found tests to delete the working directory work_dir when quitting,
     # causing an exception here. Try to recreate the directory if necessary.
     if not os.path.isdir(work_dir):
@@ -394,6 +474,12 @@ def load_and_run(in_file, swarming_server, cost_usd_hour, start, out_file,
       auth_system.stop()
     with open(out_file, 'w') as f:
       json.dump(task_result, f)
+    # Store updates to the session (like the most recent session token). Don't
+    # touch it if we crashed before full initialization.
+    if session and remote:
+      session.session_token = remote.session_token
+      session.rbe_session = rbe_session.to_dict() if rbe_session else None
+      session.dump(session_state_file)
 
 
 def kill_and_wait(proc, grace_period, reason):
@@ -422,7 +508,8 @@ def fail_without_command(remote, task_id, params, cost_usd_hour, task_start,
       'exit_code': exit_code,
       'hard_timeout': False,
       'io_timeout': False,
-      'must_signal_internal_failure': None,
+      'internal_error': None,
+      'internal_error_reported': False,
       'version': OUT_VERSION,
   }
 
@@ -479,21 +566,21 @@ def _start_task_runner(args, work_dir, ctx_file):
   return proc
 
 
-class _OutputBuffer(object):
+class _OutputBuffer:
   """_OutputBuffer implements stdout (and eventually stderr) buffering.
 
   This data is buffered and must be sent to the Swarming server when
   self.should_post_update() is True.
   """
   # To be mocked in tests.
-  _MIN_PACKET_INTERVAL = 1
+  _MIN_PACKET_INTERVAL = 4
   _MAX_PACKET_INTERVAL = 10
 
   def __init__(self, task_details, start):
     self._task_details = task_details
     self._start = start
-    # Sends a maximum of 25kb of stdout per task_update packet.
-    self._max_chunk_size = 25600
+    # Sends a maximum of 250kb of stdout per task_update packet.
+    self._max_chunk_size = 250000
     # Minimum wait between task_update packet when there's output.
     self._min_packet_interval = self._MIN_PACKET_INTERVAL
     # Maximum wait between task_update packet when there's no output.
@@ -581,12 +668,71 @@ class _OutputBuffer(object):
       out = min(out, self._start + self._task_details.hard_timeout - now)
     if self._task_details.io_timeout:
       out = min(out, self._last_loop + self._task_details.io_timeout - now)
-    out = max(out, 0)
-    logging.debug('calc_yield_wait() = %d', out)
-    return out
+    return max(out, 0)
 
 
-def run_command(remote, task_details, work_dir, cost_usd_hour,
+class _RBEPinger:
+  """Knows when and how to ping the RBE session to keep it alive.
+
+  Currently ignores lease cancellation signals: cancellations still happen
+  exclusively through Swarming.
+
+  If the session dies, recreates it.
+  """
+
+  def __init__(self, rbe_session):
+    self._rbe_session = rbe_session
+    self._next_ping_time = monotonic_time()  # ASAP
+
+  def time_until_next_ping(self):
+    """Returns how many seconds to wait until the next ping."""
+    return max(0.0, self._next_ping_time - monotonic_time())
+
+  def ping(self):
+    """Sends a ping to RBE, keeping the lease alive, if it's time."""
+    if monotonic_time() < self._next_ping_time:
+      return
+    # TODO(vadimsh): Figure out the optimal frequency for pings. The native RBE
+    # bot does something more complicated here (e.g. slows down with time).
+    if self._rbe_session.alive and self._rbe_session.active_lease:
+      self._schedule_next_ping(10.0)
+      self._ping_active_lease()
+    else:
+      self._schedule_next_ping(60.0)
+      self._ping_session()
+    if self._rbe_session.alive and self._rbe_session.terminating:
+      logging.warning('RBE session %s is pending termination',
+                      self._rbe_session.session_id)
+
+  def _schedule_next_ping(self, delta):
+    self._next_ping_time = monotonic_time() + random.uniform(delta, delta * 1.5)
+
+  def _ping_active_lease(self):
+    try:
+      self._rbe_session.ping_active_lease()
+    except remote_client.RBEServerError as e:
+      logging.error('Failed to ping RBE lease: %s', e)
+
+  def _ping_session(self):
+    if not self._rbe_session.alive:
+      logging.warning('RBE session %s is dead, attempting to recreate',
+                      self._rbe_session.session_id)
+      try:
+        self._rbe_session.recreate()
+      except remote_client.RBEServerError as e:
+        logging.error('Failed to recreate RBE session: %s', e)
+        return
+      logging.info('Recreated RBE session as %s', self._rbe_session.session_id)
+    try:
+      self._rbe_session.update(remote_client.RBESessionStatus.MAINTENANCE)
+      if not self._rbe_session.alive:
+        logging.warning('RBE session %s is dead and will be recreated later',
+                        self._rbe_session.session_id)
+    except remote_client.RBEServerError as e:
+      logging.error('Failed to ping RBE session: %s', e)
+
+
+def run_command(remote, rbe_session, task_details, work_dir, cost_usd_hour,
                 task_start, run_isolated_flags, bot_file, ctx_file):
   """Runs a command and sends packets to the server to stream results back.
 
@@ -623,7 +769,8 @@ def run_command(remote, task_details, work_dir, cost_usd_hour,
         'exit_code': -1,
         'hard_timeout': False,
         'io_timeout': False,
-        'must_signal_internal_failure': None,
+        'internal_error_reported': False,
+        'internal_error': None,
         'version': OUT_VERSION,
     }
 
@@ -636,6 +783,11 @@ def run_command(remote, task_details, work_dir, cost_usd_hour,
   task_details.hard_timeout = 0
   if task_details.grace_period:
     task_details.grace_period *= 2
+
+  # Send the initial ping to RBE to let it know we have started.
+  rbe_pinger = _RBEPinger(rbe_session) if rbe_session else None
+  if rbe_pinger:
+    rbe_pinger.ping()
 
   try:
     proc = _start_task_runner(args, work_dir, ctx_file)
@@ -650,13 +802,24 @@ def run_command(remote, task_details, work_dir, cost_usd_hour,
     # Monitor the task
     exit_code = None
     had_io_timeout = False
-    must_signal_internal_failure = None
+    missing_cas = []
+    missing_cipd = []
+    internal_error = None
+    internal_error_reported = False
     term_sent = False
     kill_sent = False
     timed_out = None
     try:
-      for channel, new_data in proc.yield_any(
-          maxsize=buf.maxsize, timeout=lambda: buf.calc_yield_wait(timed_out)):
+      # Calculates how soon to unblock in proc.yield_any(...).
+      def yield_timeout():
+        buf_wait = buf.calc_yield_wait(timed_out)
+        rbe_wait = rbe_pinger.time_until_next_ping() if rbe_pinger else None
+        if rbe_wait is None:
+          return buf_wait
+        return min(buf_wait, rbe_wait)
+
+      for channel, new_data in proc.yield_any(maxsize=buf.maxsize,
+                                              timeout=yield_timeout):
         buf.add(channel, new_data)
 
         # Post update if necessary.
@@ -673,6 +836,10 @@ def run_command(remote, task_details, work_dir, cost_usd_hour,
               term_sent = True
               proc.terminate()
               timed_out = monotonic_time()
+
+        # Keep RBE updated as well.
+        if rbe_pinger:
+          rbe_pinger.ping()
 
         # Send signal on timeout if necessary. Both are failures, not
         # internal_failures.
@@ -716,7 +883,7 @@ def run_command(remote, task_details, work_dir, cost_usd_hour,
         OSError, remote_client.InternalError) as e:
       logging.exception('got some exception, killing process')
       # Something wrong happened, try to kill the child process.
-      must_signal_internal_failure = str(e) or 'unknown error'
+      internal_error = str(e) or 'unknown error'
       exit_code = kill_and_wait(proc, task_details.grace_period, str(e))
 
     logging.info('Subprocess for run_isolated was completed or killed')
@@ -750,52 +917,55 @@ def run_command(remote, task_details, work_dir, cost_usd_hour,
         logging.debug('run_isolated:\n%s', run_isolated_result)
         # TODO(maruel): Grab statistics (cache hit rate, data downloaded,
         # mapping time, etc) from run_isolated and push them to the server.
-        if run_isolated_result['cas_output_root']:
-          params['cas_output_root'] = run_isolated_result['cas_output_root']
-        had_hard_timeout = run_isolated_result['had_hard_timeout']
-        if not had_io_timeout and not had_hard_timeout:
-          if run_isolated_result['internal_failure']:
-            must_signal_internal_failure = (
-                run_isolated_result['internal_failure'])
-            logging.error('%s', must_signal_internal_failure)
-          elif exit_code:
-            # TODO(maruel): Grab stdout from run_isolated.
-            must_signal_internal_failure = (
-                'run_isolated internal failure %d' % exit_code)
-            logging.error('%s', must_signal_internal_failure)
-        exit_code = run_isolated_result['exit_code']
-        params['bot_overhead'] = 0.
-        if run_isolated_result.get('duration') is not None:
-          # Store the real task duration as measured by run_isolated and
-          # calculate the total overhead.
-          params['duration'] = run_isolated_result['duration']
-          params['bot_overhead'] = duration - run_isolated_result['duration']
-          if params['bot_overhead'] < 0:
-            params['bot_overhead'] = 0
-        run_isolated_stats = run_isolated_result.get('stats', {})
-        isolated_stats = run_isolated_stats.get('isolated')
-        if isolated_stats:
-          params['isolated_stats'] = isolated_stats
-        cipd_stats = run_isolated_stats.get('cipd')
-        if cipd_stats:
-          params['cipd_stats'] = cipd_stats
-        cipd_pins = run_isolated_result.get('cipd_pins')
-        if cipd_pins:
-          params['cipd_pins'] = cipd_pins
-        named_caches_stats = run_isolated_stats.get('named_caches')
-        if named_caches_stats:
-          params['named_caches_stats'] = named_caches_stats
-        cache_trim_stats = run_isolated_stats.get('trim_caches')
-        if cache_trim_stats:
-          params['cache_trim_stats'] = cache_trim_stats
-        cleanup_stats = run_isolated_stats.get('cleanup')
-        if cleanup_stats:
-          params['cleanup_stats'] = cleanup_stats
+        missing_cas = run_isolated_result.get('missing_cas', [])
+        missing_cipd = run_isolated_result.get('missing_cipd', [])
+        if missing_cipd or missing_cas:
+          internal_error = run_isolated_result['internal_failure']
+        else:
+          if run_isolated_result['cas_output_root']:
+            params['cas_output_root'] = run_isolated_result['cas_output_root']
+          had_hard_timeout = run_isolated_result['had_hard_timeout']
+          if not had_io_timeout and not had_hard_timeout:
+            if run_isolated_result['internal_failure']:
+              internal_error = (run_isolated_result['internal_failure'])
+              logging.error('%s', internal_error)
+            elif exit_code:
+              # TODO(maruel): Grab stdout from run_isolated.
+              internal_error = ('run_isolated internal failure %d' % exit_code)
+              logging.error('%s', internal_error)
+          exit_code = run_isolated_result['exit_code']
+          params['bot_overhead'] = 0.
+          if run_isolated_result.get('duration') is not None:
+            # Store the real task duration as measured by run_isolated and
+            # calculate the total overhead.
+            params['duration'] = run_isolated_result['duration']
+            params['bot_overhead'] = duration - run_isolated_result['duration']
+            if params['bot_overhead'] < 0:
+              params['bot_overhead'] = 0
+
+          run_isolated_stats = run_isolated_result.get('stats', {})
+          isolated_stats = run_isolated_stats.get('isolated')
+          if isolated_stats:
+            params['isolated_stats'] = isolated_stats
+          cipd_stats = run_isolated_stats.get('cipd')
+          if cipd_stats:
+            params['cipd_stats'] = cipd_stats
+          cipd_pins = run_isolated_result.get('cipd_pins')
+          if cipd_pins:
+            params['cipd_pins'] = cipd_pins
+          named_caches_stats = run_isolated_stats.get('named_caches')
+          if named_caches_stats:
+            params['named_caches_stats'] = named_caches_stats
+          cache_trim_stats = run_isolated_stats.get('trim_caches')
+          if cache_trim_stats:
+            params['cache_trim_stats'] = cache_trim_stats
+          cleanup_stats = run_isolated_stats.get('cleanup')
+          if cleanup_stats:
+            params['cleanup_stats'] = cleanup_stats
     except (IOError, OSError, ValueError) as e:
       logging.error('Swallowing error: %s', e)
-      if not must_signal_internal_failure:
-        must_signal_internal_failure = '%s\n%s' % (
-            e, traceback.format_exc()[-2048:])
+      if not internal_error:
+        internal_error = '%s\n%s' % (e, traceback.format_exc()[-2048:])
 
     # If no exit code has been set, something went wrong with run_isolated.py.
     # Set exit code to -1 to indicate a generic error occurred.
@@ -806,7 +976,7 @@ def run_command(remote, task_details, work_dir, cost_usd_hour,
     # Ignore server reply to stop. Also ignore internal errors here if we are
     # already handling some.
     try:
-      if must_signal_internal_failure:
+      if internal_error:
         # We need to update the task and then send task error. However, we
         # should *not* send the exit_code since doing so would cause the task
         # to be marked as COMPLETED until the subsequent post_task_error call
@@ -815,7 +985,7 @@ def run_command(remote, task_details, work_dir, cost_usd_hour,
         # stats as the server prints errors if either are set in this case.
         # TODO(sethkoehler): Come up with some way to still send the exit_code
         # (and thus also duration/stats) without marking the task COMPLETED.
-        logging.debug('must_signal_internal_failure: True. '
+        logging.debug('internal_error: True. '
                       'Resetting exit_code and params.')
         exit_code = None
         params.pop('duration', None)
@@ -830,23 +1000,24 @@ def run_command(remote, task_details, work_dir, cost_usd_hour,
                               exit_code)
       logging.debug('Last task update finished. task_id: %s, exit_code: %s, '
                     'params: %s.', task_details.task_id, exit_code, params)
-      if must_signal_internal_failure:
+      if internal_error:
         remote.post_task_error(task_details.task_id,
-                               must_signal_internal_failure)
-        # Clear out this error as we've posted it now (we already cleared out
-        # exit_code above). Note: another error could arise after this point,
-        # which is fine, since bot_main.py will post it).
-        must_signal_internal_failure = ''
+                               internal_error,
+                               missing_cas=missing_cas,
+                               missing_cipd=missing_cipd)
+        # We've reported the error, bot_main.py should not report it again
+        internal_error_reported = True
     except remote_client.InternalError as e:
       logging.error('Internal error while finishing the task: %s', e)
-      if not must_signal_internal_failure:
-        must_signal_internal_failure = str(e) or 'unknown error'
+      if not internal_error:
+        internal_error = str(e) or 'unknown error'
 
     return {
         'exit_code': exit_code,
         'hard_timeout': had_hard_timeout,
         'io_timeout': had_io_timeout,
-        'must_signal_internal_failure': must_signal_internal_failure,
+        'internal_error_reported': internal_error_reported,
+        'internal_error': internal_error,
         'version': OUT_VERSION,
     }
   finally:
@@ -866,15 +1037,19 @@ def main(args):
   parser.add_option(
       '--out-file', help='Name of the JSON file to write a task summary to')
   parser.add_option(
-      '--swarming-server', help='Swarming server to send data back')
-  parser.add_option(
-      '--cost-usd-hour', type='float', help='Cost of this VM in $/h')
+      '--swarming-server',
+      help='Swarming server URL to send data back and to put into LUCI_CONTEXT')
+  parser.add_option('--cost-usd-hour',
+                    type='float',
+                    help='Cost of this VM in $/h')
   parser.add_option('--start', type='float', help='Time this task was started')
-  parser.add_option(
-      '--bot-file', help='Path to a file describing the state of the host.')
+  parser.add_option('--bot-file',
+                    help='Path to a file describing the state of the host')
   parser.add_option(
       '--auth-params-file',
       help='Path to a file with bot authentication parameters')
+  parser.add_option('--session-state-file',
+                    help='Path to a file with Swarming session state')
 
   options, args = parser.parse_args(args)
   if not options.in_file or not options.out_file:
@@ -890,7 +1065,8 @@ def main(args):
   try:
     load_and_run(options.in_file, options.swarming_server,
                  options.cost_usd_hour, options.start, options.out_file, args,
-                 options.bot_file, options.auth_params_file)
+                 options.bot_file, options.auth_params_file,
+                 options.session_state_file)
     return 0
   finally:
     logging.info('quitting')

@@ -2,7 +2,12 @@
 # Use of this source code is governed under the Apache License, Version 2.0
 # that can be found in the LICENSE file.
 
-"""Set of functions to work with GAE SDK tools."""
+"""Set of functions to work with GAE SDK tools.
+
+Note: this module must be compatible with both Python 2 and Python 3. It is
+called by Python 2 as part of GAE smoke tests, and by Python 3 as part of gae.py
+tool.
+"""
 
 from __future__ import print_function
 
@@ -21,11 +26,14 @@ import sys
 import tempfile
 import time
 
-from six.moves import urllib
-
-
-# 'setup_gae_sdk' loads the 'yaml' module and modifies this variable.
-yaml = None
+if sys.version_info.major >= 3:
+  from urllib.parse import urlencode
+  # See vpython spec in gae.py.
+  import yaml
+else:
+  from urllib import urlencode
+  # Will be loaded lazily from GAE SDK by `setup_gae_sdk`.
+  yaml = None
 
 
 # Directory with this file.
@@ -128,6 +136,14 @@ def find_gcloud():
     exe_file = os.path.join(search_dir, 'gcloud', 'bin', binary)
     if os.path.isfile(exe_file) and os.access(exe_file, os.X_OK):
       return os.path.realpath(exe_file)
+
+    # infra.git installs gcloud as //cipd/gcloud
+    #
+    # This is all terrible :/
+    exe_file = os.path.join(search_dir, 'cipd', 'gcloud', 'bin', binary)
+    if os.path.isfile(exe_file) and os.access(exe_file, os.X_OK):
+      return os.path.realpath(exe_file)
+
     prev_dir = search_dir
     search_dir = os.path.dirname(search_dir)
     if search_dir == prev_dir:
@@ -251,7 +267,7 @@ def expand_luci_gae_vars(body, app_id):
   # value. Note that we handle only types that can appear as a result of YAML
   # deserialization (e.g. tuples can't).
   def sub(x):
-    if isinstance(x, basestring):
+    if isinstance(x, str):
       if x in mapping:
         return mapping[x]  # preserve the type! useful for int-valued vars
       return re.sub(r'\$\{[\w]+\}', pick_value, x)
@@ -344,6 +360,9 @@ def setup_gae_sdk(sdk_path):
   SDK and any AppEngine included Python module can be imported. The change is
   global and permanent.
   """
+  # GAE SDK only supports python2.
+  assert sys.version_info.major == 2
+
   global _GAE_SDK_PATH
   if _GAE_SDK_PATH:
     return
@@ -356,9 +375,12 @@ def setup_gae_sdk(sdk_path):
 
   import dev_appserver
   dev_appserver.fix_sys_path()
-  for i in sys.path[:]:
-    if 'jinja2-2.6' in i:
-      sys.path.remove(i)
+
+  # These packages are not actually available on real GAE, but dev_appserver
+  # still includes them. Remove them to make sure unit tests use an environment
+  # similar to the real one.
+  kick_out = {'endpoints-1.0', 'jinja2-2.6'}
+  sys.path = [p for p in sys.path if not any(x in p for x in kick_out)]
 
   # Make 'yaml' variable (defined on top of this module) point to loaded module.
   global yaml
@@ -387,16 +409,18 @@ class Application(object):
   serving version, uploaded versions, etc.). Built on top of appcfg.py calls.
   """
 
-  def __init__(self, app_dir, app_id=None, verbose=False):
+  def __init__(self, app_dir, app_id=None, verbose=False, gae_sdk=None):
     """Args:
       app_dir: application directory (should contain app.yaml).
       app_id: application ID to use, or None to use one from app.yaml.
       verbose: if True will run all appcfg.py operations in verbose mode.
+      gae_sdk: path to GAE SDK or None to use SDK setup by `setup_gae_sdk`.
     """
-    if not _GAE_SDK_PATH:
-      raise ValueError('Call setup_gae_sdk first')
+    if not yaml:
+      raise Error('Python 2 code needs to call setup_gae_sdk before '
+                  'instantiating Application')
 
-    self._gae_sdk = _GAE_SDK_PATH
+    self._gae_sdk = gae_sdk or _GAE_SDK_PATH
     self._app_dir = os.path.abspath(app_dir)
     self._app_id = app_id
     self._verbose = verbose
@@ -465,6 +489,8 @@ class Application(object):
   def run_cmd(self, cmd, cwd=None):
     """Runs subprocess, capturing the output.
 
+    Returns output as bytes on python3.
+
     Doesn't close stdin, since gcloud may be asking for user input. If this is
     undesirable (e.g when gae.py is used from scripts), close 'stdin' of gae.py
     process itself.
@@ -476,7 +502,13 @@ class Application(object):
         stdout=subprocess.PIPE)
     output, _ = proc.communicate()
     if proc.returncode:
-      sys.stderr.write('\n' + output + '\n')
+      if output:
+        sys.stderr.write('\n')
+        if sys.version_info.major >= 3:
+          sys.stderr.buffer.write(output)
+        else:
+          sys.stderr.write(output)
+        sys.stderr.write('\n')
       raise subprocess.CalledProcessError(proc.returncode, cmd, output)
     return output
 
@@ -502,8 +534,8 @@ class Application(object):
     data = self.run_gcloud(['app', 'versions', 'list'])
     per_service = collections.defaultdict(list)
     for deployment in data:
-      service = deployment['service'].encode('utf-8')
-      version_id = deployment['id'].encode('utf-8')
+      service = deployment['service']
+      version_id = deployment['id']
       per_service[service].append(version_id)
     return dict(per_service)
 
@@ -525,7 +557,7 @@ class Application(object):
     advanced_filter = _SWITCH_ADVANCED_FILTER.format(
         version=version, app_id=self.app_id)
     url = ('https://console.cloud.google.com/logs/viewer?' +
-           urllib.parse.urlencode({
+           urlencode({
                'project': self.app_id,
                'minLogLevel': 0,
                'customFacets': '',
@@ -605,6 +637,7 @@ class Application(object):
     if any(m.is_go for m in mods):
       _check_go()
 
+    cleanup = lambda: ()
     try:
       expanded_yamls, cleanup = expand_files_with_luci_gae_vars(
           mods, self.app_id)
@@ -671,11 +704,14 @@ class Application(object):
     Returns:
       Instance of subprocess.Popen and a cleanup callback function.
     """
+    if not self._gae_sdk:
+      raise Error('Configured GAE SDK path is required to run this method')
+
     expanded_mods, cleanup = expand_files_with_luci_gae_vars(
         self._services.values(), self.app_id)
 
     cmd = [
-        sys.executable,
+        'python2',
         os.path.join(self._gae_sdk, 'dev_appserver.py'),
         '--application',
         self.app_id,
@@ -736,7 +772,7 @@ class Application(object):
       try:
         parts[0] = int(parts[0])
       except ValueError:
-        pass
+        parts = [0] + parts
       return tuple(parts)
     return sorted(actual_versions, key=extract_version_num)
 
@@ -877,10 +913,8 @@ def process_sdk_options(parser, options):
   if not sdk_path:
     parser.error('Failed to find the AppEngine SDK. Pass --sdk-path argument.')
 
-  setup_gae_sdk(sdk_path)
-
   try:
-    return Application(app_dir, options.app_id, options.verbose)
+    return Application(app_dir, options.app_id, options.verbose, sdk_path)
   except (Error, ValueError) as e:
     parser.error(str(e))
 
@@ -897,15 +931,15 @@ def confirm(text, app, version, services=None, default_yes=False):
   Returns:
     True on approval, False otherwise.
   """
+  ask = input if sys.version_info.major >= 3 else raw_input
   print(text)
   print('  Directory: %s' % os.path.basename(app.app_dir))
   print('  App ID:    %s' % app.app_id)
   print('  Version:   %s' % version)
   print('  Services:  %s' % ', '.join(services or app.services))
   if default_yes:
-    return raw_input('Continue? [Y/n] ') not in ('n', 'N')
-  else:
-    return raw_input('Continue? [y/N] ') in ('y', 'Y')
+    return ask('Continue? [Y/n] ') not in ('n', 'N')
+  return ask('Continue? [y/N] ') in ('y', 'Y')
 
 
 def is_gcloud_auth_set():
@@ -913,11 +947,14 @@ def is_gcloud_auth_set():
   try:
     # This returns an email address of currently active account or empty string
     # if no account is active.
-    output = subprocess.check_output([
-      find_gcloud(), 'auth', 'list',
-      '--filter=status:ACTIVE', '--format=value(account)',
-    ])
-    return bool(output.strip())
+    return bool(
+        _check_output([
+            find_gcloud(),
+            'auth',
+            'list',
+            '--filter=status:ACTIVE',
+            '--format=value(account)',
+        ]))
   except subprocess.CalledProcessError as exc:
     logging.error('Failed to check active gcloud account: %s', exc)
     return False
@@ -932,15 +969,26 @@ def setup_gae_env():
 
 
 def _parse_version(v):
-  return tuple(map(int, (v.split('.'))))
+  """Takes e.g. "1.20-pre3" and returns e.g. (1, 20, 0)."""
+  v = v.split('-', 1)[0]
+  v = tuple(map(int, (v.split('.'))))
+  while len(v) < 3:
+    v += (0,)
+  return v
+
+
+def _check_output(cmd):
+  kwargs = {}
+  if sys.version_info.major >= 3:
+    kwargs['text'] = True
+  return subprocess.check_output(cmd, **kwargs).strip()
 
 
 def _check_go(min_version='1.16.0'):
   """Checks `go` is in PATH and it is fresh enough."""
   try:
     # 'go version go1.16.5 darwin/amd64'.
-    ver = subprocess.check_output(['go', 'version'])
-    ver = ver.splitlines()[0].strip()
+    ver = _check_output(['go', 'version']).splitlines()[0].strip()
     if not ver.startswith('go version go'):
       raise BadEnvironmentError(
           'Unexpected output from `go version`: %s' % (ver,))
@@ -953,17 +1001,19 @@ def _check_go(min_version='1.16.0'):
         'Could not find `go` in PATH. Is it needed to deploy Go code.')
 
 
-def _check_cloudbuildhelper(min_version='1.1.13'):
+def _check_cloudbuildhelper(min_version='1.5.4'):
   """Checks `cloudbuildhelper` is in PATH and it is fresh enough."""
   explainer = (
-      'It is needed to deploy Go GAE apps now (https://crbug.com/1057067).\n'
-      'Try activating Infra go environment first:\n'
-      '  $ eval `.../infra/go/env.py`.'
+      'It is needed to deploy Go GAE apps (https://crbug.com/1057067). '
+      '`cloudbuildhelper` is distributed via infra.git gclient DEPS. '
+      'Make sure your infra.git gclient checkout is up-to-date and activate Go '
+      'environment to put `cloudbuildhelper` in PATH:\n'
+      '  $ eval `.../infra/go/env.py`.\n'
+      'See https://chromium.googlesource.com/infra/infra/+/main/go/README.md'
   )
   try:
     # 'cloudbuildhelper v1.x.y\nCIPD package: ...'
-    ver = subprocess.check_output(['cloudbuildhelper', 'version'])
-    ver = ver.splitlines()[0].strip()
+    ver = _check_output(['cloudbuildhelper', 'version']).splitlines()[0].strip()
     if not ver.startswith('cloudbuildhelper v'):
       raise BadEnvironmentError(
           'Unexpected output from `cloudbuildhelper version`: %s' % (ver,))
@@ -1015,8 +1065,12 @@ def _prep_go_deployment(services, app_dir):
     # to `inputsdir` which is the parent of app_dir) into the corresponding
     # output directory in the staging destination.
     manifest_body['build'].append({
-        'go_gae_bundle': os.path.join('${inputsdir}', app_name, rel_path),
-        'dest': os.path.join('${contextdir}', app_name, rel_dir),
+        'go_gae_bundle':
+        os.path.join('${inputsdir}', app_name, rel_path),
+        'go_gae_bundle_as_module':
+        True,
+        'dest':
+        os.path.join('${contextdir}', app_name, rel_dir),
     })
 
   garbage = []
@@ -1038,36 +1092,40 @@ def _prep_go_deployment(services, app_dir):
 
     # Prepare ModuleFiles which point to staged YAMLs now. It is important to
     # follow symlinks in the staged output to get to the package directories
-    # in _gopath: that way "gcloud app deploy" will know what Go packages these
-    # YAML correspond too. This information eventually may surface in error
-    # stack traces.
+    # in _gopath/_gomod: that way "gcloud app deploy" will know what Go packages
+    # these YAML correspond too.
     staged_services = []
     for m in services:
       # E.g. "services/module-services.yaml".
       rel_path = os.path.relpath(m.path, app_dir)
       # E.g. "/tmp/_gae_py_xxx/app_name/services", matches `dest` in the YAML.
       abs_dir = os.path.join(stage_dir, app_name, os.path.dirname(rel_path))
-      # If it is a symlink, follow it to its destination in _gopath. This is how
-      # cloudbuildhelper packages directories specified via `go_gae_bundle`.
+      # If it is a symlink, follow it to its destination in _gopath/_gomod. This
+      # is how cloudbuildhelper packages directories specified via
+      # `go_gae_bundle`.
       abs_dir = os.path.realpath(abs_dir)
       # The YAML *must* be there.
       yaml_path = os.path.join(abs_dir, os.path.basename(m.path))
       assert os.path.isfile(yaml_path), yaml_path
       staged_services.append(ModuleFile(path=yaml_path, data=m.data))
 
-    # Scrub Go environ to set it up to use staged _gopath only.
-    for k in os.environ.keys():
+    # Scrub Go environ to set it up to use staged code only.
+    for k in list(os.environ):
       if k.startswith('GO') or k.startswith('CGO'):
         os.environ.pop(k)
 
     # We must not fetch any extra code at this point.
     os.environ['GOPROXY'] = 'off'
 
-    # GOPATH with the staged files, if present, is at _gopath.
+    # These indicate which bundling mode was used by cloudbuildhelper.
     go_path = os.path.join(stage_dir, '_gopath')
+    go_mod = os.path.join(stage_dir, '_gomod')
     if os.path.exists(go_path):
       os.environ['GOPATH'] = os.path.realpath(go_path)
       os.environ['GO111MODULE'] = 'off'
+    elif os.path.exists(go_mod):
+      os.environ.pop('GOPATH', None)
+      os.environ['GO111MODULE'] = 'on'
 
     # Proceed using the staged service YAMLs.
     yield staged_services

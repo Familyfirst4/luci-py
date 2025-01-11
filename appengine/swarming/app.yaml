@@ -23,6 +23,12 @@ handlers:
   script: main_frontend.prpc_app
   secure: always
 
+# For requests proxied from the Go server. Need a separate prefix to be able to
+# setup a dispatch.yaml rule that forwards these requests to the Python server.
+- url: /python/prpc/.*
+  script: main_frontend.prpc_app
+  secure: always
+
 # Old API URLs.
 - url: /api/.*
   script: main_frontend.app
@@ -58,9 +64,6 @@ handlers:
 - url: .*
   script: main_frontend.app
   secure: always
-
-builtins:
-- remote_api: on
 
 inbound_services:
 - mail # This is for 'reply all' to the mail from ereporter2.

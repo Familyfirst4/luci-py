@@ -28,6 +28,7 @@ import cipdserver_fake
 
 import cas_util
 import cipd
+import errors
 import local_caching
 import run_isolated
 from libs import luci_context
@@ -130,11 +131,10 @@ class RunIsolatedTestBase(auto_stub.TestCase):
 
   def fake_make_temp_dir(self, prefix, _root_dir):
     """Predictably returns directory for run_tha_test (one per test case)."""
-    self.assertIn(
-        prefix, (run_isolated.ISOLATED_OUT_DIR, run_isolated.ISOLATED_RUN_DIR,
-                 run_isolated.ISOLATED_TMP_DIR,
-                 run_isolated.ISOLATED_CLIENT_DIR, run_isolated._CAS_CLIENT_DIR,
-                 'cipd_site_root', run_isolated._NSJAIL_DIR))
+    self.assertIn(prefix,
+                  (run_isolated.ISOLATED_OUT_DIR, run_isolated.ISOLATED_RUN_DIR,
+                   run_isolated.ISOLATED_TMP_DIR, run_isolated._CAS_CLIENT_DIR,
+                   'cipd_site_root'))
     temp_dir = os.path.join(self.tempdir, prefix)
     self.assertFalse(fs.isdir(temp_dir))
     fs.makedirs(temp_dir)
@@ -200,7 +200,8 @@ class RunIsolatedTest(RunIsolatedTestBase):
         return ()
 
       def wait(self2, timeout=None):
-        self.assertIn(timeout, (None, 30, 60))
+        if timeout is not None:
+          self.assertTrue(timeout > 0)
         self2.returncode = 0
         for mock_fn in self.popen_fakes:
           ret = mock_fn(self2.args, **self2.kwargs)
@@ -230,9 +231,8 @@ class RunIsolatedTest(RunIsolatedTestBase):
     self.assertFalse(os.path.exists(dst))
 
   def test_get_command_env(self):
-    old_env = os.environ
+    old_env = os.environ.copy()
     try:
-      os.environ = os.environ.copy()
       os.environ.pop('B', None)
       self.assertNotIn('B', os.environ)
       os.environ['C'] = 'foo'
@@ -259,7 +259,8 @@ class RunIsolatedTest(RunIsolatedTestBase):
         self.assertEqual('/b/foo:bar', env['D'])
       self.assertEqual(os.sep + os.path.join('spam', 'eggs'), env['E'])
     finally:
-      os.environ = old_env
+      os.environ.clear()
+      os.environ.update(old_env)
 
   @mock.patch.dict(os.environ, {'SWARMING_TASK_ID': '4242'})
   def test_main(self):
@@ -606,6 +607,107 @@ class RunIsolatedTest(RunIsolatedTestBase):
         echo_cmd[0])
     self.assertEqual(echo_cmd[1:], ['hello', 'world'])
 
+  def test_main_naked_with_invalid_cas_input(self):
+    def dump_bad_digest_json(cmd, _):
+      json_path = cmd[cmd.index('-dump-json') + 1]
+      with open(json_path, 'w') as fp:
+        json.dump(
+            {
+                'result': 'digest_invalid',
+                'error_details': {
+                    'digest': 'abcd1234/21'
+                }
+            }, fp)
+
+    self.mock(run_isolated, "_run_go_cmd_and_wait", dump_bad_digest_json)
+    result_json_path = os.path.join(self.tempdir, 'result.json')
+
+    cmd = [
+        '--json',
+        result_json_path,
+        '--no-log',
+        '--named-cache-root',
+        os.path.join(self.tempdir, 'named_cache'),
+        '--cipd-enabled',
+        'False',
+        '--cas-digest',
+        'not_valid',
+        '--cas-instance',
+        'some_cas_instance',
+        '--',
+        'bin/echo${EXECUTABLE_SUFFIX}',
+        'hello',
+        'world',
+    ]
+
+    ret = run_isolated.main(cmd)
+    self.assertEqual(1, ret)
+    with open(result_json_path, 'r') as fp:
+      result_json = json.load(fp)
+
+    missing_cas = result_json['missing_cas'][0]
+    self.assertEqual('digest_invalid', missing_cas['status'])
+    self.assertEqual('abcd1234/21', missing_cas['digest'])
+    self.assertEqual('some_cas_instance', missing_cas['instance'])
+
+  def test_main_naked_with_invalid_cipd_package(self):
+    self.mock(cipd, 'get_platform', lambda: 'linux-amd64')
+    suffix = '.exe' if sys.platform == 'win32' else ''
+
+    def fake_ensure(args, **kwargs):
+      if (args[0].endswith(os.path.join('bin', 'cipd' + suffix))
+          and args[1] == 'ensure' and '-json-output' in args):
+        idx = args.index('-json-output')
+        with open(args[idx + 1], 'w') as json_out:
+          json.dump(
+              {
+                  "error":
+                  "failed to resolve does/not/exists/linux-amd64@latest",
+                  "error_code": "invalid_version_error",
+                  "error_details": {
+                      "package": "does/not/exists/linux-amd64",
+                      "version": "latest"
+                  },
+                  "result": None
+              }, json_out)
+        return 0
+      if args[0].endswith(os.sep + 'echo' + suffix):
+        return 0
+      self.fail('unexpected: %s, %s' % (args, kwargs))
+      return 1
+
+    self.popen_fakes.append(fake_ensure)
+    result_json_path = os.path.join(self.tempdir, 'result.json')
+    cipd_cache = os.path.join(self.tempdir, 'cipd_cache')
+    cmd = [
+        '--json',
+        result_json_path,
+        '--no-log',
+        '--cipd-package',
+        'bin:does/not/exists/${platform}:latest',
+        '--cipd-server',
+        self.cipd_server.url,
+        '--cipd-cache',
+        cipd_cache,
+        '--named-cache-root',
+        os.path.join(self.tempdir, 'named_cache'),
+        '--',
+        'bin/echo${EXECUTABLE_SUFFIX}',
+        'hello',
+        'world',
+    ]
+    ret = run_isolated.main(cmd)
+    self.assertEqual(1, ret)
+    with open(result_json_path, 'r') as fp:
+      result_json = json.load(fp)
+    self.assertEqual(1, len(result_json['missing_cipd']))
+    missing_cipd = result_json['missing_cipd'][0]
+    self.assertEqual('does/not/exists/linux-amd64',
+                     missing_cipd['package_name'])
+    self.assertEqual('invalid_version_error', missing_cipd['status'])
+    self.assertEqual('latest', missing_cipd['version'])
+    self.assertIsNone(missing_cipd['path'])
+
   def test_main_naked_with_cipd_client_no_packages(self):
     self.mock(cipd, 'get_platform', lambda: 'linux-amd64')
 
@@ -843,28 +945,6 @@ class RunIsolatedTest(RunIsolatedTestBase):
     ], self.popen_calls)
 
   @unittest.skipIf(sys.platform == 'win32', 'crbug.com/1148174')
-  def test_python_cmd_lower_priority(self):
-    self._run_tha_test(
-        command=['../out/cmd.py', 'arg'],
-        relative_cwd='some',
-        lower_priority=True)
-    # Injects sys.executable but on macOS, the path may be different than
-    # sys.executable due to symlinks.
-    self.assertEqual(1, len(self.popen_calls))
-    cmd, args = self.popen_calls[0]
-    self.assertEqual(
-        {
-          'cwd': self.ir_dir('some'),
-          'detached': True,
-          'close_fds': True,
-          'lower_priority': True,
-          'containment': None,
-        },
-        args)
-    self.assertIn('python', cmd[0])
-    self.assertEqual([os.path.join('..', 'out', 'cmd.py'), 'arg'], cmd[1:])
-
-  @unittest.skipIf(sys.platform == 'win32', 'crbug.com/1148174')
   def test_run_tha_test_non_isolated(self):
     _ = self._run_tha_test(command=['/bin/echo', 'hello', 'world'])
     self.assertEqual([
@@ -984,6 +1064,160 @@ class RunIsolatedTestRun(RunIsolatedTestBase):
     self.assertEqual(os.listdir(dest), ['foo'])
     with open(os.path.join(dest, 'foo'), 'rb') as f:
       self.assertEqual(f.read(), b'bar')
+
+  def test_write_without_empty_cas_does_not_crash(self):
+    """Test is here to prevent regression of: https://crbug.com/1504567
+    """
+    cmd = """
+import os
+outpath = os.path.join("${ISOLATED_OUTDIR}", "foo")
+with open(outpath, "w") as f:
+  f.write("dont crash")
+    """
+    os.environ.pop('RUN_ISOLATED_CAS_ADDRESS', None)
+    data = run_isolated.TaskData(
+        command=['python3', '-c', cmd],
+        relative_cwd=None,
+        cas_instance=None,
+        cas_digest=None,
+        outputs=None,
+        install_named_caches=init_named_caches_stub,
+        leak_temp_dir=False,
+        root_dir=self.tempdir,
+        hard_timeout=60,
+        grace_period=30,
+        bot_file=None,
+        switch_to_account=False,
+        install_packages_fn=run_isolated.copy_local_packages,
+        cas_cache_dir='',
+        cas_cache_policies=local_caching.CachePolicies(0, 0, 0, 0),
+        cas_kvs='',
+        env={},
+        env_prefix={},
+        lower_priority=False,
+        containment=None,
+        trim_caches_fn=trim_caches_stub)
+
+    result_json = os.path.join(self.tempdir, 'result.json')
+    ret = run_isolated.run_tha_test(data, result_json)
+    self.assertEqual(0, ret)
+
+
+class RunIsolatedTestCase(RunIsolatedTestRun):
+  def test_bad_cas_json_output(self):
+    def dump_bad_json(cmd, _):
+      json_path = cmd[cmd.index('-dump-json') + 1]
+      with open(json_path, 'w') as fp:
+        fp.write("{i[]nv[[]alid js{}on")
+
+    digest = self._server.archive_files(
+        {'cmd.py': b'import sys\n'
+         b'open(sys.argv[1], "w").write("bar")\n'})
+
+    self.mock(run_isolated, "_run_go_cmd_and_wait", dump_bad_json)
+
+    data = run_isolated.TaskData(
+        command=['python3', 'cmd.py', '${ISOLATED_OUTDIR}/foo'],
+        relative_cwd=None,
+        cas_instance="some_instance",
+        cas_digest=digest,
+        outputs=None,
+        install_named_caches=init_named_caches_stub,
+        leak_temp_dir=False,
+        root_dir=self.tempdir,
+        hard_timeout=60,
+        grace_period=30,
+        bot_file=None,
+        switch_to_account=False,
+        install_packages_fn=run_isolated.copy_local_packages,
+        cas_cache_dir='',
+        cas_cache_policies=local_caching.CachePolicies(0, 0, 0, 0),
+        cas_kvs=None,
+        env={},
+        env_prefix={},
+        lower_priority=False,
+        containment=None,
+        trim_caches_fn=trim_caches_stub)
+
+    result_json = os.path.join(self.tempdir, 'result.json')
+    run_isolated.run_tha_test(data, result_json)
+    with open(result_json) as f:
+      result = json.load(f)
+    # Don't care the exact error, so long as its not reported as a missing_cas
+    self.assertTrue(result.get('internal_failure'))
+    self.assertIsNone(result.get('missing_cas'))
+
+  def test_bad_cas_digest(self):
+    digest = "notvaliddigest"
+    os.environ['RUN_ISOLATED_CAS_ADDRESS'] = self._server.address
+    data = run_isolated.TaskData(
+        command=['python3', 'cmd.py', '${ISOLATED_OUTDIR}/foo'],
+        relative_cwd=None,
+        cas_instance="some_instance",
+        cas_digest=digest,
+        outputs=None,
+        install_named_caches=init_named_caches_stub,
+        leak_temp_dir=False,
+        root_dir=self.tempdir,
+        hard_timeout=60,
+        grace_period=30,
+        bot_file=None,
+        switch_to_account=False,
+        install_packages_fn=run_isolated.copy_local_packages,
+        cas_cache_dir='',
+        cas_cache_policies=local_caching.CachePolicies(0, 0, 0, 0),
+        cas_kvs='',
+        env={},
+        env_prefix={},
+        lower_priority=False,
+        containment=None,
+        trim_caches_fn=trim_caches_stub)
+
+    result_json = os.path.join(self.tempdir, 'result.json')
+    ret = run_isolated.run_tha_test(data, result_json)
+    with open(result_json) as f:
+      result = json.load(f)
+    self.assertEqual(1, ret)
+    self.assertEqual(digest, result['missing_cas'][0]['digest'])
+    self.assertEqual('some_instance', result['missing_cas'][0]['instance'])
+
+  def test_bad_cipd_package(self):
+    def emulate_bad_cipd(_run_dir, cas_dir):
+      raise errors.NonRecoverableCipdException("missing_cipd", "foo_package",
+                                               "not/found/foo", "deadbeef")
+
+    data = run_isolated.TaskData(
+        command=['python3', 'cmd.py', '${ISOLATED_OUTDIR}/foo'],
+        relative_cwd=None,
+        cas_instance=None,
+        cas_digest=None,
+        outputs=None,
+        install_named_caches=init_named_caches_stub,
+        leak_temp_dir=False,
+        root_dir=self.tempdir,
+        hard_timeout=60,
+        grace_period=30,
+        bot_file=None,
+        switch_to_account=False,
+        install_packages_fn=emulate_bad_cipd,
+        cas_cache_dir='',
+        cas_cache_policies=local_caching.CachePolicies(0, 0, 0, 0),
+        cas_kvs='',
+        env={},
+        env_prefix={},
+        lower_priority=False,
+        containment=None,
+        trim_caches_fn=trim_caches_stub)
+
+    result_json = os.path.join(self.tempdir, 'result.json')
+    ret = run_isolated.run_tha_test(data, result_json)
+    with open(result_json) as f:
+      result = json.load(f)
+
+    self.assertEqual(1, ret)
+    self.assertEqual('foo_package', result['missing_cipd'][0]['package_name'])
+    self.assertEqual('not/found/foo', result['missing_cipd'][0]['path'])
+    self.assertEqual('deadbeef', result['missing_cipd'][0]['version'])
 
 
 FILE, LINK, RELATIVE_LINK, DIR = range(4)
@@ -1330,6 +1564,7 @@ class RunIsolatedTestOutputFiles(RunIsolatedTestBase):
 class RunIsolatedJsonTest(RunIsolatedTestBase):
   # Similar to RunIsolatedTest but adds the hacks to process ISOLATED_OUTDIR to
   # generate a json result file.
+
   def setUp(self):
     super(RunIsolatedJsonTest, self).setUp()
 
@@ -1388,6 +1623,9 @@ class RunIsolatedJsonTest(RunIsolatedTestBase):
                 'upload': {
                     'items_cold': [15, 81],
                     'items_hot': None,
+                    'result': 'success',
+                    'size_cold': 96,
+                    'size_hot': 0,
                 },
             },
             'named_caches': {

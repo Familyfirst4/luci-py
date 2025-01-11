@@ -91,8 +91,11 @@ def _is_project():
 
 def is_ip_whitelisted_machine():
   """Returns True if the call is made from allowed-IP machine."""
-  return auth.is_in_ip_whitelist(auth.bots_ip_whitelist(), auth.get_peer_ip(),
-                                 False)
+  peer_ip = auth.get_peer_ip()
+  yes = auth.is_in_ip_whitelist(auth.bots_ip_whitelist(), peer_ip, False)
+  if yes and peer_ip:
+    logging.warning('is_ip_whitelisted_machine: %s', auth.ip_to_string(peer_ip))
+  return yes
 
 
 def can_access():
@@ -162,24 +165,14 @@ def can_schedule_high_priority_tasks():
   return _is_admin()
 
 
-def can_edit_task(task):
-  """Can 'edit' tasks, like cancelling.
-
-  The account that created a task can cancel it.
-  """
-  return (_is_privileged_user() or
-          auth.get_current_identity() == task.authenticated)
+def can_edit_one_task():
+  """Can 'edit' individual tasks, like cancelling."""
+  return _is_privileged_user()
 
 
 def can_edit_all_tasks():
   """Can 'edit' a batch of tasks, like cancelling."""
   return _is_admin()
-
-
-def can_view_task(task):
-  """Can view a single task."""
-  return (_is_view_all_tasks() or
-          auth.get_current_identity() == task.authenticated)
 
 
 def can_view_all_tasks():
@@ -188,6 +181,17 @@ def can_view_all_tasks():
 
 
 ### Other
+
+
+def can_use_task_backend():
+  """Can call TaskBackend API methods."""
+  return _is_project()
+
+
+def is_swarming_itself():
+  """True if the call is made by Swarming backend itself (for internal RPCs)."""
+  return (auth.get_current_identity() ==
+          auth.Identity(auth.IDENTITY_USER, utils.get_service_account_name()))
 
 
 def bootstrap_dev_server_acls():

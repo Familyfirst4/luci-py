@@ -3,17 +3,15 @@
 # that can be found in the LICENSE file.
 """Exceptions raised by methods called by prpc/endpoints handlers."""
 
-
 class BadRequestException(Exception):
   """The request is invalid."""
-  pass
-
 
 class PermissionException(Exception):
   """Permission requirements are not fulfilled."""
-  pass
-
 
 class InternalException(Exception):
   """Unexpected error occurred."""
-  pass
+
+
+class NotFoundException(Exception):
+  """The requested entity is not found."""

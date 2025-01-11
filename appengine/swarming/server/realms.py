@@ -2,6 +2,7 @@
 # Use of this source code is governed under the Apache License, Version 2.0
 # that can be found in the LICENSE file.
 
+from collections import namedtuple
 import datetime
 import logging
 
@@ -16,6 +17,25 @@ from server import task_scheduler
 from server import task_queues
 
 _TRACKING_BUG = 'crbug.com/1066839'
+
+
+# Properties of a task that affect who can access it.
+#
+# Extracted either from TaskRequest or from TaskResultSummary.
+TaskAccessInfo = namedtuple(
+    'TaskAccessInfo',
+    [
+        # ID of the task. Only for error messages and logs!
+        'task_id',
+        # The realm the task belongs to, as "<project>:<realm>" string.
+        'realm',
+        # Task's pool as a string.
+        'pool',
+        # The bot ID the task is targeting or None.
+        'bot_id',
+        # auth.Identity of whoever submitted the task.
+        'submitter',
+    ])
 
 
 def get_permission(enum_permission):
@@ -219,12 +239,8 @@ def check_bot_get_acl(bot_id):
   Raises:
     auth.AuthorizationError: if the caller is not allowed.
   """
-
-  # check global permission.
   if acl.can_view_bot():
     return
-
-  # check Realm permission 'swarming.pools.listBots'
   _check_bot_acl(realms_pb2.REALM_PERMISSION_POOLS_LIST_BOTS, bot_id)
 
 
@@ -246,12 +262,8 @@ def check_bot_tasks_acl(bot_id):
   Raises:
     auth.AuthorizationError: if the caller is not allowed.
   """
-
-  # check global permission.
   if acl.can_view_all_tasks():
     return
-
-  # check Realm permission 'swarming.pools.listTasks'
   _check_bot_acl(realms_pb2.REALM_PERMISSION_POOLS_LIST_TASKS, bot_id)
 
 
@@ -273,12 +285,8 @@ def check_bot_terminate_acl(bot_id):
   Raises:
     auth.AuthorizationError: if the caller is not allowed.
   """
-
-  # check global permission.
   if acl.can_edit_bot():
     return
-
-  # check Realm permission 'swarming.pools.terminateBot'
   _check_bot_acl(realms_pb2.REALM_PERMISSION_POOLS_TERMINATE_BOT, bot_id)
 
 
@@ -300,12 +308,8 @@ def check_bot_delete_acl(bot_id):
   Raises:
     auth.AuthorizationError: if the caller is not allowed.
   """
-
-  # check global permission.
   if acl.can_delete_bot():
     return
-
-  # check Realm permission 'swarming.pools.deleteBot'
   _check_bot_acl(realms_pb2.REALM_PERMISSION_POOLS_DELETE_BOT, bot_id)
 
 
@@ -386,8 +390,6 @@ def check_bots_list_acl(pools):
   Raises:
     auth.AuthorizationError: if the caller is not allowed.
   """
-
-  # check global permission.
   if acl.can_view_bot():
     return
   _check_pools_filters_acl(realms_pb2.REALM_PERMISSION_POOLS_LIST_BOTS, pools)
@@ -418,17 +420,43 @@ def can_list_bots(pool):
     return False
 
 
-def check_task_get_acl(task_request):
+def task_access_info_from_request(task_request):
+  """Extracts information for task ACL check from TaskRequest."""
+  return TaskAccessInfo(task_id=task_request.task_id,
+                        realm=task_request.realm,
+                        pool=task_request.pool,
+                        bot_id=task_request.bot_id,
+                        submitter=task_request.authenticated)
+
+
+def task_access_info_from_result_summary(result_summary):
+  """Extracts information for task ACL check from TaskResultSummary.
+
+  Raises:
+    ValueError if it doesn't have expected fields populated.
+  """
+  if not result_summary.request_realm:
+    raise ValueError('Unsupported TaskResultSummary entity')
+  return TaskAccessInfo(task_id=result_summary.task_id,
+                        realm=result_summary.request_realm,
+                        pool=result_summary.request_pool,
+                        bot_id=result_summary.request_bot_id,
+                        submitter=result_summary.request_authenticated)
+
+
+def check_task_get_acl(access_info):
   """Checks if the caller is allowed to get the task entities.
 
-  Checks if the caller has global permission using acl.can_view_task().
+  Checks if the caller has global permission using acl.can_view_all_tasks().
 
-  If the caller doesn't have any global permissions,
-    Checks if the caller has either of 'swarming.pools.listTasks' or
-    'swarming.tasks.get' permission.
+  If the caller doesn't have any global permissions, checks if the caller has
+  'swarming.tasks.get' in the task realm or 'swarming.pools.listTasks' in a
+  realm associated with either the task pool or the bot pool the task was
+  assigned to.
 
   Args:
-    task_request: An instance of TaskRequest.
+    access_info: An instance of TaskAccessInfo extracted from TaskRequest or
+        TaskResultSummary via task_access_info_from_*(...).
 
   Returns:
     None
@@ -436,54 +464,28 @@ def check_task_get_acl(task_request):
   Raises:
     auth.AuthorizationError: if the caller is not allowed.
   """
-
-  if acl.can_view_task(task_request):
+  assert isinstance(access_info, TaskAccessInfo)
+  if auth.get_current_identity() == access_info.submitter:
     return
-
-  # check 'swarming.pools.listTasks' permission of the pool in task dimensions.
-  if task_request.pool:
-    pool_cfg = pools_config.get_pool_config(task_request.pool)
-    if not pool_cfg:
-      raise auth.AuthorizationError(
-          'No such pool or no permission to use it: %s' % task_request.pool)
-    if pool_cfg.realm and auth.has_permission(
-        get_permission(realms_pb2.REALM_PERMISSION_POOLS_LIST_TASKS),
-        [pool_cfg.realm]):
-      return
-
-  # check 'swarming.pools.listTasks' permission of the pool in bot dimensions.
-  if task_request.bot_id:
-    pools = bot_management.get_pools_from_dimensions_flat(
-        _retrieve_bot_dimensions(task_request.bot_id))
-    pool_realms = [
-        p.realm for p in map(pools_config.get_pool_config, pools) if p.realm
-    ]
-    if pool_realms and auth.has_permission(
-        get_permission(realms_pb2.REALM_PERMISSION_POOLS_LIST_TASKS),
-        pool_realms):
-      return
-
-  # check 'swarming.tasks.get' permission.
-  task_realm = task_request.realm
-  if task_realm and auth.has_permission(
-      get_permission(realms_pb2.REALM_PERMISSION_TASKS_GET), [task_realm]):
+  if acl.can_view_all_tasks():
     return
+  _check_task_acl(access_info, realms_pb2.REALM_PERMISSION_TASKS_GET,
+                  realms_pb2.REALM_PERMISSION_POOLS_LIST_TASKS)
 
-  raise auth.AuthorizationError('Task "%s" is not accessible' %
-                                task_request.task_id)
 
-
-def check_task_cancel_acl(task_request):
+def check_task_cancel_acl(access_info):
   """Checks if the caller is allowed to cancel the task.
 
-  Checks if the caller has global permission using acl.can_edit_task().
+  Checks if the caller has global permission using acl.can_edit_one_task().
 
-  If the caller doesn't have any global permissions,
-    Checks if the caller has either of 'swarming.pools.cancelTask' or
-    'swarming.tasks.cancel' permission.
+  If the caller doesn't have any global permissions, checks if the caller has
+  'swarming.tasks.cancel' in the task realm or 'swarming.pools.cancelTask' in
+  a realm associated with either the task pool or the bot pool the task was
+  assigned to.
 
   Args:
-    task_request: An instance of TaskRequest.
+    access_info: An instance of TaskAccessInfo extracted from TaskRequest or
+        TaskResultSummary via task_access_info_from_*(...).
 
   Returns:
     None
@@ -491,55 +493,27 @@ def check_task_cancel_acl(task_request):
   Raises:
     auth.AuthorizationError: if the caller is not allowed.
   """
-
-  # check global permission.
-  if acl.can_edit_task(task_request):
+  assert isinstance(access_info, TaskAccessInfo)
+  if auth.get_current_identity() == access_info.submitter:
     return
-
-  # check 'swarming.pools.cancelTask' permission of the pool in task dimensions.
-  if task_request.pool:
-    pool_cfg = pools_config.get_pool_config(task_request.pool)
-    if not pool_cfg:
-      raise auth.AuthorizationError(
-          'No such pool or no permission to use it: %s' % task_request.pool)
-    if pool_cfg.realm and auth.has_permission(
-        get_permission(realms_pb2.REALM_PERMISSION_POOLS_CANCEL_TASK),
-        [pool_cfg.realm]):
-      return
-
-  # check 'swarming.pools.cancelTask' permission of the pool in bot dimensions.
-  if task_request.bot_id:
-    pools = bot_management.get_pools_from_dimensions_flat(
-        _retrieve_bot_dimensions(task_request.bot_id))
-    pool_realms = [
-        p.realm for p in map(pools_config.get_pool_config, pools) if p.realm
-    ]
-    if pool_realms and auth.has_permission(
-        get_permission(realms_pb2.REALM_PERMISSION_POOLS_CANCEL_TASK),
-        pool_realms):
-      return
-
-  # check 'swarming.tasks.cancel' permission.
-  task_realm = task_request.realm
-  if task_realm and auth.has_permission(
-      get_permission(realms_pb2.REALM_PERMISSION_TASKS_CANCEL), [task_realm]):
+  if acl.can_edit_one_task():
     return
+  _check_task_acl(access_info, realms_pb2.REALM_PERMISSION_TASKS_CANCEL,
+                  realms_pb2.REALM_PERMISSION_POOLS_CANCEL_TASK)
 
-  raise auth.AuthorizationError('Task "%s" is not accessible' %
-                                task_request.task_id)
 
-
-def can_cancel_task(task_request):
+def can_cancel_task(access_info):
   """Checks if the caller is allowed to cancel the task.
 
   Args:
-    task_request: An instance of TaskRequest.
+    access_info: An instance of TaskAccessInfo extracted from TaskRequest or
+        TaskResultSummary via task_access_info_from_*(...).
 
   Returns:
     allowed: True if allowed, False otherwise.
   """
   try:
-    check_task_cancel_acl(task_request)
+    check_task_cancel_acl(access_info)
     return True
   except auth.AuthorizationError:
     return False
@@ -564,8 +538,6 @@ def check_tasks_list_acl(pools):
   Raises:
     auth.AuthorizationError: if the caller is not allowed.
   """
-
-  # check global permission.
   if acl.can_view_all_tasks():
     return
   _check_pools_filters_acl(realms_pb2.REALM_PERMISSION_POOLS_LIST_TASKS, pools)
@@ -616,8 +588,6 @@ def check_tasks_cancel_acl(pools):
   Raises:
     auth.AuthorizationError: if the caller is not allowed.
   """
-
-  # check global permission.
   if acl.can_edit_all_tasks():
     return
   _check_pools_filters_acl(realms_pb2.REALM_PERMISSION_POOLS_CANCEL_TASK, pools)
@@ -677,14 +647,23 @@ def _check_permission(perm, realms, identity=None):
                identity.kind, identity.name, perm.name, realms)
 
 
-def _retrieve_bot_dimensions(bot_id):
-  """Retrieves bot dimensions"""
-  # get the last BotEvent because BotInfo may have been deleted.
-  events = bot_management.get_events_query(bot_id, True).fetch(1)
-  if not events:
-    raise auth.AuthorizationError(
-        'No such bot or no permission to use it: "%s".' % bot_id)
-  return events[0].dimensions_flat
+def _bot_pool_realms(bot_id):
+  """Returns realms of all pools the bot belongs to.
+
+  Returns:
+    A list of realms. It is empty if the bot doesn't exist or has no pools
+    associated with it.
+  """
+  realms = []
+  for p in bot_management.get_bot_pools(bot_id):
+    pool_cfg = pools_config.get_pool_config(p)
+    if not pool_cfg:
+      logging.warning('Bot pool is missing. pool: %s, bot: %s', p, bot_id)
+    elif not pool_cfg.realm:
+      logging.warning('Bot pool has no realm. pool: %s, bot: %s', p, bot_id)
+    else:
+      realms.append(pool_cfg.realm)
+  return realms
 
 
 def _check_pools_filters_acl(perm_enum, pools):
@@ -720,18 +699,57 @@ def _check_bot_acl(perm_enum, bot_id):
   Raises:
     auth.AuthorizationError: if the caller is not allowed.
   """
-  # retrieve the pools from bot dimensions.
-  pools = bot_management.get_pools_from_dimensions_flat(
-      _retrieve_bot_dimensions(bot_id))
-  realms = []
-  for p in pools:
-    pool_cfg = pools_config.get_pool_config(p)
-    if not pool_cfg:
-      logging.warning('PoolCfg is missing. pool: %s', p)
-      continue
-    if not pool_cfg.realm:
-      continue
-    realms.append(pool_cfg.realm)
+  bot_realms = _bot_pool_realms(bot_id)
+  if not bot_realms:
+    raise auth.AuthorizationError(
+        'No such bot or no permission to use it: %s.' % bot_id)
+  _check_permission(get_permission(perm_enum), bot_realms)
 
-  # the caller needs to have any permission of the pools.
-  _check_permission(get_permission(perm_enum), realms)
+
+def _check_task_acl(access_info, task_perm_enum, pool_perm_enum):
+  """Checks if the caller has `task_perm_enum` permission in the task realm or
+  `pool_perm_enum` permission in a realm associated with either the task pool
+  or a bot pool of the bot the task was assigned to.
+
+  The idea is that the caller can either "own" the task or "own" the bot pool it
+  was scheduled to run on. If the caller "owns" the task, they will get access
+  through  `task_perm_enum` in the tasks realm. If the caller "owns" the pool,
+  they will get access through `pool_perm_enum` in the pool realm.
+
+  Args:
+    access_info: An instance of TaskAccessInfo.
+    task_perm_enum: realms_pb2.RealmPermission enum value.
+    pool_perm_enum: realms_pb2.RealmPermission enum value.
+
+  Raises:
+    auth.AuthorizationError if the call is not allowed.
+  """
+  task_perm = get_permission(task_perm_enum)
+  pool_perm = get_permission(pool_perm_enum)
+
+  # First check the task realm permission, it is the fastest check.
+  task_realm = access_info.realm
+  if task_realm and auth.has_permission(task_perm, [task_realm]):
+    return
+
+  # Next check the pool permission of the pool the task was scheduled in. This
+  # is also relatively fast, since it hits the local config cache.
+  if access_info.pool:
+    pool_cfg = pools_config.get_pool_config(access_info.pool)
+    if not pool_cfg:
+      logging.warning('Task pool is missing. pool: %s', access_info.pool)
+    elif not pool_cfg.realm:
+      logging.warning('Task pool has no realm. pool: %s', access_info.pool)
+    elif auth.has_permission(pool_perm, [pool_cfg.realm]):
+      return
+
+  # Finally check the pool permission of all the pools (usually one) in bot
+  # dimensions. This is slow, since we need to fetch bot dimensions from the
+  # datastore. For that reason we do it last.
+  if access_info.bot_id:
+    bot_realms = _bot_pool_realms(access_info.bot_id)
+    if bot_realms and auth.has_permission(pool_perm, bot_realms):
+      return
+
+  raise auth.AuthorizationError('Task "%s" is not accessible' %
+                                access_info.task_id)

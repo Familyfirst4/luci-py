@@ -159,7 +159,7 @@ def rpc_async(req, response_metadata=None):
     # such cases.
     if 'X-Prpc-Grpc-Code' not in ex.headers:
       if ex.status_code is None:
-        raise RpcError(ex.message, codes.StatusCode.UNAVAILABLE, {})
+        raise RpcError(str(ex), codes.StatusCode.UNAVAILABLE, {})
       if ex.status_code == 500:
         raise RpcError(msg, codes.StatusCode.INTERNAL, ex.headers)
       if ex.status_code == 503:
@@ -181,7 +181,7 @@ def rpc_async(req, response_metadata=None):
   try:
     encoding.decode_bin_metadata(response_metadata)
   except ValueError as ve:
-    raise ProtocolError(ve.message)
+    raise ProtocolError(str(ve))
   raise ndb.Return(res)
 
 
@@ -283,12 +283,11 @@ class Client(object):
     assert response_py_type, 'response type for %s.%s not found' % (
         self._full_service_name, method_desc.name)
 
-    def method_async(  # pylint: disable=redefined-outer-name
-        request,
-        timeout=None,
-        metadata=None,
-        credentials=None,
-        response_metadata=None):
+    def method_async(request,
+                     timeout=None,
+                     metadata=None,
+                     credentials=None,
+                     response_metadata=None):
       # The signature of this function was originally supposed to match
       # https://grpc.io/grpc/python/grpc.html#grpc.UnaryUnaryMultiCallable.__call__
       # But a new optional argument has been added to return the response's

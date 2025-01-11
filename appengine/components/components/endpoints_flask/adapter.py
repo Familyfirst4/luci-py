@@ -18,8 +18,8 @@ import flask
 
 from components import template
 
-import discovery
-import partial
+from . import discovery
+from . import partial
 
 PROTOCOL = protojson.EndpointsProtoJson()
 
@@ -39,14 +39,13 @@ def decode_field(field, value):
     value = value.lower()
     if value == 'true':
       return True
-    elif value == 'false':
+    if value == 'false':
       return False
-    else:
-      raise ValueError('boolean field must be either "true" or "false"')
+    raise ValueError('boolean field must be either "true" or "false"')
   return PROTOCOL.decode_field(field, value)
 
 
-def decode_message(remote_method_info, request):
+def decode_message(remote_method_info, request, route_kwargs):
   """Decodes a protorpc message from a Flask request.
 
   If method accepts a resource container, parses field values from URL too.
@@ -77,8 +76,8 @@ def decode_message(remote_method_info, request):
     else:
       param_fields = res_container.parameters_message_class.all_fields()
     for f in param_fields:
-      if f.name in request.args:
-        values = [request.args[f.name]]
+      if f.name in route_kwargs:
+        values = [route_kwargs[f.name]]
       else:
         values = request.values.getlist(f.name)
       if values:
@@ -90,14 +89,14 @@ def decode_message(remote_method_info, request):
   return result
 
 
-def cors_handler():
+def cors_handler(**_):
   return flask.Response(headers=CORS_HEADERS)
 
 
 def path_handler_factory(api_class, api_method, service_path):
   """Returns a Flask handler function for the API methods."""
 
-  def path_handler():
+  def path_handler(**route_kwargs):
     headers = CORS_HEADERS
 
     split_host = flask.request.host.split(':')
@@ -111,35 +110,38 @@ def path_handler_factory(api_class, api_method, service_path):
                                 server_port=port,
                                 http_method=flask.request.method,
                                 service_path=service_path,
-                                headers=flask.request.headers.items()))
+                                headers=list(flask.request.headers.items())))
     try:
-      req = decode_message(api_method.remote, flask.request)
+      req = decode_message(api_method.remote, flask.request, route_kwargs)
       # Check that required fields are populated.
       req.check_initialized()
-    except (messages.DecodeError, messages.ValidationError, ValueError) as ex:
-      response = {'error': {'message': ex.message}}
+    except (messages.DecodeError, messages.ValidationError, AttributeError,
+            ValueError) as ex:
+      logging.warning('Bad request data: ' + flask.request.data.decode())
+      logging.warning('Error was: ' + str(ex))
+      response = {'error': {'message': str(ex)}}
       return flask.jsonify(response), http_client.BAD_REQUEST, headers
     try:
       res = api_method(api, req)
     except endpoints.ServiceException as ex:
-      response = {'error': {'message': ex.message}}
+      response = {'error': {'message': str(ex)}}
       return flask.jsonify(response), ex.http_status, headers
     if isinstance(res, message_types.VoidMessage):
       return '', http_client.NO_CONTENT, headers
     # Flask jsonifies Python dicts, so this format is more convenient.
     response = json.loads(PROTOCOL.encode_message(res))
-    if flask.request.get('fields'):
+    if flask.request.values.get('fields'):
       try:
         # PROTOCOL.encode_message checks that the message is initialized
         # before dumping it directly to JSON string. Therefore we can't
         # mask the protocol buffer (if masking removes a required field
         # then encode_message will fail). Instead, call encode_message
         # first, mask the dict,and dump it back to JSON.
-        response = partial.mask(response, flask.request.get('fields'))
+        response = partial.mask(response, flask.request.values.get('fields'))
       except (partial.ParsingError, ValueError) as e:
         # Log the error but return the full response.
         logging.warning('Ignoring erroneous field mask %r: %s',
-                        flask.request.get('fields'), e)
+                        flask.request.values.get('fields'), e)
     return flask.jsonify(response), http_client.OK, headers
 
   return path_handler
@@ -163,19 +165,22 @@ def api_routes(api_classes, base_path='/_ah/api'):
 
   # Add routes for each class.
   for api_class in api_classes:
-    api_base_path = '%s/%s/%s' % (base_path, api_class.api_info.name,
-                                  api_class.api_info.version)
+    api_info = api_class.api_info
+    path_version = (api_info.path_version
+                    if hasattr(api_info, 'path_version') else api_info.version)
+    api_base_path = '%s/%s/%s' % (base_path, api_info.name, path_version)
     templates = set()
 
     # Add routes for each method of each class.
     for _, method in sorted(api_class.all_remote_methods().items()):
       info = method.method_info
       method_path = info.get_path(api_class.api_info)
-      method_path = method_path.replace('{', '<string:').replace('}', '>')
-      t = posixpath.join(api_base_path, method_path)
+      flask_method_path = method_path.replace('{', '<string:').replace('}', '>')
+      t = posixpath.join(api_base_path, flask_method_path)
       http_method = info.http_method.upper() or 'POST'
+      unique_endpoint = method_path + ' ' + http_method
       handler = path_handler_factory(api_class, method, api_base_path)
-      routes.append((t, method_path, handler, [http_method]))
+      routes.append((t, unique_endpoint, handler, [http_method]))
       templates.add(t)
 
       # Add routes for HTTP OPTIONS (to add CORS headers) for each method.
@@ -227,8 +232,10 @@ def discovery_handler_factory(api_classes, base_path):
   # Create a map of (name, version) => [services...].
   service_map = collections.defaultdict(list)
   for api_class in api_classes:
-    service_map[(api_class.api_info.name,
-                 api_class.api_info.version)].append(api_class)
+    api_info = api_class.api_info
+    path_version = (api_info.path_version
+                    if hasattr(api_info, 'path_version') else api_info.version)
+    service_map[(api_info.name, path_version)].append(api_class)
 
   def discovery_handler(name, version):
     host = flask.request.headers['Host']
@@ -304,11 +311,11 @@ def explorer_proxy_route(base_path):
   def proxy_handler():
     """Returns a proxy capable of handling requests from API explorer."""
 
-    return template.render('adapter/proxy.html',
+    return template.render('endpoints_adapter/proxy.html',
                            params={'base_path': base_path})
 
   template.bootstrap({
-      'adapter': os.path.join(THIS_DIR, 'templates'),
+      'endpoints_adapter': os.path.join(THIS_DIR, 'templates'),
   })
 
   return ('%s/static/proxy.html' % base_path, 'proxy_handler', proxy_handler,

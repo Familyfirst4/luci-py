@@ -27,10 +27,11 @@ from server import task_request
 from server import task_result
 from server import task_pack
 
-from proto.api.internal.bb import backend_pb2
-from proto.api.internal.bb import common_pb2
-from proto.api.internal.bb import launcher_pb2
-from proto.api.internal.bb import swarming_bb_pb2
+from bb.go.chromium.org.luci.buildbucket.proto import backend_pb2
+from bb.go.chromium.org.luci.buildbucket.proto import common_pb2
+from bb.go.chromium.org.luci.buildbucket.proto import launcher_pb2
+from bb.go.chromium.org.luci.buildbucket.proto import task_pb2
+from proto.api_v2 import swarming_pb2
 
 
 def req_dim_prpc(key, value, exp_secs=None):
@@ -45,7 +46,7 @@ class TestBackendConversions(test_case.TestCase):
 
   def setUp(self):
     super(TestBackendConversions, self).setUp()
-    now = datetime.datetime(2019, 01, 02, 03)
+    now = datetime.datetime(2019, 1, 2, 3)
     test_case.mock_now(self, now, 0)
 
   def test_compute_task_request(self):
@@ -64,28 +65,37 @@ class TestBackendConversions(test_case.TestCase):
         backend_config=struct_pb2.Struct(
             fields={
                 'wait_for_capacity':
-                    struct_pb2.Value(bool_value=True),
+                struct_pb2.Value(bool_value=True),
                 'priority':
-                    struct_pb2.Value(number_value=5),
+                struct_pb2.Value(number_value=5),
                 'bot_ping_tolerance':
-                    struct_pb2.Value(number_value=70),
+                struct_pb2.Value(number_value=70),
                 'service_account':
-                    struct_pb2.Value(string_value='who@serviceaccount.com'),
+                struct_pb2.Value(string_value='who@serviceaccount.com'),
                 'parent_run_id':
-                    struct_pb2.Value(string_value=parent_task_id),
+                struct_pb2.Value(string_value=parent_task_id),
                 'agent_binary_cipd_filename':
-                    struct_pb2.Value(string_value='agent'),
+                struct_pb2.Value(string_value='agent'),
                 'agent_binary_cipd_pkg':
-                    struct_pb2.Value(string_value='agent/package/${platform}'),
+                struct_pb2.Value(string_value='agent/package/${platform}'),
                 'agent_binary_cipd_vers':
-                    struct_pb2.Value(string_value='latest'),
+                struct_pb2.Value(string_value='latest'),
+                'tags':
+                  struct_pb2.Value(list_value=struct_pb2.ListValue(
+                      values=[
+                          struct_pb2.Value(string_value ='k1:v1'),
+                          struct_pb2.Value(string_value ='k2:v2'),
+                      ],
+                  )),
+                'task_name': struct_pb2.Value(string_value='task_name'),
             }),
         grace_period=duration_pb2.Duration(seconds=grace_secs),
         execution_timeout=duration_pb2.Duration(seconds=exec_secs),
         start_deadline=timestamp_pb2.Timestamp(seconds=start_deadline_secs),
         dimensions=[req_dim_prpc('required-1', 'req-1')],
-        backend_token='token-token-token',
+        register_backend_task_token='token-token-token',
         buildbucket_host='cow-buildbucket.appspot.com',
+        pubsub_topic="my_subscription_topic",
     )
 
     expected_slice = task_request.TaskSlice(
@@ -96,35 +106,36 @@ class TestBackendConversions(test_case.TestCase):
             execution_timeout_secs=exec_secs,
             grace_period_secs=grace_secs,
             dimensions_data={u'required-1': [u'req-1']},
-            command=[
-                u'agent', '-fantasia', 'pegasus', '-cache-base', 'cache',
-                '-task-id', '${SWARMING_TASK_ID}'
-            ],
+            command=[u'agent', '-fantasia', 'pegasus'],
             cipd_input=task_request.CipdInput(packages=[
                 task_request.CipdPackage(
                     path='.',
                     package_name=u'agent/package/${platform}',
                     version=u'latest')
-            ])))
+            ]),
+            containment=task_request.Containment(containment_type=0)))
     expected_tr = task_request.TaskRequest(
         created_ts=utils.utcnow(),
         task_slices=[expected_slice],
         expiration_ts=utils.timestamp_to_datetime(start_deadline_secs *
                                                   1000000),
         realm='some:realm',
-        name='bb-4242',
+        name='task_name',
         priority=5,
         bot_ping_tolerance_secs=70,
         service_account='who@serviceaccount.com',
         parent_task_id=parent_task_id,
-        has_build_token=True)
+        has_build_task=True,
+        manual_tags=['k1:v1', 'k2:v2'])
 
     expected_sb = task_request.SecretBytes(
         secret_bytes=run_task_req.secrets.SerializeToString())
-    expected_bt = task_request.BuildToken(
+    expected_bt = task_request.BuildTask(
         build_id='4242',
-        token='token-token-token',
-        buildbucket_host='cow-buildbucket.appspot.com')
+        buildbucket_host='cow-buildbucket.appspot.com',
+        latest_task_status=task_result.State.PENDING,
+        pubsub_topic="my_subscription_topic",
+        update_id=1546398000000000000)
 
     actual_tr, actual_sb, actual_bt = backend_conversions.compute_task_request(
         run_task_req)
@@ -142,17 +153,17 @@ class TestBackendConversions(test_case.TestCase):
         backend_config=struct_pb2.Struct(
             fields={
                 'wait_for_capacity':
-                    struct_pb2.Value(bool_value=True),
+                struct_pb2.Value(bool_value=True),
                 'agent_binary_cipd_filename':
-                    struct_pb2.Value(string_value='agent'),
+                struct_pb2.Value(string_value='agent'),
                 'agent_binary_cipd_pkg':
-                    struct_pb2.Value(string_value='agent/package/${platform}'),
+                struct_pb2.Value(string_value='agent/package/${platform}'),
                 'agent_binary_cipd_vers':
-                    struct_pb2.Value(string_value='latest'),
+                struct_pb2.Value(string_value='latest'),
             }),
         caches=[
-            swarming_bb_pb2.CacheEntry(name='name_1', path='path_1'),
-            swarming_bb_pb2.CacheEntry(
+            common_pb2.CacheEntry(name='name_1', path='path_1'),
+            common_pb2.CacheEntry(
                 name='name_2',
                 path='path_2',
                 wait_for_warm_cache=duration_pb2.Duration(seconds=180))
@@ -168,27 +179,22 @@ class TestBackendConversions(test_case.TestCase):
             req_dim_prpc('required-2', 'req-2'),
             req_dim_prpc('required-1', 'req-1-2')
         ])
-    backend_config = backend_conversions.ingest_backend_config(
+    backend_config = backend_conversions.ingest_backend_config_with_default(
         run_task_req.backend_config)
 
     # Create expected slices.
     base_slice = task_request.TaskSlice(
         wait_for_capacity=True,
         properties=task_request.TaskProperties(
-            command=[
-                u'agent', '-chicken', '1', '-cow', '3', '-cache-base', 'cache',
-                '-task-id', '${SWARMING_TASK_ID}'
-            ],
+            command=[u'agent', '-chicken', '1', '-cow', '3'],
             has_secret_bytes=True,
             caches=[
-                task_request.CacheEntry(
-                    path=posixpath.join(backend_conversions._CACHE_DIR,
-                                        'path_1'),
-                    name='name_1'),
-                task_request.CacheEntry(
-                    path=posixpath.join(backend_conversions._CACHE_DIR,
-                                        'path_2'),
-                    name='name_2'),
+                task_request.CacheEntry(path=posixpath.join(
+                    backend_conversions._CACHE_DIR, 'path_1'),
+                                        name='name_1'),
+                task_request.CacheEntry(path=posixpath.join(
+                    backend_conversions._CACHE_DIR, 'path_2'),
+                                        name='name_2'),
             ],
             execution_timeout_secs=exec_secs,
             grace_period_secs=grace_secs,
@@ -197,7 +203,8 @@ class TestBackendConversions(test_case.TestCase):
                     path='.',
                     package_name=u'agent/package/${platform}',
                     version=u'latest')
-            ])))
+            ]),
+            containment=task_request.Containment(containment_type=0)))
 
     slice_1 = task_request.TaskSlice(
         expiration_secs=60, properties=copy.deepcopy(base_slice.properties))
@@ -227,11 +234,9 @@ class TestBackendConversions(test_case.TestCase):
     }
 
     expected_slices = [slice_1, slice_2, base_slice]
-
-    self.assertEqual(
-        expected_slices,
-        backend_conversions._compute_task_slices(
-            run_task_req, backend_config, True))
+    actual_slices = backend_conversions._compute_task_slices(
+            run_task_req, backend_config, True)
+    self.assertEqual(expected_slices, actual_slices)
 
   def test_compute_task_slices_base_slice_only(self):
     exec_secs = 180
@@ -258,17 +263,14 @@ class TestBackendConversions(test_case.TestCase):
             req_dim_prpc('required-2', 'req-2'),
             req_dim_prpc('required-1', 'req-1-2')
         ])
-    backend_config = backend_conversions.ingest_backend_config(
+    backend_config = backend_conversions.ingest_backend_config_with_default(
         run_task_req.backend_config)
 
     base_slice = task_request.TaskSlice(
         wait_for_capacity=True,
         expiration_secs=120,
         properties=task_request.TaskProperties(
-            command=[
-                u'agent', '-cache-base', 'cache', '-task-id',
-                '${SWARMING_TASK_ID}'
-            ],
+            command=[u'agent'],
             has_secret_bytes=False,
             execution_timeout_secs=exec_secs,
             grace_period_secs=grace_secs,
@@ -281,7 +283,8 @@ class TestBackendConversions(test_case.TestCase):
                     path='.',
                     package_name=u'agent/package/${platform}',
                     version=u'latest')
-            ])),
+            ]),
+            containment=task_request.Containment(containment_type=0)),
     )
 
     self.assertEqual([base_slice],
@@ -289,7 +292,7 @@ class TestBackendConversions(test_case.TestCase):
                          run_task_req, backend_config, False))
 
   def test_compute_task_slices_exceptions(self):
-    backend_config = swarming_bb_pb2.SwarmingBackendConfig()
+    backend_config = swarming_pb2.SwarmingTaskBackendConfig()
 
     run_task_req = backend_pb2.RunTaskRequest(
         grace_period=duration_pb2.Duration(nanos=42))
@@ -306,11 +309,11 @@ class TestBackendConversions(test_case.TestCase):
                                                False)
 
     run_task_req = backend_pb2.RunTaskRequest(caches=[
-        swarming_bb_pb2.CacheEntry(
-            wait_for_warm_cache=duration_pb2.Duration(nanos=42))
+        common_pb2.CacheEntry(wait_for_warm_cache=duration_pb2.Duration(
+            seconds=1))
     ])
     with self.assertRaisesRegexp(handlers_exceptions.BadRequestException,
-                                 'wait_for_warm_cache.nanos'):
+                                 'wait_for_warm_cache'):
       backend_conversions._compute_task_slices(run_task_req, backend_config,
                                                False)
 
@@ -326,14 +329,14 @@ class TestBackendConversions(test_case.TestCase):
   def test_convert_results_to_tasks(self):
     def test_task(status, task_id=None, summary=None, set_timeout=False,
                   set_exhaustion=False):
-      task = backend_pb2.Task(
-          id=backend_pb2.TaskID(target='swarming://%s' %
+      task = task_pb2.Task(
+          id=task_pb2.TaskID(target='swarming://%s' %
                                 app_identity.get_application_id()),
           status=status)
       if task_id is not None:
         task.id.id = str(task_id)
       if summary is not None:
-        task.summary_html = summary
+        task.summary_markdown = summary
       if set_timeout:
         task.status_details.timeout.SetInParent()
       if set_exhaustion:
@@ -388,22 +391,17 @@ class TestBackendConversions(test_case.TestCase):
     results = [None, res_sum_1, run_res_2, run_res_3, run_res_4, run_res_5]
 
     expected_tasks = [
-        test_task(
-            common_pb2.INFRA_FAILURE,
-            task_id='1',
-            summary='Swarming task 1 not found'),
+        test_task(common_pb2.INFRA_FAILURE,
+                  task_id='1',
+                  summary='Swarming task 1 not found'),
         test_task(common_pb2.SCHEDULED, task_id=res_sum_1.task_id),
-        test_task(
-            common_pb2.INFRA_FAILURE,
-            task_id=run_res_2.task_id,
-            summary='Task expired.',
-            set_timeout=True,
-            set_exhaustion=True),
+        test_task(common_pb2.INFRA_FAILURE,
+                  task_id=run_res_2.task_id,
+                  summary='Task expired.',
+                  set_timeout=True,
+                  set_exhaustion=True),
         test_task(common_pb2.CANCELED, task_id=run_res_3.task_id),
-        test_task(
-            common_pb2.FAILURE,
-            task_id=run_res_4.task_id,
-            summary='Task completed with failure.'),
+        test_task(common_pb2.FAILURE, task_id=run_res_4.task_id),
         test_task(common_pb2.SUCCESS, task_id=run_res_5.task_id),
     ]
 

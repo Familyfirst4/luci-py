@@ -4,8 +4,10 @@
 """Internal bot API handlers."""
 
 import base64
+import datetime
 import json
 import logging
+import re
 import urlparse
 
 import six
@@ -19,17 +21,20 @@ from google.appengine.ext import ndb
 from google.appengine import runtime
 from google.appengine.runtime import apiproxy_errors
 
-import api_helpers
 from components import auth
+from components import datastore_utils
 from components import decorators
 from components import ereporter2
 from components import utils
 from server import acl
 from server import bot_auth
 from server import bot_code
+from server import bot_groups_config
 from server import bot_management
+from server import bot_session
 from server import config
 from server import named_caches
+from server import rbe
 from server import resultdb
 from server import service_accounts
 from server import task_pack
@@ -37,6 +42,9 @@ from server import task_queues
 from server import task_request
 from server import task_result
 from server import task_scheduler
+from server import task_to_run
+import api_helpers
+import ts_mon_metrics
 
 # Methods used to authenticate requests from bots, see get_auth_methods().
 #
@@ -47,6 +55,9 @@ _BOT_AUTH_METHODS = (
     auth.machine_authentication,
     auth.oauth_authentication,
 )
+
+# Allowed bot session IDs.
+_SESSION_ID_RE = re.compile(r'^[a-z0-9\-_/]{1,50}$')
 
 
 def has_unexpected_subset_keys(expected_keys, minimum_keys, actual_keys, name):
@@ -68,14 +79,6 @@ def has_unexpected_subset_keys(expected_keys, minimum_keys, actual_keys, name):
                                                         msg_superfluous)
 
 
-def has_unexpected_keys(expected_keys, actual_keys, name):
-  """Return an error if unexpected keys are present or expected keys are
-  missing.
-  """
-  return has_unexpected_subset_keys(expected_keys, expected_keys, actual_keys,
-                                    name)
-
-
 def log_unexpected_subset_keys(expected_keys, minimum_keys, actual_keys,
                                request, source, name):
   """Logs an error if unexpected keys are present or expected keys are missing.
@@ -91,13 +94,6 @@ def log_unexpected_subset_keys(expected_keys, minimum_keys, actual_keys,
   return message
 
 
-def log_unexpected_keys(expected_keys, actual_keys, request, source, name):
-  """Logs an error if unexpected keys are present or expected keys are missing.
-  """
-  return log_unexpected_subset_keys(expected_keys, expected_keys, actual_keys,
-                                    request, source, name)
-
-
 def has_missing_keys(minimum_keys, actual_keys, name):
   """Returns an error if expected keys are not present.
 
@@ -108,6 +104,38 @@ def has_missing_keys(minimum_keys, actual_keys, name):
   if missing:
     msg_missing = (' missing: %s' % sorted(missing)) if missing else ''
     return 'Unexpected %s%s; did you make a typo?' % (name, msg_missing)
+
+
+def is_valid_session_id(session_id):
+  if not isinstance(session_id, basestring):
+    return False
+  return bool(_SESSION_ID_RE.match(session_id))
+
+
+def refresh_session_token(request, session_token):
+  """Updates the expiration time in the token.
+
+  Unlike the refresh in /bot/poll, this one just bumps the expiration time and
+  doesn't touch or check any other fields. Unlike /bot/poll, it is expected to
+  be called by healthy enough bots.
+
+  Aborts the request if the token is invalid or expired.
+  """
+  if not session_token:
+    return None
+  try:
+    session = bot_session.unmarshal(session_token)
+  except bot_session.BadSessionToken as e:
+    logging.error('Malformed session token: %s', e)
+    request.abort_with_error(401, error='Bad session token')
+    return
+  logging.info('Session ID: %s', session.session_id)
+  if bot_session.is_expired_session(session):
+    logging.error('Expired bot session')
+    bot_session.debug_log(session)
+    request.abort_with_error(403, error='Expired session token')
+    return
+  return bot_session.marshal(bot_session.update(session))
 
 
 ## Generic handlers (no auth)
@@ -148,7 +176,7 @@ class _BotAuthenticatingHandler(auth.AuthenticatingHandler):
   _X_LUCI_SWARMING_BOT_ID = 'X-Luci-Swarming-Bot-ID'
 
   @classmethod
-  def get_auth_methods(cls, conf):
+  def get_auth_methods(cls, conf):  # pylint: disable=unused-argument
     return _BOT_AUTH_METHODS
 
   def check_bot_code_access(self, bot_id, generate_token):
@@ -207,52 +235,68 @@ class BotCodeHandler(_BotAuthenticatingHandler):
 
   @auth.public  # auth inside check_bot_code_access()
   def get(self, version=None):
-    server = self.request.host_url
-    expected = bot_code.get_bot_version(server)[0]
-    if not version:
+    info = bot_code.config_bundle_rev_key().get()
+
+    # Bootstrap the bot archive for the local smoke test.
+    if not info and utils.is_local_dev_server():
+      info = bot_code.bootstrap_for_dev_server(self.request.host_url)
+
+    # If didn't ask for a concrete version, or asked for a version we don't
+    # know, redirect to the latest stable version. Use a redirect, instead of
+    # serving it directly, to utilize the GAE response cache.
+    known = version and version in (info.stable_bot.digest,
+                                    info.canary_bot.digest)
+    if not version or not known:
+      if version:
+        logging.warning('Requesting unknown version %s', version)
       # Historically, the bot_id query argument was used for the bot to pass its
       # ID to the server. More recent bot code uses the X-Luci-Swarming-Bot-ID
       # HTTP header instead so it doesn't bust the GAE transparent public cache.
       # Support both mechanism until 2020-01-01.
       bot_id = self.request.get('bot_id') or self.request.headers.get(
-          self._X_LUCI_SWARMING_BOT_ID)
+          self._X_LUCI_SWARMING_BOT_ID) or _bot_id_from_auth_token()
       self.check_bot_code_access(bot_id=bot_id, generate_token=False)
-
-      # Let default access to redirect to url with version so that we can use
-      # cache for response safely.
-      redirect_url = str(server + '/swarming/api/v1/bot/bot_code/' + expected)
-      self.redirect(redirect_url)
+      self.redirect_to_version(info.stable_bot.digest)
       return
 
-    if version != expected:
-      # The client is requesting an unexpected hash. Redirects to /bot_code,
-      # which will ensure authentication, then will redirect to the currently
-      # expected version.
-      bot_id = self.request.get('bot_id') or self.request.headers.get(
-          self._X_LUCI_SWARMING_BOT_ID)
-      redirect_url = server + '/bot_code'
-      if bot_id:
-        redirect_url += '?bot_id=' + bot_id
-      self.redirect(str(redirect_url))
-      return
-
+    # If the request has a query string, redirect to an URI without it, since
+    # it is the one being cached by GAE.
     if self.request.query_string:
-      logging.info('ignoring query string: %s', self.request.query_string)
-
-      # If bot has query string, let the request redirect to url not having
-      # query string to share the content from cache.
-      redirect_url = str(server + '/swarming/api/v1/bot/bot_code/' + expected)
-      self.redirect(redirect_url)
+      logging.info('Ignoring query string: %s', self.request.query_string)
+      self.redirect_to_version(version)
       return
 
-    # We don't need to do authentication in this path, because bot already
-    # knows version of bot_code, and the content may be in edge cache.
-    self.response.headers['Cache-Control'] = 'public, max-age=3600'
+    # Serve the corresponding bot code, asking GAE to cache it for a while.
+    # TODO(b/362324087): Improve.
+    if version == info.stable_bot.digest:
+      self.serve_cached_blob(info.stable_bot.fetch_archive())
+    elif version == info.canary_bot.digest:
+      self.serve_cached_blob(info.canary_bot.fetch_archive())
+    else:
+      raise AssertionError('Impossible, already checked version is known')
 
+  def redirect_to_version(self, version):
+    self.redirect('%s/swarming/api/v1/bot/bot_code/%s' %
+                  (str(self.request.host_url), str(version)))
+
+  def serve_cached_blob(self, blob):
+    self.response.headers['Cache-Control'] = 'public, max-age=3600'
     self.response.headers['Content-Type'] = 'application/octet-stream'
     self.response.headers['Content-Disposition'] = (
         'attachment; filename="swarming_bot.zip"')
-    self.response.out.write(bot_code.get_swarming_bot_zip(server))
+    self.response.out.write(blob)
+
+
+def _bot_id_from_auth_token():
+  """Extracts bot ID from the authenticated credentials."""
+  ident = auth.get_peer_identity()
+  if ident.kind != 'bot':
+    return None
+  # This is either 'botid.domain' or 'botid@gce.project'.
+  val = ident.name
+  if '@' in val:
+    return val.split('@')[0]
+  return val.split('.')[0]
 
 
 ## Bot API RPCs
@@ -266,7 +310,7 @@ class _BotApiHandler(auth.ApiHandler):
   xsrf_token_enforce_on = ()
 
   @classmethod
-  def get_auth_methods(cls, conf):
+  def get_auth_methods(cls, conf):  # pylint: disable=unused-argument
     return _BOT_AUTH_METHODS
 
 
@@ -274,7 +318,7 @@ class _BotApiHandler(auth.ApiHandler):
 
 
 class _ProcessResult(object):
-  """Returned by _BotBaseHandler._process."""
+  """Returned by _BotBaseHandler.process."""
 
   # A dict with parsed JSON request body, as it was received.
   request = None
@@ -286,8 +330,16 @@ class _ProcessResult(object):
   state = None
   # Dict with bot dimensions (union of bot-reported and server-side ones).
   dimensions = None
+  # An RBE instance the bot should be using (if any).
+  rbe_instance = None
+  # If True, consume tasks from both Swarming and RBE schedulers.
+  rbe_hybrid_mode = None
   # Instance of BotGroupConfig with server-side bot config (from bots.cfg).
   bot_group_cfg = None
+  # Instance of BotAuth with auth method details used to authenticate the bot.
+  bot_auth_cfg = None
+  # BotDetails to pass to the scheduler.
+  bot_details = None
   # Bot quarantine message (or None if the bot is not in a quarantine).
   quarantined_msg = None
   # Bot maintenance message (or None if the bot is not under maintenance).
@@ -302,6 +354,16 @@ class _ProcessResult(object):
   @property
   def os(self):
     return (self.dimensions or {}).get('os') or []
+
+  def rbe_params(self, sleep_streak):
+    """Generates a dict with RBE-related parameters for bots in RBE mode."""
+    assert self.rbe_instance
+    return {
+        'instance': self.rbe_instance,
+        'hybrid_mode': self.rbe_hybrid_mode,
+        'sleep': task_scheduler.exponential_backoff(sleep_streak),
+        'poll_token': 'legacy-unused-field',
+    }
 
 
 def _validate_dimensions(dimensions):
@@ -344,13 +406,44 @@ class _BotBaseHandler(_BotApiHandler):
       "state": <dict of properties>,
       "version": <sha-1 of swarming_bot.zip uncompressed content>,
     }
+
+  Well-known state keys:
+    * running_time: how long the bot process is running in seconds.
+    * sleep_streak: number of consecutive idle cycles. Native scheduler only.
+    * maintenance: a bot maintenance message. If set, the bot won't get tasks.
+    * quarantined: a boolean, if True the bot won't get tasks.
+    * rbe_instance: the RBE instance the bot is connected to right now.
+    * rbe_session: the RBE session ID, if have an active RBE session.
+    * rbe_idle: True if the last RBE poll returned no tasks, None if not on RBE.
   """
 
   EXPECTED_KEYS = {u'dimensions', u'state', u'version'}
-  OPTIONAL_KEYS = {u'request_uuid'}
+  OPTIONAL_KEYS = {u'session'}
   REQUIRED_STATE_KEYS = {u'running_time', u'sleep_streak'}
 
-  def _process(self):
+  # Endpoint name to use in timeout tsmon metrics.
+  TSMON_ENDPOINT_ID = 'bot/unknown'
+
+  # All exception classes that can indicate a datastore or overall timeout.
+  TIMEOUT_EXCEPTIONS = (
+      apiproxy_errors.CancelledError,
+      apiproxy_errors.DeadlineExceededError,
+      datastore_errors.InternalError,
+      datastore_errors.Timeout,
+      datastore_utils.CommitError,  # one reason is timeout
+      runtime.DeadlineExceededError,
+      task_to_run.ScanDeadlineError,
+  )
+
+  def abort_by_timeout(self, stage, exc):
+    if isinstance(exc, task_to_run.ScanDeadlineError):
+      stage += ':%s' % exc.code
+    clazz = exc.__class__.__name__
+    ts_mon_metrics.on_handler_timeout(self.TSMON_ENDPOINT_ID, stage, clazz)
+    logging.exception('abort_by_timeout: %s %s', stage, clazz)
+    self.abort(429, 'Timeout in %s (%s)' % (stage, clazz))
+
+  def process(self):
     """Fetches bot info and settings, does authorization and quarantine checks.
 
     Returns:
@@ -377,8 +470,8 @@ class _BotBaseHandler(_BotApiHandler):
 
     # Make sure bot self-reported ID matches the authentication token. Raises
     # auth.AuthorizationError if not.
-    bot_group_cfg = bot_auth.validate_bot_id_and_fetch_config(bot_id)
-    logging.debug('Feched bot_group_cfg for %s: %s', bot_id, bot_group_cfg)
+    bot_group_cfg, bot_auth_cfg = bot_auth.authenticate_bot(bot_id)
+    logging.debug('Fetched bot_group_cfg for %s: %s', bot_id, bot_group_cfg)
 
     # The server side dimensions from bot_group_cfg override bot-provided ones.
     # If both server side config and bot report some dimension, server side
@@ -398,6 +491,13 @@ class _BotBaseHandler(_BotApiHandler):
             dim_key, from_bot, from_cfg)
       dimensions[dim_key] = from_cfg
 
+    # Check the config to see if this bot is in the RBE mode.
+    rbe_cfg = rbe.get_rbe_config_for_bot(bot_id, dimensions.get('pool'))
+
+    # These are passed to the scheduler as is to be stored with the task.
+    bot_details = task_scheduler.BotDetails(version,
+                                            bot_group_cfg.logs_cloud_project)
+
     # Fill in all result fields except 'quarantined_msg'.
     result = _ProcessResult(
         request=request,
@@ -405,7 +505,11 @@ class _BotBaseHandler(_BotApiHandler):
         version=version,
         state=state,
         dimensions=dimensions,
+        rbe_instance=rbe_cfg.instance if rbe_cfg else None,
+        rbe_hybrid_mode=rbe_cfg.hybrid_mode if rbe_cfg else False,
         bot_group_cfg=bot_group_cfg,
+        bot_auth_cfg=bot_auth_cfg,
+        bot_details=bot_details,
         maintenance_msg=state.get('maintenance'))
 
     # The bot may decide to "self-quarantine" itself. Accept both via
@@ -450,6 +554,120 @@ class _BotBaseHandler(_BotApiHandler):
 
     return result
 
+  def prepare_manifest(self, request, secret_bytes, run_result,
+                       bot_request_info):
+    """Returns a manifest with all information about a task needed to run it.
+
+    Arguments:
+      request: TaskRequest representing the task.
+      secret_bytes: SecretBytes with task secrets.
+      run_result: TaskRunResult identifying the slice to run.
+      bot_request_info: _ProcessResult as returned by process().
+
+    Returns:
+      A task manifest dict ready to be placed in a some JSON response.
+    """
+    props = request.task_slice(run_result.current_task_slice).properties
+    caches = [c.to_dict() for c in props.caches]
+    pool = props.dimensions['pool'][0]
+    names = [c.name for c in props.caches]
+
+    # Warning: this is doing a DB GET on the cold path, which will increase the
+    # reap failure.
+    #
+    # TODO(vadimsh): Do this before recording bot_event.
+    hints = named_caches.get_hints(pool, bot_request_info.os, names)
+    for i, hint in enumerate(hints):
+      caches[i]['hint'] = str(hint)
+
+    logging.debug('named cache: %s', caches)
+
+    resultdb_context = None
+    if request.resultdb_update_token:
+      resultdb_context = {
+          'hostname':
+          urlparse.urlparse(config.settings().resultdb.server).hostname,
+          'current_invocation': {
+              'name':
+              resultdb.get_invocation_name(
+                  task_pack.pack_run_result_key(run_result.run_result_key)),
+              'update_token':
+              request.resultdb_update_token,
+          }
+      }
+    realm_context = {}
+    if request.realm:
+      realm_context['name'] = request.realm
+
+    out = {
+        'bot_id':
+        bot_request_info.bot_id,
+        'bot_authenticated_as':
+        auth.get_peer_identity().to_bytes(),
+        'caches':
+        caches,
+        'cipd_input': {
+            'client_package': props.cipd_input.client_package.to_dict(),
+            'packages': [p.to_dict() for p in props.cipd_input.packages],
+            'server': props.cipd_input.server,
+        } if props.cipd_input else None,
+        'command':
+        props.command,
+        'containment': {
+            'containment_type': props.containment.containment_type,
+        } if props.containment else {},
+        'dimensions':
+        props.dimensions,
+        'env':
+        props.env,
+        'env_prefixes':
+        props.env_prefixes,
+        'grace_period':
+        props.grace_period_secs,
+        'hard_timeout':
+        props.execution_timeout_secs,
+        # TODO(b/355013257): Stop sending this in Go version.
+        'host':
+        utils.get_versioned_hosturl(),
+        'io_timeout':
+        props.io_timeout_secs,
+        'secret_bytes':
+        (secret_bytes.secret_bytes.encode('base64') if secret_bytes else None),
+        'cas_input_root': {
+            'cas_instance': props.cas_input_root.cas_instance,
+            'digest': {
+                'hash': props.cas_input_root.digest.hash,
+                'size_bytes': props.cas_input_root.digest.size_bytes,
+            },
+        } if props.cas_input_root else None,
+        'outputs':
+        props.outputs,
+        'realm':
+        realm_context,
+        'relative_cwd':
+        props.relative_cwd,
+        'resultdb':
+        resultdb_context,
+        'service_accounts': {
+            'system': {
+                # 'none', 'bot' or email. Bot interprets 'none' and 'bot'
+                # locally. When it sees something else, it uses /oauth_token
+                # API endpoint to grab tokens through server.
+                'service_account':
+                bot_request_info.bot_group_cfg.system_service_account or 'none',
+            },
+            'task': {
+                # Same here.
+                'service_account': request.service_account,
+            },
+        },
+        'task_id':
+        task_pack.pack_run_result_key(run_result.key),
+        'bot_dimensions':
+        bot_request_info.dimensions,
+    }
+    return utils.to_json_encodable(out)
+
 
 class BotHandshakeHandler(_BotBaseHandler):
   """First request to be called to get initial data like bot code version.
@@ -466,16 +684,32 @@ class BotHandshakeHandler(_BotBaseHandler):
     {
       "bot_version": <sha-1 of swarming_bot.zip uncompressed content>,
       "server_version": "138-193f1f3",
-      "bot_group_cfg_version": "0123abcdef",
       "bot_group_cfg": {
         "dimensions": { <server-defined dimensions> },
+      },
+      "rbe": {
+        ...
       }
     }
   """
 
-  @auth.public  # auth happens in self._process()
+  OPTIONAL_KEYS = {u'session_id'}
+
+  @auth.public  # auth happens in self.process()
   def post(self):
-    res = self._process()
+    res = self.process()
+
+    # Bot session is optional for now until it is fully rolled out.
+    session_id = res.request.get('session_id')
+    if session_id is not None:
+      if not is_valid_session_id(session_id):
+        self.abort_with_error(400, error='Bad session ID')
+        return
+
+    # This boolean marks the state as "not fully initialized yet", since it
+    # lacks entries reported by custom bot hooks (the bot doesn't have them
+    # yet, they are returned below).
+    res.state['handshaking'] = True
 
     # The dimensions provided by Bot won't be applied to BotInfo since they
     # provide them without injected bot_config. The bot will report valid
@@ -483,6 +717,7 @@ class BotHandshakeHandler(_BotBaseHandler):
     bot_management.bot_event(
         event_type='bot_connected',
         bot_id=res.bot_id,
+        session_id=session_id,
         external_ip=self.request.remote_addr,
         authenticated_as=auth.get_peer_identity().to_bytes(),
         dimensions=res.dimensions,
@@ -490,18 +725,17 @@ class BotHandshakeHandler(_BotBaseHandler):
         version=res.version,
         quarantined=bool(res.quarantined_msg),
         maintenance_msg=res.maintenance_msg,
-        task_id=None,
-        task_name=None,
-        message=res.quarantined_msg,
-        register_dimensions=False)
+        event_msg=res.quarantined_msg)
 
-    bot_ver, _, bot_config_rev = bot_code.get_bot_version(self.request.host_url)
+    channel = bot_code.get_bot_channel(res.bot_id, config.settings())
+    logging.debug('Bot channel: %s', channel)
+    bot_ver, bot_config_rev = bot_code.get_bot_version(channel)
+
     data = {
         'bot_version': bot_ver,
         'bot_config_rev': bot_config_rev,
         'bot_config_name': 'bot_config.py',
         'server_version': utils.get_app_version(),
-        'bot_group_cfg_version': res.bot_group_cfg.version,
         'bot_group_cfg': {
             # Let the bot know its server-side dimensions (from bots.cfg file).
             'dimensions': res.bot_group_cfg.dimensions,
@@ -515,6 +749,19 @@ class BotHandshakeHandler(_BotBaseHandler):
       data['bot_config'] = res.bot_group_cfg.bot_config_script_content
       data['bot_config_rev'] = res.bot_group_cfg.bot_config_script_rev
       data['bot_config_name'] = res.bot_group_cfg.bot_config_script
+    if res.rbe_instance:
+      data['rbe'] = res.rbe_params(0)
+
+    if session_id:
+      logging.info('Session ID: %s', session_id)
+      data['session'] = bot_session.marshal(
+          bot_session.create(
+              bot_id=res.bot_id,
+              session_id=session_id,
+              bot_group_cfg=res.bot_group_cfg,
+              rbe_instance=res.rbe_instance,
+          ))
+
     self.send_response(data)
 
 
@@ -527,8 +774,10 @@ class BotPollHandler(_BotBaseHandler):
   just enough to be able to self-update again even if they don't get task
   assigned anymore.
   """
+  TSMON_ENDPOINT_ID = 'bot/poll'
+  OPTIONAL_KEYS = {u'session', u'request_uuid', u'force'}
 
-  @auth.public  # auth happens in self._process()
+  @auth.public  # auth happens in self.process()
   def post(self):
     """Handles a polling request.
 
@@ -538,16 +787,17 @@ class BotPollHandler(_BotBaseHandler):
 
     It makes recovery of the fleet in case of catastrophic failure much easier.
     """
-    now = utils.milliseconds_since_epoch()
     logging.debug('Request started')
-    if config.settings().force_bots_to_sleep_and_not_run_task:
+    settings = config.settings()
+    if settings.force_bots_to_sleep_and_not_run_task:
       # Ignore everything, just sleep. Tell the bot it is quarantined to inform
       # it that it won't be running anything anyway. Use a large streak so it
       # will sleep for 60s.
-      self._cmd_sleep(1000, True)
+      self._cmd_sleep(None, 1000, True)
       return
 
-    res = self._process()
+    deadline = utils.utcnow() + datetime.timedelta(seconds=60)
+    res = self.process()
 
     sleep_streak = res.state.get('sleep_streak', 0)
     quarantined = bool(res.quarantined_msg)
@@ -567,51 +817,79 @@ class BotPollHandler(_BotBaseHandler):
             version=res.version,
             quarantined=quarantined,
             maintenance_msg=res.maintenance_msg,
+            event_msg=res.quarantined_msg,
             task_id=task_id,
             task_name=task_name,
-            message=res.quarantined_msg,
             register_dimensions=True)
-      except runtime.DeadlineExceededError as e:
-        # Ignore runtime.DeadlineExceededError at the following events
-        # and return 429 for the bot to retry later
-        # if the event_type is 'request_task' or 'bot_terminate', the exception
-        # will be handled at the end of BotPollHandler.post
-        if event_type in ('request_sleep', 'request_update', 'request_restart'):
-          logging.debug('Ignoring deadline exceeded error. %s', e)
-          self.abort(429, 'Deadline exceeded')
-          return
-        raise
+      except self.TIMEOUT_EXCEPTIONS as e:
+        self.abort_by_timeout('bot_event:%s' % event_type, e)
       except datastore_errors.BadValueError as e:
         logging.warning('Invalid BotInfo or BotEvent values', exc_info=True)
-        return self.abort_with_error(400, error=e.message)
+        self.abort_with_error(400, error=str(e))
 
-    # Bot version is host-specific because the host URL is embedded in
-    # swarming_bot.zip
-    logging.debug('Fetching bot code version')
-    # TODO(crbug.com/1087981): compare the expected bot config revision and
-    # the current bot config revision.
-    expected_version, _, _expected_bot_config_rev = bot_code.get_bot_version(
-        self.request.host_url)
+    # Ask the bot to update itself if it runs unexpected version.
+    channel = bot_code.get_bot_channel(res.bot_id, settings)
+    logging.debug('Bot channel: %s', channel)
+    expected_version, _ = bot_code.get_bot_version(channel)
     if res.version != expected_version:
       bot_event('request_update')
       self._cmd_update(expected_version)
       return
 
-    # If the server-side per-bot config for the bot has changed, we need
-    # to restart this particular bot, so it picks up new config in /handshake.
-    # Do this check only for bots that know about server-side per-bot configs
-    # already (such bots send 'bot_group_cfg_version' state attribute).
-    cur_bot_cfg_ver = res.state.get('bot_group_cfg_version')
-    logging.debug('bot_config version: %s, latest: %s', cur_bot_cfg_ver,
-                  res.bot_group_cfg.version)
-    if cur_bot_cfg_ver and cur_bot_cfg_ver != res.bot_group_cfg.version:
+    # If we reached this stage, it means the bot is running a relatively recent
+    # version of the code and it therefore must be sending a session token.
+    # Verify the session token is indeed present.
+    session_token = res.request.get('session')
+    if not session_token:
+      logging.error('Missing session token')
+      self.abort_with_error(401, error='Missing session token')
+      return
+
+    # Validate the session token
+    try:
+      session = bot_session.unmarshal(session_token)
+    except bot_session.BadSessionToken as e:
+      # This happens if the token is complete nonsense (or was signed by
+      # a revoked or unknown key). This should not be happening.
+      logging.error('Malformed session token: %s', e)
+      self.abort_with_error(401, error='Bad session token')
+      return
+    if res.bot_id != session.bot_id:
+      logging.error('Bot ID mismatch %s != %s', res.bot_id, session.bot_id)
+      bot_session.debug_log(session)
+      self.abort_with_error(403,
+                            error='Unexpected bot ID in the session %s' %
+                            session.bot_id)
+      return
+    logging.info('Session ID: %s', session.session_id)
+
+    # If the session has expired, ask the bot to restart itself to get a new
+    # session. This can happen if the bot was stuck somewhere for a while
+    # (or had no network connection). We need this because very likely the
+    # state in the session (like the RBE session ID) is stale already.
+    if bot_session.is_expired_session(session):
+      logging.error('Expired bot session: asking the bot to restart')
+      bot_session.debug_log(session)
       bot_event('request_restart')
-      self._cmd_bot_restart('Restarting to pick up new bots.cfg config')
+      self._cmd_bot_restart(None, 'Restarting because the bot session expired')
+      return
+
+    # The session is valid. Refresh the config inside.
+    session_token = bot_session.marshal(
+        bot_session.update(session, res.bot_group_cfg, res.rbe_instance))
+
+    # Ask the bot to restart to pick up new configs consumed only during the
+    # handshake (like the bot hooks or custom server-assigned dimensions), if
+    # they have changed since the bot created the session.
+    if bot_session.is_stale_handshake_config(session, res.bot_group_cfg):
+      bot_event('request_restart')
+      self._cmd_bot_restart(session_token,
+                            'Restarting to pick up new bots.cfg config')
       return
 
     if quarantined:
       bot_event('request_sleep')
-      self._cmd_sleep(sleep_streak, quarantined)
+      self._cmd_sleep(session_token, sleep_streak, quarantined)
       return
 
     #
@@ -630,10 +908,11 @@ class BotPollHandler(_BotBaseHandler):
     if res.state.get('maintenance'):
       bot_event('request_sleep')
       # Tell the bot it's considered quarantined.
-      self._cmd_sleep(sleep_streak, True)
+      self._cmd_sleep(session_token, sleep_streak, True)
       return
 
-    bot_info = bot_management.get_info_key(res.bot_id).get()
+    bot_info = bot_management.get_info_key(res.bot_id).get(use_cache=False,
+                                                           use_memcache=False)
     # TODO(crbug.com/1077188):
     #   avoid assigning to bots with another task assigned.
     if bot_info and bot_info.task_id:
@@ -642,197 +921,135 @@ class BotPollHandler(_BotBaseHandler):
 
     # The bot is in good shape.
 
-    try:
-      # Prepare BotTaskDimensions
-      bot_root_key = bot_management.get_root_key(res.bot_id)
-      task_queues.assert_bot_async(bot_root_key, res.dimensions).get_result()
-    except runtime.DeadlineExceededError as e:
-      # TODO(crbug.com/1027431): assert_bot_async().get_result()
-      # takes longer than 60 sec which ends up with "DeadlineExceededError".
-      # Returning 429 for the bot to retry.
-      # Approaches to avoid ignoring the errors would be to
-      # - Move the assert_bot task to background rather than waiting at polling.
-      # - Execute assert_bot_async here (before bot_reap_task), and get_result()
-      # after reaping task.
-      # See discussion:
-      # https://crrev.com/c/1948022/2#message-15c7ac534cdc49794fcb66cd209e5d2272ea22a5
-      logging.warning(
-          'crbug.com/1027431: '
-          'Ignoring Deadline exceeded error: %s', e)
-      self.abort(429, 'Deadline exceeded while asserting bot')
-    except datastore_errors.InternalError as e:
-      self.abort(429, 'Datastore internal error. %s' % e)
+    # True if a hybrid RBE bot wants to poll from Swarming scheduler.
+    force_poll = res.request.get('force')
+    if res.rbe_instance and res.rbe_hybrid_mode and force_poll:
+      logging.info('Force-polling Swarming from an RBE bot')
+
+    # We need to make two separate decisions based on RBE migration status
+    # of the bot: whether the bot should be registered in the Swarming
+    # scheduler, and whether it should *use* the Swarming scheduler.
+    #
+    # The answers are different for hybrid bots: we want to always register them
+    # in the scheduler, but we *use* the scheduler only when `force` is True.
+    if not res.rbe_instance:
+      # Native Swarming bot. Need to use the Swarming scheduler.
+      scheduler_reg = True
+      scheduler_use = True
+    elif not res.rbe_hybrid_mode:
+      # Pure RBE-mode bot. Don't use the Swarming scheduler.
+      scheduler_reg = False
+      scheduler_use = False
+    else:
+      # Hybrid RBE-mode bot. Decide based on `force` request field.
+      scheduler_reg = True
+      scheduler_use = force_poll
+
+    # Register in the Swarming scheduler, get queues to poll.
+    queues = None
+    if scheduler_reg:
+      try:
+        queues = task_queues.assert_bot(res.dimensions)
+      except self.TIMEOUT_EXCEPTIONS as e:
+        self.abort_by_timeout('assert_bot', e)
+
+    # Grab the task from the Swarming scheduler if actually using it.
+    request = None
+    if scheduler_use:
+      # Try to grab a task. Leave ~10s for bot_event(...) transaction below.
+      reap_deadline = deadline - datetime.timedelta(seconds=10)
+      request_uuid = res.request.get('request_uuid')
+      try:
+        (request, secret_bytes,
+         run_result), is_deduped = api_helpers.cache_request(
+             'bot_poll', request_uuid, lambda: task_scheduler.bot_reap_task(
+                 res.dimensions, queues, res.bot_details, reap_deadline))
+        if is_deduped:
+          logging.info('Reusing request cache with uuid %s', request_uuid)
+      except self.TIMEOUT_EXCEPTIONS as e:
+        self.abort_by_timeout('bot_reap_task', e)
+
+    if not request:
+      # No tasks found in the Swarming scheduler or not using it at all.
+      if not res.rbe_instance:
+        # If this is a native Swarming bot, tell it to sleep a bit.
+        bot_event('request_sleep')
+        self._cmd_sleep(session_token, sleep_streak, False)
+      else:
+        # If this is an RBE Swarming bot, tell it to switch to RBE or keep using
+        # RBE if it already does. It is important we record an appropriate bot
+        # event here. They are necessary to keep the bot alive in Swarming
+        # datastore and to keep track of bot idleness status.
+        if res.state.get('rbe_idle') is False:
+          bot_event('bot_polling')  # the bot got a task from RBE recently
+        else:
+          bot_event('bot_idle')  # the bot is not seeing any RBE tasks
+        self._cmd_rbe(session_token, sleep_streak, res)
       return
 
-    def _reap_task():
-      try:
-        # This is a fairly complex function call, exceptions are expected.
-        request, secret_bytes, run_result = task_scheduler.bot_reap_task(
-            res.dimensions, res.version, start_time=now)
-      except (datastore_errors.Timeout, apiproxy_errors.CancelledError):
-        self.abort(429, 'Deadline exceeded while accessing datastore')
-      return request, secret_bytes, run_result
+    # This part is tricky since it intentionally runs a transaction after
+    # another one.
+    if request.task_slice(
+        run_result.current_task_slice).properties.is_terminate:
+      if res.rbe_instance:
+        logging.warning('RBE: termination through Swarming scheduler')
+      bot_event('bot_terminate', task_id=run_result.task_id)
+      self._cmd_terminate(session_token, run_result.task_id)
+    else:
+      if res.rbe_instance:
+        logging.warning('RBE: task through Swarming scheduler')
+      bot_event('request_task',
+                task_id=run_result.task_id,
+                task_name=request.name)
+      self._cmd_run(session_token, request, secret_bytes, run_result, res)
 
-    # Try to grab a task.
-    try:
-      request_uuid = res.request.get('request_uuid')
-      (request, secret_bytes,
-       run_result), is_deduped = api_helpers.cache_request(
-           'bot_poll', request_uuid, _reap_task)
-      if is_deduped:
-        logging.info('Reusing cache with uuid %s', request_uuid)
-
-      if not request:
-        # No task found, tell it to sleep a bit.
-        bot_event('request_sleep')
-        self._cmd_sleep(sleep_streak, quarantined)
-        return
-
-      try:
-        # This part is tricky since it intentionally runs a transaction after
-        # another one.
-        if request.task_slice(
-            run_result.current_task_slice).properties.is_terminate:
-          bot_event('bot_terminate', task_id=run_result.task_id)
-          self._cmd_terminate(run_result.task_id)
-        else:
-          bot_event(
-              'request_task',
-              task_id=run_result.task_id,
-              task_name=request.name)
-          self._cmd_run(request, secret_bytes, run_result, res.bot_id, res.os,
-                        res.bot_group_cfg)
-      except:
-        logging.exception('Dang, exception after reaping')
-        raise
-    except runtime.DeadlineExceededError:
-      # If the timeout happened before a task was assigned there is no problems.
-      # If the timeout occurred after a task was assigned, that task will
-      # timeout (BOT_DIED) since the bot didn't get the details required to
-      # run it) and it will automatically get retried (TODO) when the task times
-      # out.
-      # TODO(maruel): Note the task if possible and hand it out on next poll.
-      # https://code.google.com/p/swarming/issues/detail?id=130
-      self.abort(500, 'Deadline')
-
-  def _cmd_run(self, request, secret_bytes, run_result, bot_id, oses,
-               bot_group_cfg):
+  def _cmd_run(self, session, request, secret_bytes, run_result,
+               bot_request_info):
     logging.info('Run: %s', request.task_id)
-    props = request.task_slice(run_result.current_task_slice).properties
-
-    caches = [c.to_dict() for c in props.caches]
-    names = [c.name for c in props.caches]
-    pool = props.dimensions['pool'][0]
-    # Warning: this is doing a DB GET on the cold path, which will increase the
-    # reap failure.
-    for i, hint in enumerate(named_caches.get_hints(pool, oses, names)):
-      caches[i]['hint'] = str(hint)
-
-    logging.debug('named cache: %s', caches)
-
-    resultdb_context = None
-    if request.resultdb_update_token:
-      resultdb_context = {
-          'hostname':
-              urlparse.urlparse(config.settings().resultdb.server).hostname,
-          'current_invocation': {
-              'name':
-                  resultdb.get_invocation_name(
-                      task_pack.pack_run_result_key(run_result.run_result_key)),
-              'update_token':
-                  request.resultdb_update_token,
-          }
-      }
-    realm_context = {}
-    if request.realm:
-      realm_context['name'] = request.realm
-
+    manifest = self.prepare_manifest(request, secret_bytes, run_result,
+                                     bot_request_info)
     out = {
         'cmd': 'run',
-        'manifest': {
-            'bot_id':
-            bot_id,
-            'bot_authenticated_as':
-            auth.get_peer_identity().to_bytes(),
-            'caches':
-            caches,
-            'cipd_input': {
-                'client_package': props.cipd_input.client_package.to_dict(),
-                'packages': [p.to_dict() for p in props.cipd_input.packages],
-                'server': props.cipd_input.server,
-            } if props.cipd_input else None,
-            'command':
-            props.command,
-            'containment': {
-                'containment_type': props.containment.containment_type,
-            } if props.containment else {},
-            'dimensions':
-            props.dimensions,
-            'env':
-            props.env,
-            'env_prefixes':
-            props.env_prefixes,
-            'grace_period':
-            props.grace_period_secs,
-            'hard_timeout':
-            props.execution_timeout_secs,
-            'host':
-            utils.get_versioned_hosturl(),
-            'io_timeout':
-            props.io_timeout_secs,
-            'secret_bytes': (secret_bytes.secret_bytes.encode('base64')
-                             if secret_bytes else None),
-            'cas_input_root': {
-                'cas_instance': props.cas_input_root.cas_instance,
-                'digest': {
-                    'hash': props.cas_input_root.digest.hash,
-                    'size_bytes': props.cas_input_root.digest.size_bytes,
-                },
-            } if props.cas_input_root else None,
-            'outputs':
-            props.outputs,
-            'realm':
-            realm_context,
-            'relative_cwd':
-            props.relative_cwd,
-            'resultdb':
-            resultdb_context,
-            'service_accounts': {
-                'system': {
-                    # 'none', 'bot' or email. Bot interprets 'none' and 'bot'
-                    # locally. When it sees something else, it uses /oauth_token
-                    # API endpoint to grab tokens through server.
-                    'service_account':
-                    bot_group_cfg.system_service_account or 'none',
-                },
-                'task': {
-                    # Same here.
-                    'service_account': request.service_account,
-                },
-            },
-            'task_id':
-            task_pack.pack_run_result_key(run_result.key),
-        },
+        'manifest': manifest,
     }
-    self.send_response(utils.to_json_encodable(out))
+    if bot_request_info.rbe_instance:
+      out['rbe'] = bot_request_info.rbe_params(0)
+    if session:
+      out['session'] = session
+    self.send_response(out)
 
-  def _cmd_sleep(self, sleep_streak, quarantined):
+  def _cmd_sleep(self, session, sleep_streak, quarantined):
     duration = task_scheduler.exponential_backoff(sleep_streak)
     logging.debug('Sleep: streak: %d; duration: %ds; quarantined: %s',
                   sleep_streak, duration, quarantined)
     out = {
         'cmd': 'sleep',
         'duration': duration,
-        'quarantined': quarantined,
+        'quarantined': quarantined,  # TODO(vadimsh): Appears to be ignored.
     }
+    if session:
+      out['session'] = session
     self.send_response(out)
 
-  def _cmd_terminate(self, task_id):
+  def _cmd_rbe(self, session, sleep_streak, bot_request_info):
+    logging.info('RBE mode: %s%s', bot_request_info.rbe_instance,
+                 ' (hybrid)' if bot_request_info.rbe_hybrid_mode else '')
+    out = {
+        'cmd': 'rbe',
+        'rbe': bot_request_info.rbe_params(sleep_streak),
+    }
+    if session:
+      out['session'] = session
+    self.send_response(out)
+
+  def _cmd_terminate(self, session, task_id):
     logging.info('Terminate: %s', task_id)
     out = {
         'cmd': 'terminate',
         'task_id': task_id,
     }
+    if session:
+      out['session'] = session
     self.send_response(out)
 
   def _cmd_update(self, expected_version):
@@ -843,12 +1060,128 @@ class BotPollHandler(_BotBaseHandler):
     }
     self.send_response(out)
 
-  def _cmd_bot_restart(self, message):
+  def _cmd_bot_restart(self, session, message):
     logging.info('Restarting bot: %s', message)
     out = {
         'cmd': 'bot_restart',
         'message': message,
     }
+    if session:
+      out['session'] = session
+    self.send_response(out)
+
+
+class BotClaimHandler(_BotBaseHandler):
+  """Called by a bot that wants to claim a pending TaskToRun for itself.
+
+  This transactionally assigns the task to this bot or returns a rejection error
+  if the TaskToRun is no longer pending.
+
+  Used by bots in RBE mode after they get the lease from RBE.
+  """
+  TSMON_ENDPOINT_ID = 'bot/claim'
+  EXPECTED_KEYS = _BotBaseHandler.EXPECTED_KEYS | {
+      u'claim_id',  # an opaque string used to make the request idempotent
+      u'task_id',  # TaskResultSummary packed ID
+      u'task_to_run_shard',  # shard index identifying TaskToRunShardXXX class
+      u'task_to_run_id',  # TaskToRunShardXXX integer entity ID
+  }
+
+  @auth.public  # auth happens in self.process()
+  def post(self):
+    res = self.process()
+
+    # If the bot is using a session, validate and refresh the session token.
+    session_token = refresh_session_token(self, res.request.get('session'))
+
+    logging.info('Claiming task %s (shard %s, id %s)', res.request['task_id'],
+                 res.request['task_to_run_shard'],
+                 res.request['task_to_run_id'])
+
+    # Get TaskToRunShardXXX entity key that identifies the slice to claim.
+    try:
+      to_run_key = task_to_run.task_to_run_key_from_parts(
+          task_pack.get_request_and_result_keys(res.request['task_id'])[0],
+          res.request['task_to_run_shard'], res.request['task_to_run_id'])
+    except ValueError as e:
+      self.abort_with_error(400, error=str(e))
+
+    # Try to transactionally claim the slice.
+    try:
+      request, secret_bytes, run_result = task_scheduler.bot_claim_slice(
+          bot_dimensions=res.dimensions,
+          bot_details=res.bot_details,
+          to_run_key=to_run_key,
+          claim_id='%s:%s' % (res.bot_id, res.request['claim_id']))
+    except self.TIMEOUT_EXCEPTIONS as e:
+      self.abort_by_timeout('bot_claim_slice', e)
+    except task_scheduler.ClaimError as e:
+      # The slice was already claimed by someone else (or it has expired).
+      self._cmd_skip(session_token, str(e))
+      return
+
+    # Update the state of the bot in the DB. It is now presumably works on
+    # the claimed slice.
+    #
+    # TODO(vadimsh): Record bot_event in the same transaction that claims the
+    # slice.
+    is_terminate = request.task_slice(
+        run_result.current_task_slice).properties.is_terminate
+    event_type = 'bot_terminate' if is_terminate else 'request_task'
+    try:
+      bot_management.bot_event(
+          event_type=event_type,
+          bot_id=res.bot_id,
+          external_ip=self.request.remote_addr,
+          authenticated_as=auth.get_peer_identity().to_bytes(),
+          dimensions=res.dimensions,
+          state=res.state,
+          version=res.version,
+          task_id=run_result.task_id,
+          task_name=None if is_terminate else request.name)
+    except self.TIMEOUT_EXCEPTIONS as e:
+      self.abort_by_timeout('bot_event:%s' % event_type, e)
+    except datastore_errors.BadValueError as e:
+      logging.warning('Invalid BotInfo or BotEvent values', exc_info=True)
+      self.abort_with_error(400, error=str(e))
+
+    # Return the payload to the bot.
+    if is_terminate:
+      self._cmd_terminate(session_token, run_result.task_id)
+    else:
+      self._cmd_run(session_token, request, secret_bytes, run_result, res)
+
+  def _cmd_skip(self, session, reason):
+    logging.info('Skip: %s', reason)
+    out = {
+        'cmd': 'skip',
+        'reason': reason,
+    }
+    if session:
+      out['session'] = session
+    self.send_response(out)
+
+  def _cmd_terminate(self, session, task_id):
+    logging.info('Terminate: %s', task_id)
+    out = {
+        'cmd': 'terminate',
+        'task_id': task_id,
+    }
+    if session:
+      out['session'] = session
+    self.send_response(out)
+
+  def _cmd_run(self, session, request, secret_bytes, run_result,
+               bot_request_info):
+    logging.info('Run: %s', request.task_id)
+    manifest = self.prepare_manifest(request, secret_bytes, run_result,
+                                     bot_request_info)
+    out = {
+        'cmd': 'run',
+        'manifest': manifest,
+    }
+    if session:
+      out['session'] = session
     self.send_response(out)
 
 
@@ -859,12 +1192,12 @@ class BotEventHandler(_BotBaseHandler):
 
   ALLOWED_EVENTS = ('bot_error', 'bot_log', 'bot_rebooting', 'bot_shutdown')
 
-  @auth.public  # auth happens in self._process()
+  @auth.public  # auth happens in self.process()
   def post(self):
-    res = self._process()
+    res = self.process()
     event = res.request.get('event')
     if event not in self.ALLOWED_EVENTS:
-      logging.error('Unexpected event type')
+      logging.error('Unexpected event type: %s', event)
       self.abort_with_error(400, error='Unsupported event type')
     message = res.request.get('message')
     # Record the event in a BotEvent entity so it can be listed on the bot's
@@ -881,13 +1214,10 @@ class BotEventHandler(_BotBaseHandler):
           version=res.version,
           quarantined=bool(res.quarantined_msg),
           maintenance_msg=res.maintenance_msg,
-          task_id=None,
-          task_name=None,
-          message=message,
-          register_dimensions=False)
+          event_msg=message)
     except datastore_errors.BadValueError as e:
       logging.warning('Invalid BotInfo or BotEvent values', exc_info=True)
-      return self.abort_with_error(400, error=e.message)
+      return self.abort_with_error(400, error=str(e))
 
     if event == 'bot_error':
       # Also logs this to ereporter2, so it will be listed in the server's
@@ -926,7 +1256,7 @@ class _BotTokenHandler(_BotApiHandler):
     """
     raise NotImplementedError()
 
-  @auth.public  # auth happens in bot_auth.validate_bot_id_and_fetch_config()
+  @auth.public  # auth happens in bot_auth.authenticate_bot()
   def post(self):
     request = self.parse_body()
     logging.debug('Request body: %s', request)
@@ -958,7 +1288,7 @@ class _BotTokenHandler(_BotApiHandler):
     # Make sure bot self-reported ID matches the authentication token. Raises
     # auth.AuthorizationError if not. Also fetches corresponding BotGroupConfig
     # that contains system service account email for this bot.
-    bot_group_cfg = bot_auth.validate_bot_id_and_fetch_config(bot_id)
+    bot_group_cfg, _ = bot_auth.authenticate_bot(bot_id)
 
     # At this point, the request is valid structurally, and the bot used proper
     # authentication when making it.
@@ -977,7 +1307,8 @@ class _BotTokenHandler(_BotApiHandler):
     # source of truth here, not whatever bot reports.
     if account_id == 'task':
       current_task_id = None
-      bot_info = bot_management.get_info_key(bot_id).get()
+      bot_info = bot_management.get_info_key(bot_id).get(use_cache=False,
+                                                         use_memcache=False)
       if bot_info:
         current_task_id = bot_info.task_id
       if task_id != current_task_id:
@@ -1003,11 +1334,11 @@ class _BotTokenHandler(_BotApiHandler):
       else:
         raise AssertionError('Impossible, there is a check above')
     except service_accounts.PermissionError as exc:
-      self.abort_with_error(403, error=exc.message)
+      self.abort_with_error(403, error=str(exc))
     except service_accounts.MisconfigurationError as exc:
-      self.abort_with_error(400, error=exc.message)
+      self.abort_with_error(400, error=str(exc))
     except service_accounts.InternalError as exc:
-      self.abort_with_error(500, error=exc.message)
+      self.abort_with_error(500, error=str(exc))
 
     # Note: the token info is already logged by service_accounts.get_*_token.
     if token:
@@ -1065,6 +1396,7 @@ class BotOAuthTokenHandler(_BotTokenHandler):
       u'id',  # bot ID
       u'scopes',  # list of requested OAuth scopes
       u'task_id',  # optional task ID, required if using 'task' account
+      u'session',  # the session token
   }
   REQUIRED_KEYS = {u'account_id', u'id', u'scopes'}
 
@@ -1102,6 +1434,7 @@ class BotIDTokenHandler(_BotTokenHandler):
       u'id',  # bot ID
       u'audience',  # the string audience to put into the token
       u'task_id',  # optional task ID, required if using 'task' account
+      u'session',  # the session token
   }
   REQUIRED_KEYS = {u'account_id', u'id', u'audience'}
 
@@ -1138,18 +1471,17 @@ class BotTaskUpdateHandler(_BotApiHandler):
       u'named_caches_stats',
       u'output',
       u'output_chunk_start',
+      u'session',
       u'task_id',
   }
   REQUIRED_KEYS = {u'id', u'task_id'}
 
   @decorators.silence(apiproxy_errors.RPCFailedError)
-  @auth.public  # auth happens in bot_auth.validate_bot_id_and_fetch_config()
+  @auth.public  # auth happens in bot_auth.authenticate_bot()
   def post(self, task_id=None):
     # Unlike handshake and poll, we do not accept invalid keys here. This code
     # path is much more strict.
 
-    # Take the time now - for measuring pubsub task change latency.
-    now = utils.milliseconds_since_epoch()
     request = self.parse_body()
     msg = log_unexpected_subset_keys(self.ACCEPTED_KEYS, self.REQUIRED_KEYS,
                                      request, self.request, 'bot', 'keys')
@@ -1162,7 +1494,10 @@ class BotTaskUpdateHandler(_BotApiHandler):
 
     # Make sure bot self-reported ID matches the authentication token. Raises
     # auth.AuthorizationError if not.
-    bot_auth.validate_bot_id_and_fetch_config(bot_id)
+    bot_auth.authenticate_bot(bot_id)
+
+    # If the bot is using a session, validate and refresh the session token.
+    session_token = refresh_session_token(self, request.get('session'))
 
     bot_overhead = request.get('bot_overhead')
     cipd_pins = request.get('cipd_pins')
@@ -1258,10 +1593,18 @@ class BotTaskUpdateHandler(_BotApiHandler):
               task_request.CipdPackage(**args) for args in cipd_pins['packages']
           ])
 
-    # Tell the task queues management engine that the bot is still alive, and
-    # it shall refresh the task queues.
-    bot_root_key = bot_management.get_root_key(bot_id)
-    task_queues.get_queues(bot_root_key)
+    # Notify the Swarming scheduler this bot is still alive. Don't do this for
+    # bots in pure RBE mode: they aren't using Swarming scheduler. Note that
+    # the bot doesn't send its pools with this RPC, so we either need to
+    # fetch them from the datastore or from configs. We use configs.
+    bot_group_cfg = bot_groups_config.get_bot_group_config(bot_id)
+    if bot_group_cfg:
+      pools = bot_group_cfg.dimensions.get('pool')
+      rbe_cfg = rbe.get_rbe_config_for_bot(bot_id, pools)
+      pure_rbe = rbe_cfg and not rbe_cfg.hybrid_mode
+      if not pure_rbe:
+        logging.debug('Keeping swarming queues alive')
+        task_queues.freshen_up_queues(bot_id)
 
     try:
       state = task_scheduler.bot_update_task(
@@ -1277,8 +1620,7 @@ class BotTaskUpdateHandler(_BotApiHandler):
           cas_output_root=cas_output_root,
           cipd_pins=cipd_pins,
           performance_stats=performance_stats,
-          canceled=canceled,
-          start_time=now)
+          canceled=canceled)
       if not state:
         logging.info('Failed to update, please retry')
         self.abort_with_error(500, error='Failed to update, please retry')
@@ -1296,14 +1638,7 @@ class BotTaskUpdateHandler(_BotApiHandler):
           bot_id=bot_id,
           external_ip=self.request.remote_addr,
           authenticated_as=auth.get_peer_identity().to_bytes(),
-          dimensions=None,
-          state=None,
-          version=None,
-          quarantined=None,
-          maintenance_msg=None,
-          task_id=task_id,
-          task_name=None,
-          register_dimensions=False)
+          task_id=task_id)
     except ValueError as e:
       ereporter2.log_request(
           request=self.request,
@@ -1328,7 +1663,10 @@ class BotTaskUpdateHandler(_BotApiHandler):
     must_stop = state in (task_result.State.BOT_DIED, task_result.State.KILLED)
     if must_stop:
       logging.info('asking bot to kill the task')
-    self.send_response({'must_stop': must_stop, 'ok': True})
+    out = {'must_stop': must_stop, 'ok': True}
+    if session_token:
+      out['session'] = session_token
+    self.send_response(out)
 
 
 class BotTaskErrorHandler(_BotApiHandler):
@@ -1339,35 +1677,36 @@ class BotTaskErrorHandler(_BotApiHandler):
   This can be used by bot_main.py to kill the task when task_runner misbehaved.
   """
 
-  EXPECTED_KEYS = {u'id', u'message', u'task_id'}
+  ACCEPTED_KEYS = {
+      u'id',
+      u'message',
+      u'task_id',
+      u'client_error',
+      u'session',
+  }
+  REQUIRED_KEYS = {u'id', u'task_id'}
 
-  @auth.public  # auth happens in bot_auth.validate_bot_id_and_fetch_config
+  @auth.public  # auth happens in bot_auth.authenticate_bot
   def post(self, task_id=None):
-    start_time = utils.milliseconds_since_epoch()
+    start_time = utils.utcnow()
     request = self.parse_body()
     # TODO(crbug.com/1015701): take from X-Luci-Swarming-Bot-ID header.
     bot_id = request.get('id')
     task_id = request.get('task_id', '')
     message = request.get('message', 'unknown')
+    client_errors = request.get('client_error')
 
     # Make sure bot self-reported ID matches the authentication token. Raises
     # auth.AuthorizationError if not.
-    bot_auth.validate_bot_id_and_fetch_config(bot_id)
+    bot_auth.authenticate_bot(bot_id)
 
     bot_management.bot_event(
         event_type='task_error',
         bot_id=bot_id,
         external_ip=self.request.remote_addr,
         authenticated_as=auth.get_peer_identity().to_bytes(),
-        dimensions=None,
-        state=None,
-        version=None,
-        quarantined=None,
-        maintenance_msg=None,
-        task_id=task_id,
-        task_name=None,
-        message=message,
-        register_dimensions=False)
+        event_msg=message,
+        task_id=task_id)
     line = ('Bot: https://%s/restricted/bot/%s\n'
             'Task failed: https://%s/user/task/%s\n'
             '%s') % (app_identity.get_default_version_hostname(), bot_id,
@@ -1375,13 +1714,13 @@ class BotTaskErrorHandler(_BotApiHandler):
                      message)
     ereporter2.log_request(self.request, source='bot', message=line)
 
-    msg = log_unexpected_keys(self.EXPECTED_KEYS, request, self.request, 'bot',
-                              'keys')
+    msg = log_unexpected_subset_keys(self.ACCEPTED_KEYS, self.REQUIRED_KEYS,
+                                     request, self.request, 'bot', 'keys')
     if msg:
       self.abort_with_error(400, error=msg)
-
     msg = task_scheduler.bot_terminate_task(
-        task_pack.unpack_run_result_key(task_id), bot_id, start_time)
+        task_pack.unpack_run_result_key(task_id), bot_id, start_time,
+        client_errors)
     if msg:
       logging.error(msg)
       self.abort_with_error(400, error=msg)
@@ -1389,37 +1728,45 @@ class BotTaskErrorHandler(_BotApiHandler):
 
 
 def get_routes():
-  routes = [
-      # Generic handlers (no auth)
-      ('/swarming/api/v1/bot/server_ping', ServerPingHandler),
+  routes = []
 
-      # Bot code (bootstrap and swarming_bot.zip) handlers
-      ('/bootstrap', BootstrapHandler),
-      ('/bot_code', BotCodeHandler),
-      # 40 for old sha1 digest so old bot can still update, 64 for current
-      # sha256 digest.
-      ('/swarming/api/v1/bot/bot_code/<version:[0-9a-f]{40,64}>', BotCodeHandler
-      ),
+  # Add a copy of the route under "/python/...". This is needed to allow setup
+  # traffic routing between Python and Go services. Requests that must be
+  # executed by Python will be prefixed by "/python/...".
+  def add(route, handler):
+    routes.extend([
+        (route, handler),
+        ('/python' + route, handler),
+    ])
 
-      # Bot API RPCs
+  # Generic handlers (no auth)
+  add('/swarming/api/v1/bot/server_ping', ServerPingHandler)
 
-      # Bot Session API RPC handlers
-      ('/swarming/api/v1/bot/handshake', BotHandshakeHandler),
-      ('/swarming/api/v1/bot/poll', BotPollHandler),
-      ('/swarming/api/v1/bot/event', BotEventHandler),
+  # Bot code (bootstrap and swarming_bot.zip) handlers
+  add('/bootstrap', BootstrapHandler)
+  add('/bot_code', BotCodeHandler)
+  # 40 for old sha1 digest so old bot can still update, 64 for current
+  # sha256 digest.
+  add('/swarming/api/v1/bot/bot_code/<version:[0-9a-f]{40,64}>', BotCodeHandler)
 
-      # Bot Security API RPC handlers
-      ('/swarming/api/v1/bot/oauth_token', BotOAuthTokenHandler),
-      ('/swarming/api/v1/bot/id_token', BotIDTokenHandler),
+  # Bot API RPCs
 
-      # Bot Task API RPC handlers
-      ('/swarming/api/v1/bot/task_update', BotTaskUpdateHandler),
-      ('/swarming/api/v1/bot/task_update/<task_id:[a-f0-9]+>',
-       BotTaskUpdateHandler),
-      ('/swarming/api/v1/bot/task_error', BotTaskErrorHandler),
-      ('/swarming/api/v1/bot/task_error/<task_id:[a-f0-9]+>',
-       BotTaskErrorHandler),
+  # Bot Session API RPC handlers
+  add('/swarming/api/v1/bot/handshake', BotHandshakeHandler)
+  add('/swarming/api/v1/bot/poll', BotPollHandler)
+  add('/swarming/api/v1/bot/claim', BotClaimHandler)
+  add('/swarming/api/v1/bot/event', BotEventHandler)
 
-      # Bot Security API RPC handler
-  ]
+  # Bot Security API RPC handlers
+  add('/swarming/api/v1/bot/oauth_token', BotOAuthTokenHandler)
+  add('/swarming/api/v1/bot/id_token', BotIDTokenHandler)
+
+  # Bot Task API RPC handlers
+  add('/swarming/api/v1/bot/task_update', BotTaskUpdateHandler)
+  add('/swarming/api/v1/bot/task_update/<task_id:[a-f0-9]+>',
+      BotTaskUpdateHandler)
+  add('/swarming/api/v1/bot/task_error', BotTaskErrorHandler)
+  add('/swarming/api/v1/bot/task_error/<task_id:[a-f0-9]+>',
+      BotTaskErrorHandler)
+
   return [webapp2.Route(*i) for i in routes]

@@ -17,9 +17,9 @@ from google.appengine.api import taskqueue
 from google.appengine.ext import ndb
 from google.protobuf import json_format
 
-from proto.api import plugin_pb2
-from proto.api import plugin_prpc_pb2
 from proto.api import swarming_pb2
+from proto.plugin import plugin_pb2
+from proto.plugin import plugin_prpc_pb2
 
 from server import config
 from server import pools_config
@@ -61,12 +61,10 @@ def _bot_pool_cfg(bot_dimensions):
     return None
   if len(pools) == 1:
     return pools_config.get_pool_config(pools[0])
-  else:
-    logging.warning(
-        'Bot with dimensions %s was found to be in multiple '
-        'pools. Unable to determine pool config.', bot_dimensions)
 
-  return None
+  logging.warning(
+      'Bot with dimensions %s was found to be in multiple '
+      'pools. Unable to determine pool config.', bot_dimensions)
 
 
 def _config_for_dimensions(pool_cfg, dimensions_flat):
@@ -296,7 +294,8 @@ def task_batch_handle_notifications():
     else:
       requests[s_tuple].notifications.extend(proto.notifications)
 
-  for s_id, address in requests:
+  # pylint: disable=consider-iterating-dictionary
+  for s_id, address in requests.keys():
     request_json = json_format.MessageToJson(requests[s_id, address])
     enqueued = utils.enqueue_task(
         '/internal/taskqueue/important/external_scheduler/notify-tasks',

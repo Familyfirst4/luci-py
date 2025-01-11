@@ -11,7 +11,7 @@ ASPEED = '1a03'
 INTEL = '8086'
 MAXTROX = '102b'
 NVIDIA = '10de'
-
+QUALCOMM = 'qcom'
 
 _VENDOR_MAPPING = {
     AMD: (
@@ -26,6 +26,7 @@ _VENDOR_MAPPING = {
             '6821':
             'Radeon R8 M370X',  # 'HD 8800M' or 'R7 M380' based on rev_id
             '683d': 'Radeon HD 7700',
+            '7340': 'Radeon RX 5500 XT',
             '9830': 'Radeon HD 8400',
             '9874': 'Carrizo',
         }),
@@ -61,10 +62,14 @@ _VENDOR_MAPPING = {
             '1926': 'Skylake Iris 540/550',
             '193b': 'Skylake Iris Pro 580',
             '22b1': 'Braswell HD Graphics',
-            '3e92': 'Coffee Lake UHD Graphics 630',
+            '3e92': 'Coffee Lake S UHD Graphics 630',
+            # Full name is actually '3e9b': 'Coffee Lake H UHD Graphics 630',
+            # However, system_profiler returns just 'Intel UHD Graphics 630'
+            '3e9b': 'UHD Graphics 630',
             '5912': 'Kaby Lake HD Graphics 630',
             '591e': 'Kaby Lake HD Graphics 615',
             '5926': 'Kaby Lake Iris Plus Graphics 640',
+            '9bc5': 'Comet Lake S UHD Graphics 630',
         }),
     MAXTROX: ('Matrox', {
         '0522': 'MGA G200e',
@@ -92,6 +97,9 @@ _VENDOR_MAPPING = {
             '1cb3': 'Quadro P400',
             '2184': 'GeForce GTX 1660',
         }),
+    QUALCOMM: ('Qualcomm', {
+        '043a': 'Adreno 690',
+    }),
 }
 
 

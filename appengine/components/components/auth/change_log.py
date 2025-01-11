@@ -115,10 +115,6 @@ class AuthDBChange(polymodel.PolyModel):
   CHANGE_IPWL_SUBNETS_REMOVED     = 3300
   CHANGE_IPWL_DELETED             = 3400
 
-  # AuthDBIPWhitelistAssignmentChange change types.
-  CHANGE_IPWLASSIGN_SET   = 5000
-  CHANGE_IPWLASSIGN_UNSET = 5100
-
   # AuthDBConfigChange change types.
   CHANGE_CONF_OAUTH_CLIENT_CHANGED     = 7000
   CHANGE_CONF_CLIENT_IDS_ADDED         = 7100
@@ -155,11 +151,11 @@ class AuthDBChange(polymodel.PolyModel):
     def simplify(v):
       if isinstance(v, list):
         return [simplify(i) for i in v]
-      elif isinstance(v, datastore_utils.BytesSerializable):
+      if isinstance(v, datastore_utils.BytesSerializable):
         return v.to_bytes()
-      elif isinstance(v, datastore_utils.JsonSerializable):
+      if isinstance(v, datastore_utils.JsonSerializable):
         return v.to_jsonish()
-      elif isinstance(v, datetime.datetime):
+      if isinstance(v, datetime.datetime):
         return utils.datetime_to_timestamp(v)
       return v
     as_dict = self.to_dict(exclude=['class_'])
@@ -441,47 +437,7 @@ class AuthDBIPWhitelistAssignmentChange(AuthDBChange):
 
 
 def diff_ip_whitelist_assignments(target, old, new):
-  # Helper to reduce amount of typing.
-  def change(tp, identity, ip_whitelist, **kwargs):
-    # Whitelist assignments are special: individual assignments are defined
-    # as LocalStructuredProperties of a single singleton entity. We want changes
-    # to refer to individual assignments (keyed by identity name), and so
-    # construct change target manually to reflect that.
-    return AuthDBIPWhitelistAssignmentChange(
-        change_type=getattr(AuthDBChange, 'CHANGE_IPWLASSIGN_%s' % tp),
-        target='%s$%s' % (target, identity.to_bytes()),
-        identity=identity,
-        ip_whitelist=ip_whitelist,
-        **kwargs)
-
-  # All assignment were removed. Don't trust 'old' since it may be nil for old
-  # apps that did not keep history. Use "last known state" snapshot in 'new'.
-  if new.auth_db_deleted:
-    for a in new.assignments:
-      yield change('UNSET', a.identity, a.ip_whitelist)
-    return
-
-  # All assignments were added.
-  if old is None:
-    for a in new.assignments:
-      yield change('SET', a.identity, a.ip_whitelist)
-    return
-
-  # Diff two lists of assignment.
-  old_by_ident = {a.identity: a for a in old.assignments}
-  new_by_ident = {a.identity: a for a in new.assignments}
-
-  # Delete old ones.
-  for ident, a in old_by_ident.items():
-    if ident not in new_by_ident:
-      yield change('UNSET', a.identity, a.ip_whitelist)
-
-  # Add new ones, update existing ones.
-  for ident, a in new_by_ident.items():
-    old_a = old_by_ident.get(ident)
-    if not old_a or a.ip_whitelist != old_a.ip_whitelist:
-      yield change('SET', a.identity, a.ip_whitelist)
-
+  logging.info("IPWhitelistAssignments diffing is no longer supported...")
 
 ## AuthGlobalConfig changes.
 
@@ -792,8 +748,8 @@ def on_auth_db_change(auth_db_rev):
   """Called in a transaction that updated AuthDB."""
   # Avoid adding task queues in unit tests, since there are many-many unit tests
   # (in multiple project and repos) that indirectly make AuthDB transactions
-  # and mocking out 'enqueue_process_change_task' in all of them is stupid
-  # unscalable work. So be evil and detect unit tests right here.
+  # and mocking out 'enqueue_process_change_task' in all of them does not scale.
+  # Therefore, detect unit tests right here.
   if not utils.is_unit_test():
     enqueue_process_change_task(auth_db_rev)
 
@@ -809,12 +765,15 @@ def enqueue_process_change_task(auth_db_rev):
   assert ndb.in_transaction()
   conf = config.ensure_configured()
   try:
-    # Pin the task to the module and version.
-    taskqueue.add(
-        url='/internal/auth/taskqueue/process-change/%d' % auth_db_rev,
-        queue_name=conf.PROCESS_CHANGE_TASK_QUEUE,
-        headers={'Host': modules.get_hostname(module=conf.BACKEND_MODULE)},
-        transactional=True)
+    if conf.CUSTOM_PROCESS_CHANGE_TASK_ENQUEUER:
+      conf.CUSTOM_PROCESS_CHANGE_TASK_ENQUEUER(auth_db_rev)
+    else:
+      # Pin the task to the module and version.
+      taskqueue.add(
+          url='/internal/auth/taskqueue/process-change/%d' % auth_db_rev,
+          queue_name=conf.PROCESS_CHANGE_TASK_QUEUE,
+          headers={'Host': modules.get_hostname(module=conf.BACKEND_MODULE)},
+          transactional=True)
   except Exception as e:
     logging.error(
         'Problem adding "process-change" task to the task queue (%s): %s',

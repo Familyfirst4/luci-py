@@ -15,24 +15,26 @@ from google.appengine import runtime
 
 from google.protobuf import json_format
 
-from proto.api import plugin_pb2
+from proto.plugin import plugin_pb2
 
 from components import decorators
 from components import datastore_utils
 from components import utils
-from server import bq_state
 from server import bot_groups_config
 from server import bot_management
 from server import config
 from server import external_scheduler
 from server import named_caches
-from server import stats_bots
-from server import stats_tasks
 from server import task_queues
-from server import task_request
 from server import task_result
 from server import task_scheduler
 import ts_mon_metrics
+
+
+class WarmupHandler(webapp2.RequestHandler):
+  def get(self):
+    self.response.headers['Content-Type'] = 'text/plain; charset=utf-8'
+    self.response.write('ok')
 
 
 ## Cron jobs.
@@ -53,8 +55,7 @@ class CronBotDiedHandler(_CronHandlerBase):
   """
 
   def run_cron(self):
-    start_time = utils.milliseconds_since_epoch()
-    task_scheduler.cron_handle_bot_died(start_time)
+    task_scheduler.cron_handle_bot_died()
 
 
 class CronAbortExpiredShardToRunHandler(_CronHandlerBase):
@@ -69,13 +70,13 @@ class CronAbortExpiredShardToRunHandler(_CronHandlerBase):
     task_scheduler.cron_abort_expired_task_to_run()
 
 
-class CronTidyTaskQueues(_CronHandlerBase):
-  """Removes unused tasks queues, the 'dimensions sets' without active task
-  flows.
-  """
+class CronTidyTaskDimensionSets(_CronHandlerBase):
+  """Removes expired task dimension sets from the datastore."""
 
   def run_cron(self):
-    task_queues.cron_tidy_stale()
+    f = task_queues.tidy_task_dimension_sets_async()
+    if not f.get_result():
+      self.response.set_status(429, 'Need to retry')
 
 
 class CronUpdateBotInfoComposite(_CronHandlerBase):
@@ -87,38 +88,11 @@ class CronUpdateBotInfoComposite(_CronHandlerBase):
     bot_management.cron_update_bot_info()
 
 
-class CronDeleteOldBots(_CronHandlerBase):
-  """Deletes old BotRoot entity groups."""
-
-  def run_cron(self):
-    bot_management.cron_delete_old_bot()
-
-
-class CronDeleteOldBotEvents(_CronHandlerBase):
-  """Deletes old BotEvent entities."""
-
-  def run_cron(self):
-    bot_management.cron_delete_old_bot_events()
-
-
-class CronDeleteOldTasks(_CronHandlerBase):
-  """Deletes old TaskRequest entities and all their decendants."""
-
-  def run_cron(self):
-    task_request.cron_delete_old_task_requests()
-
-
 class CronNamedCachesUpdate(_CronHandlerBase):
   """Updates named caches hints."""
 
   def run_cron(self):
     named_caches.cron_update_named_caches()
-
-class CronBotsDimensionAggregationHandler(_CronHandlerBase):
-  """Aggregates all bots dimensions (except id) in the fleet."""
-
-  def run_cron(self):
-    bot_management.cron_aggregate_dimensions()
 
 
 class CronBotGroupsConfigHandler(_CronHandlerBase):
@@ -145,54 +119,6 @@ class CronExternalSchedulerGetCallbacksHandler(_CronHandlerBase):
     task_scheduler.cron_handle_get_callbacks()
 
 
-class CronBotsStats(_CronHandlerBase):
-  """Update bots monitoring statistics."""
-
-  def run_cron(self):
-    stats_bots.cron_generate_stats()
-
-
-class CronTasksStats(_CronHandlerBase):
-  """Update tasks monitoring statistics."""
-
-  def run_cron(self):
-    stats_tasks.cron_generate_stats()
-
-
-class CronSendToBQ(_CronHandlerBase):
-  """Triggers many tasks queues to send data to BigQuery."""
-
-  def run_cron(self):
-    # It can trigger up to the sum of all the max_taskqueues below.
-    # It should complete within close to 50 seconds as each function will try to
-    # limit itself to its allocated chunk.
-    max_seconds = 50. / 2
-    bq_state.cron_trigger_tasks(
-        'task_results_run',
-        '/internal/taskqueue/monitoring/bq/tasks/results/run/',
-        'monitoring-bq-tasks-results-run',
-        max_seconds,
-        max_taskqueues=30)
-    bq_state.cron_trigger_tasks(
-        'task_results_summary',
-        '/internal/taskqueue/monitoring/bq/tasks/results/summary/',
-        'monitoring-bq-tasks-results-summary',
-        max_seconds,
-        max_taskqueues=30)
-    bq_state.cron_trigger_tasks(
-        'bot_events',
-        '/internal/taskqueue/monitoring/bq/bots/events/',
-        'monitoring-bq-bots-events',
-        max_seconds,
-        max_taskqueues=30)
-    bq_state.cron_trigger_tasks(
-        'task_requests',
-        '/internal/taskqueue/monitoring/bq/tasks/requests/',
-        'monitoring-bq-tasks-requests',
-        max_seconds,
-        max_taskqueues=30)
-
-
 ## Task queues.
 
 
@@ -202,14 +128,13 @@ class TaskCancelTasksHandler(webapp2.RequestHandler):
   @decorators.silence(datastore_utils.CommitError)
   @decorators.require_taskqueue('cancel-tasks')
   def post(self):
-    start_time = utils.milliseconds_since_epoch()
     payload = json.loads(self.request.body)
     logging.info('Cancelling tasks with ids: %s', payload['tasks'])
     kill_running = payload['kill_running']
     # TODO(maruel): Parallelize.
     for task_id in payload['tasks']:
       ok, was_running = task_scheduler.cancel_task_with_id(
-          task_id, kill_running, None, start_time)
+          task_id, kill_running, None)
       logging.info('task %s canceled: %s was running: %s',
                    task_id, ok, was_running)
 
@@ -223,7 +148,6 @@ class TaskCancelTaskOnBotHandler(webapp2.RequestHandler):
 
   @decorators.require_taskqueue('cancel-task-on-bot')
   def post(self):
-    start_time = utils.milliseconds_since_epoch()
     payload = json.loads(self.request.body)
     task_id = payload.get('task_id')
     if not task_id:
@@ -232,7 +156,7 @@ class TaskCancelTaskOnBotHandler(webapp2.RequestHandler):
     bot_id = payload.get('bot_id')
     try:
       ok, was_running = task_scheduler.cancel_task_with_id(
-          task_id, True, bot_id, start_time)
+          task_id, True, bot_id)
       logging.info('task %s canceled: %s was running: %s',
                    task_id, ok, was_running)
     except ValueError:
@@ -259,32 +183,27 @@ class TaskExpireTasksHandler(webapp2.RequestHandler):
 
   @decorators.require_taskqueue('task-expire')
   def post(self):
-    start_time = utils.milliseconds_since_epoch()
     payload = json.loads(self.request.body)
-    task_scheduler.task_expire_tasks(payload.get('task_to_runs'), start_time)
+    task_scheduler.task_expire_tasks(payload['entities'])
 
 
-class TaskDeleteTasksHandler(webapp2.RequestHandler):
-  """Deletes a list of tasks, given a list of their ids."""
+class TaskUpdateBotMatchesHandler(webapp2.RequestHandler):
+  """Assigns new task queues to existing bots."""
 
-  @decorators.require_taskqueue('delete-tasks')
+  @decorators.require_taskqueue('update-bot-matches')
   def post(self):
-    payload = json.loads(self.request.body)
-    task_request.task_delete_tasks(payload['task_ids'])
-
-
-class TaskDimensionsHandler(webapp2.RequestHandler):
-  """Refreshes the active task queues."""
-
-  @decorators.silence(datastore_errors.Timeout)
-  @decorators.require_taskqueue('rebuild-task-cache')
-  def post(self):
-    f = task_queues.rebuild_task_cache_async(self.request.body)
+    f = task_queues.update_bot_matches_async(self.request.body)
     if not f.get_result():
-      # The task likely failed due to DB transaction contention,
-      # so we can reply that the service has had too many requests (429).
-      # Using a 400-level response also prevents failures here from causing
-      # unactionable alerts due to a high rate of 500s.
+      self.response.set_status(429, 'Need to retry')
+
+
+class TaskRescanMatchingTaskSetsHandler(webapp2.RequestHandler):
+  """A task queue task that finds all matching TaskDimensionsSets for a bot."""
+
+  @decorators.require_taskqueue('rescan-matching-task-sets')
+  def post(self):
+    f = task_queues.rescan_matching_task_sets_async(self.request.body)
+    if not f.get_result():
       self.response.set_status(429, 'Need to retry')
 
 
@@ -298,12 +217,11 @@ class TaskSendPubSubMessage(webapp2.RequestHandler):
 
 
 class TaskNotifyBuildbucketHandler(webapp2.RequestHandler):
-  """Sends updates to Buildbucket about tastk status."""
+  """Sends updates to Buildbucket about task status."""
 
   @decorators.require_taskqueue('buildbucket-notify')
   def post(self, task_id):  # pylint: disable=unused-argument
-    # TODO(crbug/1236848): Call buildbucket's UpdateBuildTask.
-    pass
+    task_scheduler.task_buildbucket_update(json.loads(self.request.body))
 
 
 class TaskESNotifyTasksHandler(webapp2.RequestHandler):
@@ -337,83 +255,22 @@ class TaskNamedCachesPool(webapp2.RequestHandler):
     named_caches.task_update_pool(params['pool'])
 
 
-class TaskMonitoringBotsEventsBQ(webapp2.RequestHandler):
-  """Sends rows to BigQuery swarming.bot_events table."""
-
-  @decorators.require_taskqueue('monitoring-bq-bots-events')
-  def post(self, timestamp):
-    ndb.get_context().set_cache_policy(lambda _: False)
-    start = datetime.datetime.strptime(timestamp, u'%Y-%m-%dT%H:%M')
-    end = start + datetime.timedelta(seconds=60)
-    bot_management.task_bq_events(start, end)
-
-
-class TaskMonitoringTasksRequestsBQ(webapp2.RequestHandler):
-  """Sends rows to BigQuery swarming.task_requests table."""
-
-  @decorators.require_taskqueue('monitoring-bq-tasks-requests')
-  def post(self, timestamp):
-    ndb.get_context().set_cache_policy(lambda _: False)
-    start = datetime.datetime.strptime(timestamp, u'%Y-%m-%dT%H:%M')
-    end = start + datetime.timedelta(seconds=60)
-    task_request.task_bq(start, end)
-
-
-class TaskMonitoringTasksResultsRunBQ(webapp2.RequestHandler):
-  """Sends rows to BigQuery swarming.task_results_run table."""
-
-  @decorators.require_taskqueue('monitoring-bq-tasks-results-run')
-  def post(self, timestamp):
-    start = datetime.datetime.strptime(timestamp, u'%Y-%m-%dT%H:%M')
-    end = start + datetime.timedelta(seconds=60)
-    task_result.task_bq_run(start, end)
-
-
-class TaskMonitoringTasksResultsSummaryBQ(webapp2.RequestHandler):
-  """Sends rows to BigQuery swarming.task_results_summary table."""
-
-  @decorators.require_taskqueue('monitoring-bq-tasks-results-summary')
-  def post(self, timestamp):
-    start = datetime.datetime.strptime(timestamp, u'%Y-%m-%dT%H:%M')
-    end = start + datetime.timedelta(seconds=60)
-    task_result.task_bq_summary(start, end)
-
-
-class TaskMonitoringTSMon(webapp2.RequestHandler):
-  """Compute global metrics for timeseries monitoring."""
-
-  @decorators.require_taskqueue('tsmon')
-  def post(self, kind):
-    ts_mon_metrics.set_global_metrics(kind, payload=self.request.body)
-
-
 ###
 
 
 def get_routes():
   """Returns internal urls that should only be accessible via the backend."""
   routes = [
+      ('/_ah/warmup', WarmupHandler),
+
       # Cron jobs.
       ('/internal/cron/important/scheduler/abort_bot_missing',
        CronBotDiedHandler),
       ('/internal/cron/important/scheduler/abort_expired',
        CronAbortExpiredShardToRunHandler),
-      ('/internal/cron/cleanup/task_queues', CronTidyTaskQueues),
+      ('/internal/cron/cleanup/task_dimension_sets', CronTidyTaskDimensionSets),
       ('/internal/cron/monitoring/bots/update_bot_info',
        CronUpdateBotInfoComposite),
-      ('/internal/cron/cleanup/bots/delete_old', CronDeleteOldBots),
-      ('/internal/cron/cleanup/bots/delete_old_bot_events',
-       CronDeleteOldBotEvents),
-      ('/internal/cron/cleanup/tasks/delete_old', CronDeleteOldTasks),
-
-      # Not yet used.
-      ('/internal/cron/monitoring/bots/stats', CronBotsStats),
-
-      # Not yet used.
-      ('/internal/cron/monitoring/tasks/stats', CronTasksStats),
-      ('/internal/cron/monitoring/bq', CronSendToBQ),
-      ('/internal/cron/monitoring/bots/aggregate_dimensions',
-       CronBotsDimensionAggregationHandler),
       ('/internal/cron/important/bot_groups_config',
        CronBotGroupsConfigHandler),
       ('/internal/cron/important/external_scheduler/cancellations',
@@ -429,9 +286,10 @@ def get_routes():
       ('/internal/taskqueue/important/tasks/cancel-children-tasks',
        TaskCancelChildrenTasksHandler),
       ('/internal/taskqueue/important/tasks/expire', TaskExpireTasksHandler),
-      ('/internal/taskqueue/cleanup/tasks/delete', TaskDeleteTasksHandler),
-      ('/internal/taskqueue/important/task_queues/rebuild-cache',
-       TaskDimensionsHandler),
+      ('/internal/taskqueue/important/task_queues/update-bot-matches',
+       TaskUpdateBotMatchesHandler),
+      ('/internal/taskqueue/important/task_queues/rescan-matching-task-sets',
+       TaskRescanMatchingTaskSetsHandler),
       (r'/internal/taskqueue/important/pubsub/notify-task/<task_id:[0-9a-f]+>',
        TaskSendPubSubMessage),
       (r'/internal/taskqueue/important/buildbucket/notify-task/'
@@ -442,18 +300,6 @@ def get_routes():
        TaskESNotifyKickHandler),
       (r'/internal/taskqueue/important/named_cache/update-pool',
        TaskNamedCachesPool),
-      (r'/internal/taskqueue/monitoring/bq/bots/events/'
-       r'<timestamp:\d{4}-\d\d-\d\dT\d\d:\d\d>', TaskMonitoringBotsEventsBQ),
-      (r'/internal/taskqueue/monitoring/bq/tasks/requests/'
-       r'<timestamp:\d{4}-\d\d-\d\dT\d\d:\d\d>', TaskMonitoringTasksRequestsBQ),
-      (r'/internal/taskqueue/monitoring/bq/tasks/results/run/'
-       r'<timestamp:\d{4}-\d\d-\d\dT\d\d:\d\d>',
-       TaskMonitoringTasksResultsRunBQ),
-      (r'/internal/taskqueue/monitoring/bq/tasks/results/summary/'
-       r'<timestamp:\d{4}-\d\d-\d\dT\d\d:\d\d>',
-       TaskMonitoringTasksResultsSummaryBQ),
-      (r'/internal/taskqueue/monitoring/tsmon/<kind:[0-9A-Za-z_]+>',
-       TaskMonitoringTSMon),
   ]
   return [webapp2.Route(*a) for a in routes]
 

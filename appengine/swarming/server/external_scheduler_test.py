@@ -24,8 +24,9 @@ from google.appengine.api import taskqueue
 from test_support import test_case
 
 from components import utils
-from proto.api import plugin_pb2
 from proto.api import swarming_pb2
+from proto.config import pools_pb2
+from proto.plugin import plugin_pb2
 from server import config
 from server import external_scheduler
 from server import pools_config
@@ -152,6 +153,7 @@ class ExternalSchedulerApiTest(test_env_handlers.AppTestBase):
     cfg = config.settings()
     cfg.enable_batch_es_notifications = False
     self.mock(config, 'settings', lambda: cfg)
+    self.mock_default_pool_acl([])
 
   def _enqueue(self, *args, **kwargs):
     return self._enqueue_orig(*args, use_dedicated_module=False, **kwargs)
@@ -201,7 +203,7 @@ class ExternalSchedulerApiTest(test_env_handlers.AppTestBase):
 
   def test_notify_requests(self):
     request = _gen_request()
-    result_summary = task_scheduler.schedule_request(request, 0)
+    result_summary = task_scheduler.schedule_request(request)
     external_scheduler.notify_requests(
         self.es_cfg, [(request, result_summary)], False, False)
 
@@ -219,7 +221,7 @@ class ExternalSchedulerApiTest(test_env_handlers.AppTestBase):
 
   def test_notify_request_with_tq(self):
     request = _gen_request()
-    result_summary = task_scheduler.schedule_request(request, 0)
+    result_summary = task_scheduler.schedule_request(request)
     external_scheduler.notify_requests(
       self.es_cfg, [(request, result_summary)], True, False)
 
@@ -284,6 +286,7 @@ class ExternalSchedulerApiTestBatchMode(test_env_handlers.AppTestBase):
     self.cfg = config.settings()
     self.cfg.enable_batch_es_notifications = True
     self.mock(config, 'settings', lambda: self.cfg)
+    self.mock_default_pool_acl([])
 
   def _enqueue(self, *args, **kwargs):
     return self._enqueue_orig(*args, use_dedicated_module=False, **kwargs)
@@ -301,8 +304,8 @@ class ExternalSchedulerApiTestBatchMode(test_env_handlers.AppTestBase):
 
   def test_notify_request_with_tq_batch_mode(self):
     request = _gen_request()
-    result_summary = task_scheduler.schedule_request(request, 0)
-    self.assertEqual(1, self.execute_tasks())
+    result_summary = task_scheduler.schedule_request(request)
+    self.execute_tasks()
 
     # Create requests with different scheduler IDs.
     external_scheduler.notify_requests(
@@ -340,9 +343,9 @@ class ExternalSchedulerApiTestBatchMode(test_env_handlers.AppTestBase):
 
   def test_notify_request_with_tq_batch_mode_false(self):
     request = _gen_request()
-    result_summary = task_scheduler.schedule_request(request, 0)
+    result_summary = task_scheduler.schedule_request(request)
     self.cfg.enable_batch_es_notifications = True
-    self.assertEqual(1, self.execute_tasks())
+    self.execute_tasks()
 
     self._setup_client()
     # Since use_tq is false, the requests below should be sent out immediately.

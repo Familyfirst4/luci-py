@@ -1,9 +1,10 @@
-#!/usr/bin/env vpython
+#!/usr/bin/env vpython3
 # Copyright 2017 The LUCI Authors. All rights reserved.
 # Use of this source code is governed under the Apache License, Version 2.0
 # that can be found in the LICENSE file.
 
 # [VPYTHON:BEGIN]
+# python_version: "3.8"
 # wheel: <
 #   name: "infra/python/wheels/protobuf-py2_py3"
 #   version: "version:3.6.1"
@@ -49,8 +50,8 @@ _INDEX = {
 SERVICE_FORMAT = '''
 %(service_name)sServiceDescription = {
   'file_descriptor_set': FILE_DESCRIPTOR_SET,
-  'file_descriptor': _INDEX[%(file_name)r]['descriptor'],
-  'service_descriptor': _INDEX[%(file_name)r]['services'][%(service_name)r],
+  'file_descriptor': _INDEX[u%(file_name)r]['descriptor'],
+  'service_descriptor': _INDEX[u%(file_name)r]['services'][u%(service_name)r],
 }
 '''
 
@@ -92,7 +93,8 @@ def generate_code(file_descriptor, all_files):
   fragments = [HEADER_FORMAT % {
       'file_name': file_descriptor.name,
       'file_set_descriptor_b64': string_to_code_lines(
-          base64.b64encode(zlib.compress(file_set.SerializeToString())),
+          base64.b64encode(
+              zlib.compress(file_set.SerializeToString())).decode('utf-8'),
           indent=4),
   }]
 
@@ -117,7 +119,7 @@ def safe_filename(filename):
 
 
 def main():
-  data = sys.stdin.read()
+  data = sys.stdin.buffer.read()
   req = plugin.CodeGeneratorRequest()
   req.ParseFromString(data)
   res = plugin.CodeGeneratorResponse()
@@ -129,7 +131,7 @@ def main():
           name=safe_filename(file.name).replace('.proto', '_prpc_pb2.py'),
           content=generate_code(file, files),
       )
-  sys.stdout.write(res.SerializeToString())
+  sys.stdout.buffer.write(res.SerializeToString())
 
 
 if __name__ == '__main__':

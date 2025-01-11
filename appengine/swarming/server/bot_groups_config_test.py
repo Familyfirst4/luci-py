@@ -27,27 +27,28 @@ TEST_CONFIG = bots_pb2.BotsCfg(
             auth=[
                 bots_pb2.BotAuth(require_luci_machine_token=True),
                 bots_pb2.BotAuth(require_service_account=['z@example.com']),
-                bots_pb2.BotAuth(
-                    require_gce_vm_token=bots_pb2.BotAuth.GCE(project='proj'),),
+                bots_pb2.BotAuth(require_gce_vm_token=bots_pb2.BotAuth.GCE(
+                    project='proj'), ),
             ],
             owners=['owner@example.com'],
             dimensions=['pool:A', 'pool:B', 'other:D'],
+            logs_cloud_project='google.com:chromecompute',
         ),
         # This group includes an injected bot_config and system_service_account.
         bots_pb2.BotGroup(
-            bot_id=['other_bot'],
+            bot_id=['other_bot', 'bot1--xxx'],
             bot_id_prefix=['bot'],
             auth=[bots_pb2.BotAuth(require_service_account=['a@example.com'])],
             bot_config_script='foo.py',
-            system_service_account='bot'),
-        bots_pb2.BotGroup(
-            auth=[bots_pb2.BotAuth(ip_whitelist='bots')],
-            dimensions=['pool:default']),
+            system_service_account='bot',
+            logs_cloud_project='chrome-infra-logs'),
+        bots_pb2.BotGroup(auth=[bots_pb2.BotAuth(ip_whitelist='bots')],
+                          dimensions=['pool:default']),
     ],
 )
 
 EXPECTED_GROUP_1 = bot_groups_config._make_bot_group_config(
-    owners=(u'owner@example.com',),
+    owners=(u'owner@example.com', ),
     auth=(
         bot_groups_config.BotAuth(
             log_if_failed=False,
@@ -59,7 +60,7 @@ EXPECTED_GROUP_1 = bot_groups_config._make_bot_group_config(
         bot_groups_config.BotAuth(
             log_if_failed=False,
             require_luci_machine_token=False,
-            require_service_account=('z@example.com',),
+            require_service_account=('z@example.com', ),
             require_gce_vm_token=None,
             ip_whitelist=u'',
         ),
@@ -78,7 +79,9 @@ EXPECTED_GROUP_1 = bot_groups_config._make_bot_group_config(
     bot_config_script='',
     bot_config_script_rev='',
     bot_config_script_content='',
+    bot_config_script_sha256='',
     system_service_account='',
+    logs_cloud_project='google.com:chromecompute',
     is_default=False)
 
 EXPECTED_GROUP_2 = bot_groups_config._make_bot_group_config(
@@ -86,15 +89,18 @@ EXPECTED_GROUP_2 = bot_groups_config._make_bot_group_config(
     auth=(bot_groups_config.BotAuth(
         log_if_failed=False,
         require_luci_machine_token=False,
-        require_service_account=(u'a@example.com',),
+        require_service_account=(u'a@example.com', ),
         require_gce_vm_token=None,
         ip_whitelist=u'',
-    ),),
+    ), ),
     dimensions={u'pool': []},
     bot_config_script='foo.py',
     bot_config_script_rev='',
     bot_config_script_content='print("Hi")',
+    bot_config_script_sha256=
+    '566238a1eb9839809ff20c120387d91042c3efce7d7f30d16470caec93740e1b',
     system_service_account='bot',
+    logs_cloud_project='chrome-infra-logs',
     is_default=False)
 
 EXPECTED_GROUP_3 = bot_groups_config._make_bot_group_config(
@@ -105,12 +111,14 @@ EXPECTED_GROUP_3 = bot_groups_config._make_bot_group_config(
         require_service_account=(),
         require_gce_vm_token=None,
         ip_whitelist=u'bots',
-    ),),
+    ), ),
     dimensions={u'pool': [u'default']},
     bot_config_script='',
     bot_config_script_rev='',
     bot_config_script_content='',
+    bot_config_script_sha256='',
     system_service_account='',
+    logs_cloud_project=None,
     is_default=True)
 
 
@@ -144,9 +152,9 @@ class BotGroupsConfigTest(test_case.TestCase):
     bot_groups_config.clear_cache()
 
   def test_version(self):
-    self.assertEqual('hash:ebb6f818791207', EXPECTED_GROUP_1.version)
-    self.assertEqual('hash:64de2b9a71310d', EXPECTED_GROUP_2.version)
-    self.assertEqual('hash:5d851a90da99d8', EXPECTED_GROUP_3.version)
+    self.assertEqual('hash:7d27288175e223', EXPECTED_GROUP_1.version)
+    self.assertEqual('hash:2208a8f7c5f4aa', EXPECTED_GROUP_2.version)
+    self.assertEqual('hash:035053f35deb41', EXPECTED_GROUP_3.version)
 
   def test_expand_bot_id_expr_success(self):
 
@@ -178,12 +186,14 @@ class BotGroupsConfigTest(test_case.TestCase):
     self.mock_config(TEST_CONFIG)
     cfg = bot_groups_config._fetch_bot_groups()
 
-    self.assertEquals({
-        u'bot1': EXPECTED_GROUP_1,
-        u'bot2': EXPECTED_GROUP_1,
-        u'bot3': EXPECTED_GROUP_1,
-        u'other_bot': EXPECTED_GROUP_2,
-    }, cfg.direct_matches)
+    self.assertEquals(
+        {
+            u'bot1': EXPECTED_GROUP_1,
+            u'bot1--xxx': EXPECTED_GROUP_2,
+            u'bot2': EXPECTED_GROUP_1,
+            u'bot3': EXPECTED_GROUP_1,
+            u'other_bot': EXPECTED_GROUP_2,
+        }, cfg.direct_matches)
     self.assertEquals([('bot', EXPECTED_GROUP_2)], cfg.prefix_matches)
     self.assertEquals(EXPECTED_GROUP_3, cfg.default_group)
 
@@ -191,6 +201,10 @@ class BotGroupsConfigTest(test_case.TestCase):
     self.mock_config(TEST_CONFIG)
     self.assertEquals(
         EXPECTED_GROUP_1, bot_groups_config.get_bot_group_config('bot1'))
+    self.assertEquals(EXPECTED_GROUP_1,
+                      bot_groups_config.get_bot_group_config('bot1--zzz'))
+    self.assertEquals(EXPECTED_GROUP_2,
+                      bot_groups_config.get_bot_group_config('bot1--xxx'))
     self.assertEquals(EXPECTED_GROUP_3,
                       bot_groups_config.get_bot_group_config('?'))
 

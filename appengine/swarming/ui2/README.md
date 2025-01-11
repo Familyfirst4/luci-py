@@ -39,6 +39,13 @@ of the modules (found in ./modules/) or one of the top level HTML files
 (found in ./pages/). The pages in ./modules have mock data, so those are
 generally more useful.
 
+If you are running `make serve` on a cloudtop you can access the demo pages on your local machine by using an ssh-tunnel. Run the command
+
+    ssh <your-user-name>@<your-cloudtop-host> -L 8080:localhost:8080
+
+
+All the links should work as expected if opened on local machine.
+
 The list of all demo pages so far (for easy clicking):
 
   - [bot-list](http://localhost:8080/newres/bot-list.html)
@@ -50,10 +57,17 @@ The list of all demo pages so far (for easy clicking):
   - [task-mass-cancel](http://localhost:8080/newres/task-mass-cancel.html)
   - [task-page](http://localhost:8080/newres/task-page.html)
 
-By default, the login is mocked so it works w/o an internet connection,
-but if testing the real OAuth 2.0 flow is desired, a client_id may be
-specified (see `swarming-index-demo.html` for an example). Be sure to also
-allow `localhost:8080` for that client_id.
+The login is mocked so it works w/o an internet connection.
+
+It's also possible to test using a "live_demo" mode which will pull actual
+data in from `chromium-swarm-dev.appspot.com`.
+
+The are a few steps to enable this. This assumes `depot_tools` are installed.
+
+1. Run `luci-auth login`
+2. Run `make live_demo`
+3. Navigate to the demo pages normally. They will now use data from the development environment.
+
 
 ## Running the tests
 
@@ -67,11 +81,9 @@ are present):
 
     make test
 
-If a test is failing, it can be difficult to debug w/o a browser given the fact
-that the code is bundled and minified before testing. To ease this a little bit,
-many assertions have been modified by adding an (undocumented) second param.
-This second param will be shown if the assertion fails and can make it a little
-easier to track down. For example:
+To ease this a little bit, many assertions have been modified by adding an
+(undocumented) second param. This second param will be shown if the assertion
+fails and can make it a little easier to track down. For example:
 `expect(...).toContain('foo', 'foo is very important to be in this string')`
 
 The easiest way to debug a failing test is to run it in a browser and use
@@ -80,14 +92,34 @@ To facilitate that, run:
 
     make browser_test
 
-and navigate to <http://localhost:9876/debug.html>. A suggested workflow to deal
-with the minified code is to add a few breakpoints, then use the log messages to
-access the lines inside the minified source (DevTools can unminify it, to a
-point). Then, add breakpoints and go from there.
+and navigate to <http://localhost:9876/debug.html>. If you are running on a
+CloudTop then you should repeat the ssh port forwarding steps mentioned in the
+`make serve` instructions.
+
+A suggested workflow to deal with the code is to add a few breakpoints, then
+use the log messages to access the lines inside the source.
+Then, add breakpoints and go from there.
 
 When debugging certain tests, it may be useful to prefix the `it` or `describe`
 statement with a letter 'f' (for force). Then, only tests with the 'f' prefix
 will run. Conversely, tests can be disabled with an 'x' prefix.
+
+If you are running on a local environment and get a disconnection error in the form: `Disconnectedreconnect failed before timeout of X ms`, try using the following custom launcher (which can be added to karma.conf.js):
+
+    customLaunchers: {
+        'ChromeHeadless': {
+            base: 'Chrome',
+            flags: [
+                '--headless',
+                '--disable-gpu',
+                '--no-sandbox',
+                '--disable-web-security',
+                // Without a debugging port, Chrome exits immediately.
+                '--remote-debugging-port=9222'
+            ],
+            debug: true
+        }
+    },
 
 ## Generating the docs
 

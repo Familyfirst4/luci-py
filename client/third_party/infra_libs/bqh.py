@@ -49,7 +49,18 @@ def message_to_dict(msg):
     val = getattr(msg, f.name)
     if f.label == f.LABEL_REPEATED:
       if val:  # Omit empty arrays.
-        row[f.name] = [_to_bq_value(elem, f) for elem in val]
+        if hasattr(val, 'items'):  # it's a map<K, V>
+          # Get the synthesized key/value message type
+          synthDESC = f.message_type
+          row[f.name] = [
+            {
+              'key': _to_bq_value(key, synthDESC.fields_by_name['key']),
+              'value': _to_bq_value(value, synthDESC.fields_by_name['value']),
+            }
+            for key, value in sorted(val.items())
+          ]
+        else:
+          row[f.name] = [_to_bq_value(elem, f) for elem in val]
     else:
       bq_value = _to_bq_value(val, f)
       if bq_value is not None:  # Omit NULL values.
@@ -65,18 +76,17 @@ def _to_bq_value(value, field_desc):
       raise ValueError('Invalid value %r for enum type %s' % (
           value, field_desc.enum_type.full_name))
     return enum_val.name
-  elif isinstance(value, duration_pb2.Duration):
+  if isinstance(value, duration_pb2.Duration):
     return value.ToTimedelta().total_seconds()
-  elif isinstance(value, struct_pb2.Struct):
+  if isinstance(value, struct_pb2.Struct):
     # Structs are stored as JSONPB strings,
     # see https://bit.ly/chromium-bq-struct
     return json_format.MessageToJson(value)
-  elif isinstance(value, timestamp_pb2.Timestamp):
+  if isinstance(value, timestamp_pb2.Timestamp):
     return value.ToDatetime().isoformat()
-  elif isinstance(value, message_pb.Message):
+  if isinstance(value, message_pb.Message):
     return message_to_dict(value)
-  else:
-    return value
+  return value
 
 
 def send_rows(bq_client, dataset_id, table_id, rows, batch_size=_BATCH_DEFAULT):
@@ -108,7 +118,7 @@ def send_rows(bq_client, dataset_id, table_id, rows, batch_size=_BATCH_DEFAULT):
     if isinstance(row, tuple):
       rows_to_send.append(row)
       continue
-    elif isinstance(row, message_pb.Message):
+    if isinstance(row, message_pb.Message):
       rows_to_send.append(message_to_dict(row))
     else:
       raise UnsupportedTypeError(type(row).__name__)
@@ -122,7 +132,7 @@ def send_rows(bq_client, dataset_id, table_id, rows, batch_size=_BATCH_DEFAULT):
 
 
 def _batch(rows, batch_size):
-  for i in xrange(0, len(rows), batch_size):
+  for i in range(0, len(rows), batch_size):
     yield rows[i:i + batch_size]
 
 

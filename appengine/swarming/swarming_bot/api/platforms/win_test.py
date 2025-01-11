@@ -131,17 +131,17 @@ class TestWin(auto_stub.TestCase):
                                  ['8.1', '8.1-SP0'])
 
   @params(
-      (0, 3, 32, 'i386'),
-      (9, None, 64, 'amd64'),
-      (9, 6, 32, 'i686'),
-      (10, 6, 32, 'i686'),
-      (999, None, None, None),
+      (0, 32, 'i686'),
+      (9, 64, 'amd64'),
+      (9, 32, 'i686'),
+      (10, 32, 'i686'),
+      (12, 64, 'arm64'),
+      (999, None, None),
   )
-  def test_get_cpu_type_with_wmi(self, arch, level, addr_width, expected):
-    SWbemObjectSet = mock.Mock(
-        Architecture=arch, Level=level, AddressWidth=addr_width)
+  def test_get_cpu_type_with_wmi(self, arch, addr_width, expected):
+    SWbemObjectSet = mock.Mock(Architecture=arch, AddressWidth=addr_width)
     SWbemServices = mock.Mock()
-    SWbemServices.ExecQuery.return_value = [SWbemObjectSet]
+    SWbemServices.query.return_value = [SWbemObjectSet]
     with mock.patch(
         'api.platforms.win._get_wmi_wbem', return_value=SWbemServices):
       self.assertEqual(win.get_cpu_type_with_wmi(), expected)
@@ -153,14 +153,32 @@ class TestWin(auto_stub.TestCase):
         VideoProcessor='GGA',
         DriverVersion='1.1.1.18')
     SWbemServices = mock.Mock()
-    SWbemServices.ExecQuery.return_value = [SWbemObjectSet]
+    SWbemServices.query.return_value = [SWbemObjectSet]
     with mock.patch(
       'api.platforms.win._get_wmi_wbem', return_value=SWbemServices):
       actual = win.get_gpu()
-      SWbemServices.ExecQuery.assert_called_once_with(
+      SWbemServices.query.assert_called_once_with(
         'SELECT * FROM Win32_VideoController')
       expected = (
         ['1ae0', '1ae0:a002', '1ae0:a002-1.1.1.18'], ['Unknown GGA 1.1.1.18'])
+      self.assertEqual(expected, actual)
+
+  def test_get_gpu_qualcomm(self):
+    SWbemObjectSet = mock.Mock(
+        PNPDeviceID='ACPI\\VEN_QCOM&DEV_043A&SUBSYS_CLS08180&REV_0913\\0',
+        # "680" instead of "690" is intentional since the incorrect naming shows
+        # up on at least one real world device.
+        VideoProcessor='Adreno 680',
+        DriverVersion='27.20.1870.0')
+    SWbemServices = mock.Mock()
+    SWbemServices.query.return_value = [SWbemObjectSet]
+    with mock.patch('api.platforms.win._get_wmi_wbem',
+                    return_value=SWbemServices):
+      actual = win.get_gpu()
+      SWbemServices.query.assert_called_once_with(
+          'SELECT * FROM Win32_VideoController')
+      expected = (['qcom', 'qcom:043a', 'qcom:043a-27.20.1870.0'],
+                  ['Qualcomm Adreno 690 27.20.1870.0'])
       self.assertEqual(expected, actual)
 
   def test_list_top_windows(self):
@@ -173,6 +191,179 @@ class TestWin(auto_stub.TestCase):
     m = re.search(
         win._CMD_RE, 'Microsoft Windows [version 10.0.16299.19]', re.IGNORECASE)
     self.assertEqual(('10.0', '16299.19'), m.groups())
+
+  def test_get_screen_scaling_percent_success(self):
+    cases = [
+        (100, 100, '100'),
+        (100, 50, '200'),
+        (100, 80, '125'),
+        (100, 0, None),
+    ]
+    for physical, logical, result in cases:
+      with mock.patch('api.platforms.win.is_display_attached',
+                      return_value=True):
+
+        def mock_impl(*_, **__):
+          mock_impl.call_count += 1
+          if mock_impl.call_count == 1:
+            return logical
+          if mock_impl.call_count == 2:
+            return physical
+          raise RuntimeError('Called more than 2 times')
+
+        mock_impl.call_count = 0
+
+        with mock.patch('win32ui.GetDeviceCaps', side_effect=mock_impl):
+          with mock.patch('win32gui.GetDC'), mock.patch('win32gui.ReleaseDC'):
+            self.assertEqual(win.get_screen_scaling_percent(), result)
+
+
+class TestWinPlatformIndendent(auto_stub.TestCase):
+  """Like TestWin, but not limited to running on Windows."""
+  def setUp(self):
+    super().setUp()
+    tools.clear_cache_all()
+
+  def tearDown(self):
+    super().tearDown()
+    tools.clear_cache_all()
+
+  def test_is_display_attached_valid_display(self):
+    SWbemObject = mock.Mock(CurrentHorizontalResolution=1280,
+                            CurrentVerticalResolution=720)
+    SWbemServices = mock.Mock()
+    SWbemServices.query.return_value = [SWbemObject]
+    with mock.patch('api.platforms.win._get_wmi_wbem',
+                    return_value=SWbemServices):
+      self.assertTrue(win.is_display_attached())
+
+  def test_is_display_attached_missing_display(self):
+    # Both fields missing.
+    SWbemObject = mock.Mock(CurrentHorizontalResolution=None,
+                            CurrentVerticalResolution=None)
+    SWbemServices = mock.Mock()
+    SWbemServices.query.return_value = [SWbemObject]
+    with mock.patch('api.platforms.win._get_wmi_wbem',
+                    return_value=SWbemServices):
+      self.assertFalse(win.is_display_attached())
+
+    # First field missing.
+    SWbemObject = mock.Mock(CurrentHorizontalResolution=None,
+                            CurrentVerticalResolution=720)
+    SWbemServices = mock.Mock()
+    SWbemServices.query.return_value = [SWbemObject]
+    with mock.patch('api.platforms.win._get_wmi_wbem',
+                    return_value=SWbemServices):
+      self.assertFalse(win.is_display_attached())
+
+    # Second field missing.
+    SWbemObject = mock.Mock(CurrentHorizontalResolution=1280,
+                            CurrentVerticalResolution=None)
+    SWbemServices = mock.Mock()
+    SWbemServices.query.return_value = [SWbemObject]
+    with mock.patch('api.platforms.win._get_wmi_wbem',
+                    return_value=SWbemServices):
+      self.assertFalse(win.is_display_attached())
+
+  def test_is_display_attached_no_wbem(self):
+    with mock.patch('api.platforms.win._get_wmi_wbem', return_value=None):
+      self.assertIsNone(win.is_display_attached())
+
+  def test_is_display_attached_scripting_error_handled(self):
+    SWbemServices = mock.Mock()
+    SWbemServices.query.side_effect = win._WbemScriptingError()
+    with mock.patch('api.platforms.win._get_wmi_wbem',
+                    return_value=SWbemServices):
+      self.assertIsNone(win.is_display_attached())
+
+  def test_get_screen_scaling_percent_no_display(self):
+    with mock.patch('api.platforms.win.is_display_attached',
+                    return_value=False):
+      self.assertIsNone(win.get_screen_scaling_percent())
+
+  # Use non-Windows platforms as a proxy for Windows deployments where the
+  # required pywin32 modules aren't present.
+  @unittest.skipIf(sys.platform == 'win32', 'pywin32 might exist')
+  def test_get_screen_scaling_percent_import_error(self):
+    with mock.patch('api.platforms.win.is_display_attached', return_value=True):
+      self.assertIsNone(win.get_screen_scaling_percent())
+
+  def test_get_display_resolution_success(self):
+    SWbemObject = mock.Mock(CurrentHorizontalResolution=1280,
+                            CurrentVerticalResolution=720)
+    SWbemServices = mock.Mock()
+    SWbemServices.query.return_value = [SWbemObject]
+    with mock.patch('api.platforms.win._get_wmi_wbem',
+                    return_value=SWbemServices):
+      self.assertEqual(win.get_display_resolution(), (1280, 720))
+
+  def test_get_display_resolution_missing_display(self):
+    # Both fields missing.
+    SWbemObject = mock.Mock(CurrentHorizontalResolution=None,
+                            CurrentVerticalResolution=None)
+    SWbemServices = mock.Mock()
+    SWbemServices.query.return_value = [SWbemObject]
+    with mock.patch('api.platforms.win._get_wmi_wbem',
+                    return_value=SWbemServices):
+      self.assertIsNone(win.get_display_resolution())
+
+    # First field missing.
+    SWbemObject = mock.Mock(CurrentHorizontalResolution=None,
+                            CurrentVerticalResolution=720)
+    SWbemServices = mock.Mock()
+    SWbemServices.query.return_value = [SWbemObject]
+    with mock.patch('api.platforms.win._get_wmi_wbem',
+                    return_value=SWbemServices):
+      self.assertIsNone(win.get_display_resolution())
+
+    # Second field missing.
+    SWbemObject = mock.Mock(CurrentHorizontalResolution=1280,
+                            CurrentVerticalResolution=None)
+    SWbemServices = mock.Mock()
+    SWbemServices.query.return_value = [SWbemObject]
+    with mock.patch('api.platforms.win._get_wmi_wbem',
+                    return_value=SWbemServices):
+      self.assertIsNone(win.get_display_resolution())
+
+  def test_get_display_resolution_no_wbem(self):
+    with mock.patch('api.platforms.win._get_wmi_wbem', return_value=None):
+      self.assertIsNone(win.get_display_resolution())
+
+  def test_get_display_resolution_scripting_error_handled(self):
+    SWbemServices = mock.Mock()
+    SWbemServices.query.side_effect = win._WbemScriptingError()
+    with mock.patch('api.platforms.win._get_wmi_wbem',
+                    return_value=SWbemServices):
+      self.assertIsNone(win.get_display_resolution())
+
+  def test_get_active_displays_success(self):
+    display_a = mock.Mock(PNPDeviceID='DISPLAY\\AAAA\\1234')
+    display_b = mock.Mock(PNPDeviceID='DISPLAY\\BBBB\\1234')
+    SWbemServices = mock.Mock()
+    # Deliberately swap the order to test that the return value is sorted.
+    SWbemServices.query.return_value = [display_b, display_a]
+    with mock.patch('api.platforms.win._get_wmi_wbem',
+                    return_value=SWbemServices):
+      self.assertEqual(win.get_active_displays(),
+                       ['DISPLAY\\AAAA\\1234', 'DISPLAY\\BBBB\\1234'])
+
+  def test_get_active_displays_success_no_results(self):
+    SWbemServices = mock.Mock()
+    SWbemServices.query.return_value = []
+    with mock.patch('api.platforms.win._get_wmi_wbem',
+                    return_value=SWbemServices):
+      self.assertEqual(win.get_active_displays(), [])
+
+  def test_get_active_displays_no_wbem(self):
+    with mock.patch('api.platforms.win._get_wmi_wbem', return_value=None):
+      self.assertIsNone(win.get_active_displays())
+
+  def test_get_active_displays_scripting_error_handled(self):
+    SWbemServices = mock.Mock()
+    SWbemServices.query.side_effect = win._WbemScriptingError()
+    with mock.patch('api.platforms.win._get_wmi_wbem',
+                    return_value=SWbemServices):
+      self.assertIsNone(win.get_active_displays())
 
 
 if __name__ == '__main__':

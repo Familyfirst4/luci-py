@@ -3,7 +3,7 @@ auth/
 
 `auth` is a library that provides authorization and authentication functionality
 for webapp2 and Cloud Endpoints apps. Acts as a client for
-[auth_service](../../../auth_service).
+[LUCI Auth Service](https://go.chromium.org/luci/auth_service).
 
 ### To use it in your service
 
@@ -30,8 +30,8 @@ libraries:
   - Add to your `main.py`:
 
 ```
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(BASE_DIR, 'components', 'third_party'))
+from components import utils
+utils.import_third_party()
 ```
 
   - In your `acl.py`, implement your group ACL implementation by leveraging

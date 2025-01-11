@@ -11,7 +11,11 @@ application to call.
 https://github.com/grpc/grpc/tree/master/src/python/grpcio/grpc
 """
 
-import webapp2
+try:
+  import webapp2
+except ImportError:
+  webapp2 = None
+import cgi
 
 from components.prpc.server_base import ServerBase
 
@@ -31,7 +35,10 @@ class Webapp2Server(ServerBase):
     ]
 
   def _response_body_and_status_writer(self, response, body=None, status=None):
+    """Implementation will apply `cgi.escape` to any text based inputs."""
     if body is not None:
+      if response.content_type == 'text/plain':
+        body = cgi.escape(body, quote=True)
       response.out.write(body)
     if status is not None:
       response.status = status
@@ -56,7 +63,6 @@ class Webapp2Server(ServerBase):
         server._post_handler(service, method, self.request, self.response)
         return self.response
 
-      # pylint: disable=unused-argument
       def options(self, service, method):
         """Sends an empty response with CORS headers for origins, if allowed."""
         server._options_handler(self.request, self.response)
@@ -64,5 +70,4 @@ class Webapp2Server(ServerBase):
     return Handler
 
 
-# TODO: remove Server
 Server = Webapp2Server

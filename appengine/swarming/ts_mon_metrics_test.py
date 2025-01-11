@@ -90,30 +90,6 @@ class TestMetrics(test_case.TestCase):
     self.now = datetime.datetime(2016, 4, 7)
     self.mock_now(self.now)
 
-  def test_pool_from_dimensions(self):
-    dimensions = {
-        u'os': [u'Linux', u'Ubuntu', u'Ubuntu-14.04'],
-        u'cpu': [u'x86', u'x86-64'],
-    }
-    dimensions.update(
-        {k: 'ignored' for k in ts_mon_metrics._IGNORED_DIMENSIONS})
-    expected = u'cpu:x86-64|os:Linux|os:Ubuntu-14.04'
-    self.assertEqual(expected, ts_mon_metrics._pool_from_dimensions(dimensions))
-
-  def test_shard_params(self):
-    payload = {
-        'cursor': None,
-        'task_start': '2016-04-07 12:13:14',
-        'task_count': 2,
-        'count': 42,
-    }
-    params = ts_mon_metrics._ShardParams(json.dumps(payload))
-    self.assertEqual(json.loads(params.json()), payload)
-
-  def test_shard_params_fail(self):
-    with self.assertRaises(ValueError):
-      ts_mon_metrics._ShardParams('invalid}')
-
   def test_on_task_completed(self):
     tags = [
         'project:test_project',
@@ -121,11 +97,13 @@ class TestMetrics(test_case.TestCase):
         'pool:test_pool',
         'buildername:test_builder',
         'name:some_tests',
+        'rbe:some/proj/some/inst',
     ]
     fields = {
         'project_id': 'test_project',
         'subproject_id': 'test_subproject',
         'pool': 'test_pool',
+        'rbe': 'some/proj/some/inst',
         'spec_name': 'test_builder',
     }
     summary = _gen_task_result_summary(self.now, 1, tags=tags)
@@ -169,6 +147,7 @@ class TestMetrics(test_case.TestCase):
         'project_id': 'test_project',
         'subproject_id': 'test_subproject',
         'pool': 'test_pool',
+        'rbe': 'none',
         'spec_name': 'my:custom:test:spec:name',
     }
     summary = _gen_task_result_summary(self.now, 1, tags=tags)
@@ -196,6 +175,7 @@ class TestMetrics(test_case.TestCase):
         'project_id': 'test_project',
         'subproject_id': 'test_subproject',
         'pool': 'test_pool',
+        'rbe': 'none',
         'spec_name': 'test_builder:experimental',
     }
     summary = _gen_task_result_summary(self.now, 1, tags=tags)
@@ -205,111 +185,14 @@ class TestMetrics(test_case.TestCase):
     ts_mon_metrics.on_task_requested(summary, deduped=False)
     self.assertEqual(1, ts_mon_metrics._jobs_requested.get(fields=fields))
 
-  def test_initialize(self):
-    # Smoke test for syntax errors.
-    ts_mon_metrics.initialize()
-
-  def test_set_global_metrics(self):
-    tags = [
-        'project:test_project',
-        'subproject:test_subproject',
-        'pool:test_pool',
-        'buildername:test_builder',
-        'name:some_tests',
-        'device_type:some_device',
-    ]
-    summary_running = _gen_task_result_summary(self.now, 1, tags=tags)
-    summary_running.state = task_result.State.RUNNING
-    summary_running.modified_ts = self.now
-    summary_running.started_ts = self.now
-    summary_running.bot_id = 'test_bot1'
-    summary_running.put()
-
-    summary_pending = _gen_task_result_summary(
-        self.now - datetime.timedelta(minutes=5), 2, tags=tags)
-    summary_pending.state = task_result.State.PENDING
-    summary_pending.modified_ts = self.now
-    summary_pending.bot_id = 'test_bot2'
-    summary_pending.put()
-
-    summary_pending = _gen_task_result_summary(
-        self.now - datetime.timedelta(minutes=10), 3, tags=tags)
-    summary_pending.state = task_result.State.PENDING
-    summary_pending.modified_ts = self.now
-    summary_pending.bot_id = ''
-    summary_pending.put()
-
-    _gen_bot_info('bot_ready', self.now).put()
-    _gen_bot_info('bot_running', self.now, task_id='deadbeef').put()
-    _gen_bot_info('bot_quarantined', self.now, quarantined=True).put()
-    _gen_bot_info('bot_dead', self.now - datetime.timedelta(days=365)).put()
-    _gen_bot_info(
-        'bot_maintenance', self.now, state={'maintenance': True}).put()
-    bots_expected = {
-        'bot_ready': 'ready',
-        'bot_running': 'running',
-        'bot_quarantined': 'quarantined',
-        'bot_dead': 'dead',
-        'bot_maintenance': 'maintenance'
-    }
-
-    ts_mon_metrics.set_global_metrics('jobs')
-    ts_mon_metrics.set_global_metrics('executors')
-
-    jobs_fields = {
-        'project_id': 'test_project',
-        'subproject_id': 'test_subproject',
-        'pool': 'test_pool',
-        'spec_name': 'test_builder',
-    }
-    jobs_target_fields = dict(ts_mon_metrics._TARGET_FIELDS)
-    jobs_target_fields['hostname'] = 'autogen:test_bot1'
-
-    self.assertTrue(ts_mon_metrics._jobs_running.get(
-        fields=jobs_fields, target_fields=jobs_target_fields))
-    jobs_target_fields['hostname'] = 'autogen:test_bot2'
-    self.assertFalse(
-        ts_mon_metrics._jobs_running.get(
-            fields=jobs_fields, target_fields=jobs_target_fields))
-    jobs_fields['status'] = 'running'
-    self.assertEqual(
-        1,
-        ts_mon_metrics._jobs_active.get(
-            fields=jobs_fields, target_fields=ts_mon_metrics._TARGET_FIELDS))
-    jobs_fields['status'] = 'pending'
-    self.assertEqual(
-        2,
-        ts_mon_metrics._jobs_active.get(
-            fields=jobs_fields, target_fields=ts_mon_metrics._TARGET_FIELDS))
-
-    jobs_fields['device_type'] = 'some_device'
-    self.assertEqual(
-        900,
-        ts_mon_metrics._jobs_pending_durations.get(
-            fields=jobs_fields,
-            target_fields=ts_mon_metrics._TARGET_FIELDS).sum)
-    self.assertEqual(
-        600,
-        ts_mon_metrics._jobs_max_pending_duration.get(
-            fields=jobs_fields, target_fields=ts_mon_metrics._TARGET_FIELDS))
-
-    for bot_id, status in bots_expected.items():
-      target_fields = dict(ts_mon_metrics._TARGET_FIELDS)
-      target_fields['hostname'] = 'autogen:' + bot_id
-      self.assertEqual(
-          status,
-          ts_mon_metrics._executors_status.get(target_fields=target_fields))
-
-      self.assertEqual(
-          'bot_id:%s|os:Linux|os:Ubuntu' % bot_id,
-          ts_mon_metrics._executors_pool.get(target_fields=target_fields))
 
   def test_on_task_expired(self):
     tags = [
         'project:test_project',
         'slice_index:0',
+        'rbe:some/proj/some/inst',
     ]
-    fields = {'project_id': 'test_project'}
+    fields = {'project_id': 'test_project', 'rbe': 'some/proj/some/inst'}
     summary = _gen_task_result_summary(
         self.now,
         1,
@@ -318,20 +201,49 @@ class TestMetrics(test_case.TestCase):
         state=task_result.State.EXPIRED)
     to_run = _get_task_to_run(self.now, 1, 0, expiration_delay=1)
 
-    ts_mon_metrics.on_task_expired(summary, to_run)
+    ts_mon_metrics.on_task_expired(summary, to_run, 'reason')
     self.assertEqual(
         1,
         ts_mon_metrics._tasks_expiration_delay.get(fields=fields).sum)
     self.assertEqual(
         1,
         ts_mon_metrics._tasks_slice_expiration_delay.get(
-            fields=dict(fields, slice_index=0)).sum)
+            fields=dict(fields, slice_index=0, reason='reason')).sum)
+
+  def test_on_task_to_run_consumed(self):
+    tags = [
+        'project:test_project',
+        'subproject:test_subproject',
+        'pool:test_pool',
+        'buildername:test_builder',
+        'name:some_tests',
+        'rbe:some/proj/some/inst',
+    ]
+    fields = {
+        'project_id': 'test_project',
+        'subproject_id': 'test_subproject',
+        'pool': 'test_pool',
+        'rbe': 'some/proj/some/inst',
+        'spec_name': 'test_builder',
+    }
+
+    before = self.now - datetime.timedelta(seconds=5)
+    summary = _gen_task_result_summary(before,
+                                       1,
+                                       tags=tags,
+                                       state=task_result.State.PENDING)
+    to_run = _get_task_to_run(before, 1, 2)
+
+    ts_mon_metrics.on_task_to_run_consumed(summary, to_run)
+    self.assertEqual(
+        5000.0,
+        ts_mon_metrics._ttr_consume_latencies.get(fields=fields).sum)
 
   def test_on_task_status_change_scheduler_latency(self):
     tags = [
         'project:test_project', 'subproject:test_subproject', 'pool:test_pool',
         'buildername:test_builder', 'name:some_tests',
-        'build_is_experimental:true'
+        'build_is_experimental:true', 'device_type:some_device',
     ]
 
     summary = _gen_task_result_summary(self.now,
@@ -344,7 +256,9 @@ class TestMetrics(test_case.TestCase):
 
     fields = {
         'pool': 'test_pool',
-        'status': task_result.State.to_string(task_result.State.KILLED)
+        'spec_name': 'test_builder:experimental',
+        'status': task_result.State.to_string(task_result.State.KILLED),
+        'device_type': 'some_device',
     }
     self.assertEqual(
         1000,
@@ -355,7 +269,7 @@ class TestMetrics(test_case.TestCase):
     tags = [
         'project:test_project', 'subproject:test_subproject', 'pool:test_pool',
         'buildername:test_builder', 'name:some_tests',
-        'build_is_experimental:true'
+        'build_is_experimental:true', 'device_type:some_device',
     ]
     self.mock_now(self.now, 0)
     summary = _gen_task_result_summary(self.now,
@@ -369,7 +283,9 @@ class TestMetrics(test_case.TestCase):
     ts_mon_metrics.on_task_status_change_scheduler_latency(summary)
     fields = {
         'pool': 'test_pool',
-        'status': task_result.State.to_string(task_result.State.KILLED)
+        'spec_name': 'test_builder:experimental',
+        'status': task_result.State.to_string(task_result.State.KILLED),
+        'device_type': 'some_device',
     }
     self.assertEqual(
         0,
@@ -490,6 +406,24 @@ class TestMetrics(test_case.TestCase):
         100,
         ts_mon_metrics._task_state_change_pubsub_notify_latencies.get(
             fields=fields).sum)
+
+  def test_on_bot_dead_detection(self):
+    tags = [
+        'project:test_project',
+        'subproject:test_subproject',
+        'pool:test_pool',
+        'buildername:test_builder',
+        'name:some_tests',
+        'build_is_experimental:true',
+    ]
+    dead_after_ts = datetime.timedelta(seconds=1)
+    ts_mon_metrics.on_dead_task_detection_latency(tags, dead_after_ts, True)
+    self.assertEqual(
+        1000,
+        ts_mon_metrics._dead_task_detection_latencies.get(fields={
+            'pool': 'test_pool',
+            'cron': True,
+        }).sum)
 
 
 if __name__ == '__main__':

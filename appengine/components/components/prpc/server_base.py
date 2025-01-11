@@ -12,7 +12,7 @@ https://github.com/grpc/grpc/tree/master/src/python/grpcio/grpc
 
 import collections
 import logging
-import httplib
+import traceback
 
 from google.protobuf import symbol_database
 
@@ -51,26 +51,7 @@ class ServerBase(object):
   provides a simpler interface via add_service and get_routes.
   """
 
-  # pylint: disable=pointless-string-statement
-
-  _PRPC_TO_HTTP_STATUS = {
-      StatusCode.OK: httplib.OK,
-      StatusCode.CANCELLED: httplib.NO_CONTENT,
-      StatusCode.INVALID_ARGUMENT: httplib.BAD_REQUEST,
-      StatusCode.DEADLINE_EXCEEDED: httplib.SERVICE_UNAVAILABLE,
-      StatusCode.NOT_FOUND: httplib.NOT_FOUND,
-      StatusCode.ALREADY_EXISTS: httplib.CONFLICT,
-      StatusCode.PERMISSION_DENIED: httplib.FORBIDDEN,
-      StatusCode.RESOURCE_EXHAUSTED: httplib.SERVICE_UNAVAILABLE,
-      StatusCode.FAILED_PRECONDITION: httplib.PRECONDITION_FAILED,
-      StatusCode.OUT_OF_RANGE: httplib.BAD_REQUEST,
-      StatusCode.UNIMPLEMENTED: httplib.NOT_IMPLEMENTED,
-      StatusCode.INTERNAL: httplib.INTERNAL_SERVER_ERROR,
-      StatusCode.UNAVAILABLE: httplib.SERVICE_UNAVAILABLE,
-      StatusCode.UNAUTHENTICATED: httplib.UNAUTHORIZED,
-  }
-
-  def __init__(self, allow_cors=True, allowed_origins=None):
+  def __init__(self, allow_cors=True, allowed_origins=None, debug=False):
     """Initializes a new Server.
 
     Args:
@@ -78,6 +59,7 @@ class ServerBase(object):
       allowed_origins: optional collection of allowed origins. Only used
         when cors is allowed. If empty, all origins will be allowed, otherwise
         only listed origins will be allowed.
+      debug: if True, write exception tracebacks into the response body.
 
     """
     self._services = {}
@@ -86,6 +68,7 @@ class ServerBase(object):
     self.add_service(self._discovery_service)
     self.allow_cors = allow_cors
     self.allowed_origins = set(allowed_origins or [])
+    self.debug = debug
 
   def add_interceptor(self, interceptor):
     """Adds an interceptor to the interceptor chain.
@@ -194,8 +177,7 @@ class ServerBase(object):
       context._response_encoding = parsed_headers.accept
     except ValueError as e:
       logging.warning('Error parsing headers: %s', e)
-      context.set_code(StatusCode.INVALID_ARGUMENT)
-      context.set_details(e.message)
+      self._write_exc(context, StatusCode.INVALID_ARGUMENT, str(e))
       return None
 
     if service not in self._services:
@@ -221,8 +203,8 @@ class ServerBase(object):
 
     except Exception as e:
       logging.warning('Failed to decode request: %s', e, exc_info=True)
-      context.set_code(StatusCode.INVALID_ARGUMENT)
-      context.set_details('Error parsing request: %s' % e.message)
+      self._write_exc(context, StatusCode.INVALID_ARGUMENT,
+                      'Error parsing request: %s' % str(e))
       return None
 
     context._timeout = parsed_headers.timeout
@@ -245,8 +227,8 @@ class ServerBase(object):
                                         0)
     except Exception:
       logging.exception('Service implementation threw an exception')
-      context.set_code(StatusCode.INTERNAL)
-      context.set_details('Service implementation threw an exception')
+      self._write_exc(context, StatusCode.INTERNAL,
+                      'Service implementation threw an exception')
       return None
 
     if response is None:
@@ -266,11 +248,19 @@ class ServerBase(object):
       content = encoder(response)
     except Exception:
       logging.exception('Failed to encode response')
-      context.set_code(StatusCode.INTERNAL)
-      context.set_details('Error serializing response')
+      self._write_exc(context, StatusCode.INTERNAL,
+                      'Error serializing response')
       return None
 
     return content
+
+  def _write_exc(self, context, code, message):
+    """Populates `context` with error info and, potentially, traceback."""
+    context.set_code(code)
+    if self.debug:
+      context.set_details(message + '\n' + traceback.format_exc())
+    else:
+      context.set_details(message)
 
   def _options_handler(self, request, response):
     """Sends an empty response with CORS headers for origins, if allowed."""
@@ -309,8 +299,9 @@ class ServerBase(object):
       response.headers['Access-Control-Allow-Origin'] = origin
       response.headers['Vary'] = 'Origin'
       response.headers['Access-Control-Allow-Credentials'] = 'true'
-    self._response_body_and_status_writer(
-        response, status=self._PRPC_TO_HTTP_STATUS[context._code])
+    self._response_body_and_status_writer(response,
+                                          status=StatusCode.to_http_code(
+                                              context._code))
     response.headers['X-Prpc-Grpc-Code'] = str(context._code.value)
     response.headers['Access-Control-Expose-Headers'] = ('X-Prpc-Grpc-Code')
     response.headers['X-Content-Type-Options'] = 'nosniff'
@@ -326,7 +317,6 @@ class ServerBase(object):
       response.headers['Content-Type'] = 'text/plain; charset=utf-8'
       self._response_body_and_status_writer(response, body=context._details)
 
-  # pylint: disable=unused-argument
   def _response_body_and_status_writer(self, response, body=None, status=None):
     raise NotImplementedError(
         "response body and status writer must be implemented")

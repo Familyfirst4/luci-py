@@ -44,9 +44,15 @@ def run_tests_sequential():
       [abs_path('handlers_backend_test.py')],
       [abs_path('handlers_endpoints_test.py')],
       [abs_path('handlers_prpc_test.py')],
+      [abs_path('handlers_task_backend_test.py')],
+      [abs_path('message_conversion_prpc_test.py')],
       [abs_path('server/bot_groups_config_test.py')],
       [abs_path('server/resultdb_test.py')],
-      [abs_path('local_smoke_test.py')],
+      [abs_path('api_common_test.py')],
+      # This test is special. It does something to imports that breaks `nose`.
+      # For that reason it is named differently (not a *_test.py). That way
+      # `nose` completely skips it.
+      [abs_path('local_smoke_testing.py')],
   ]
 
   # execute test runner

@@ -9,6 +9,8 @@ implemented using the webapp2 framework.
 """
 
 import collections
+import json
+import logging
 import os
 
 import webapp2
@@ -20,9 +22,9 @@ import template
 from components import auth
 from components import utils
 from server import acl
-from server import bot_code
 from server import bot_groups_config
 from server import config
+from server import hmac_secret
 
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -149,8 +151,8 @@ class UIHandler(auth.AuthenticatingHandler):
 class WarmupHandler(webapp2.RequestHandler):
   def get(self):
     auth.warmup()
-    bot_code.get_swarming_bot_zip(self.request.host_url)
     bot_groups_config.warmup()
+    hmac_secret.warmup()
     utils.get_module_version_list(None, None)
     self.response.headers['Content-Type'] = 'text/plain; charset=utf-8'
     self.response.write('ok')
@@ -162,10 +164,18 @@ class EmailHandler(webapp2.RequestHandler):
     pass
 
 
+class TempTQPlaceholderHandler(webapp2.RequestHandler):
+  def post(self, title):
+    logging.info('Task %s:\n%r', title, json.loads(self.request.body))
+
+
 def get_routes():
   routes = [
       ('/_ah/mail/<to:.+>', EmailHandler),
       ('/_ah/warmup', WarmupHandler),
+
+      # TODO(vadimsh): This is temporary until there's a Go handler.
+      ('/internal/tasks/t/rbe-enqueue/<title:.+>', TempTQPlaceholderHandler),
   ]
 
   if not utils.should_disable_ui_routes():

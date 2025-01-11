@@ -64,29 +64,31 @@ Graph of schema:
     +---------------+     +---------------+
 """
 
-import collections
 import datetime
 import logging
-import random
-import re
 
-from google.appengine import runtime
-from google.appengine.api import app_identity
 from google.appengine.api import datastore_errors
 from google.appengine.datastore import datastore_query
 from google.appengine.ext import ndb
-from google.protobuf import json_format
 
+from components import auth
 from components import datastore_utils
-from components import pubsub
 from components import utils
 from proto.api import swarming_pb2  # pylint: disable=no-name-in-module
-from server import bq_state
 from server import large
 from server import resultdb
 from server import task_pack
 from server import task_request
 from server.constants import OR_DIM_SEP
+
+# These are the fields which we are allowed to sort TaskRunResult by.
+# They are the only states which have a composite index with bot_id field.
+_BOT_TASK_ALLOWED_SORTS = {'created_ts', 'started_ts', 'completed_ts'}
+# These states are not allowed to be used to filter TaskRunResult.
+# - pending is an invalid state for a task_run_result. See _validate_not_pending
+# - pending_running is either the pending state (invalid) or running.
+# - deduped relies on try_number which is not part of `task_run_result`.
+_BOT_TASK_DISALLOWED_STATES = {'pending', 'pending_running', 'deduped'}
 
 
 class State(object):
@@ -107,16 +109,17 @@ class State(object):
   COMPLETED = 0x70  # 112
   KILLED = 0x80  # 128
   NO_RESOURCE = 0x100  # 256
+  CLIENT_ERROR = 0x200  # 512
 
   STATES = (RUNNING, PENDING, EXPIRED, TIMED_OUT, BOT_DIED, CANCELED, COMPLETED,
-            KILLED, NO_RESOURCE)
+            KILLED, NO_RESOURCE, CLIENT_ERROR)
   # State will mutate again. Anything else means not queued, not running.
   STATES_RUNNING = (RUNNING, PENDING)
   # Abnormal termination.
-  STATES_EXCEPTIONAL = (
-      EXPIRED, TIMED_OUT, BOT_DIED, CANCELED, KILLED, NO_RESOURCE)
+  STATES_EXCEPTIONAL = (EXPIRED, TIMED_OUT, BOT_DIED, CANCELED, KILLED,
+                        NO_RESOURCE, CLIENT_ERROR)
   # Task ran and is done running.
-  STATES_DONE = (TIMED_OUT, COMPLETED, KILLED)
+  STATES_DONE = (TIMED_OUT, COMPLETED, KILLED, CLIENT_ERROR)
   # Task didn't run (except for BOT_DIED, which may or may not have run).
   STATES_ABANDONED = (EXPIRED, BOT_DIED, CANCELED, NO_RESOURCE)
 
@@ -130,6 +133,7 @@ class State(object):
       COMPLETED: 'Completed',
       KILLED: 'Killed',
       NO_RESOURCE: 'No resource available',
+      CLIENT_ERROR: 'Client error',
   }
 
   @classmethod
@@ -143,13 +147,11 @@ class State(object):
 class StateProperty(ndb.IntegerProperty):
   """State of a single task as a model property."""
   def __init__(self, **kwargs):
-    # pylint: disable=E1002
     super(StateProperty, self).__init__(choices=State.STATES, **kwargs)
 
 
 def _validate_not_pending(prop, value):
   if value == State.PENDING:
-    # pylint: disable=W0212
     raise datastore_errors.BadValueError('%s cannot be PENDING' % prop._name)
 
 
@@ -165,7 +167,6 @@ class LargeIntegerArray(ndb.BlobProperty):
   """Contains a large integer array as compressed by large."""
 
   def __init__(self, **kwargs):
-    # pylint: disable=E1002
     super(LargeIntegerArray, self).__init__(
         indexed=False, compressed=False, **kwargs)
 
@@ -484,24 +485,23 @@ class _TaskResultCommon(ndb.Model):
   TODO(maruel): Overhaul this entity:
   - Get rid of TaskOutput as it is not needed anymore (?)
   """
-  # Bot that ran this task.
-  bot_id = ndb.StringProperty()
-
   # Bot version (as a hash) of the code running the task.
-  bot_version = ndb.StringProperty()
+  bot_version = ndb.StringProperty(indexed=False)
 
   # Bot dimensions at the moment the bot reaped the task. Not set for old tasks.
-  bot_dimensions = datastore_utils.DeterministicJsonProperty(
-      json_type=dict, compressed=True)
+  bot_dimensions = datastore_utils.DeterministicJsonProperty(json_type=dict)
 
   # Time when the bot becomes available. This will be used to calculate
   # overhead.
   bot_idle_since_ts = ndb.DateTimeProperty(indexed=False)
 
+  # The cloud project id where the bot saves its logs.
+  bot_logs_cloud_project = ndb.StringProperty(indexed=False)
+
   # Active server version(s). Note that during execution, the active server
   # version may have changed, this list will list all versions seen as the task
   # was updated.
-  server_versions = ndb.StringProperty(repeated=True)
+  server_versions = ndb.StringProperty(indexed=False, repeated=True)
 
   # This entity is updated everytime the bot sends data so it is equivalent to
   # 'last_ping'.
@@ -509,11 +509,13 @@ class _TaskResultCommon(ndb.Model):
 
   # Records that the task failed, e.g. one process had a non-zero exit code. The
   # task may be retried if desired to weed out flakiness.
+  #
+  # The index is used in task listing queries to filter by failure.
   failure = ndb.ComputedProperty(_calculate_failure)
 
   # Internal infrastructure failure, in which case the task should be retried
   # automatically if possible.
-  internal_failure = ndb.BooleanProperty(default=False)
+  internal_failure = ndb.BooleanProperty(indexed=False, default=False)
 
   # Number of TaskOutputChunk entities for the output.
   stdout_chunks = ndb.IntegerProperty(indexed=False)
@@ -527,22 +529,24 @@ class _TaskResultCommon(ndb.Model):
   duration = ndb.FloatProperty(indexed=False, name='durations')
 
   # Time when a bot reaped this task.
+  #
+  # The index is used in task listing queries to order by this property.
   started_ts = ndb.DateTimeProperty()
 
   # Time when the task was not considered for execution anymore, or the bot
   # completed its execution.
   #
-  # For old entities prior to 2019-02-01, this value can be unset.
+  # The index is used in a bunch of places:
+  #   1. In task listing queries to order by this property.
+  #   2. In crashed bot detection to list still pending or running tasks.
+  #   3. In BQ export pagination.
   completed_ts = ndb.DateTimeProperty()
+
   # Set when a task had an internal failure, timed out or was killed by a client
   # request.
+  #
+  # The index is used in task listing queries to order by this property.
   abandoned_ts = ndb.DateTimeProperty()
-
-  # Children tasks that were triggered by this task. This is set when the task
-  # reentrantly creates other Swarming tasks. Note that the task_id is to a
-  # TaskResultSummary.
-  children_task_ids = ndb.StringProperty(
-      validator=_validate_task_summary_id, repeated=True)
 
   # DEPRECATED. Isolate server is being migrated to RBE-CAS. cas_output_ref will
   # be used instead.
@@ -556,6 +560,14 @@ class _TaskResultCommon(ndb.Model):
 
   # The pinned versions of all the CIPD packages used in the task.
   cipd_pins = ndb.LocalStructuredProperty(CipdPins)
+
+  # Reported missing CIPD packages on CLIENT_ERROR state
+  missing_cipd = ndb.LocalStructuredProperty(task_request.CipdPackage,
+                                             repeated=True)
+
+  # Reported missing CAS packages on CLIENT_ERROR state
+  missing_cas = ndb.LocalStructuredProperty(task_request.CASReference,
+                                            repeated=True)
 
   # Index in the TaskRequest.task_slices that this entity is current waiting on,
   # running or ran.
@@ -736,6 +748,8 @@ class _TaskResultCommon(ndb.Model):
       return swarming_pb2.CANCELED
     if self.state == State.NO_RESOURCE:
       return swarming_pb2.NO_RESOURCE
+    if self.state == State.CLIENT_ERROR:
+      return swarming_pb2.CLIENT_ERROR
     # Internal error.
     return swarming_pb2.TASK_STATE_INVALID
 
@@ -788,7 +802,6 @@ class _TaskResultCommon(ndb.Model):
         elif key == u'pool':
           out.bot.pools.extend(values)
     out.server_versions.extend(self.server_versions)
-    out.children_task_ids.extend(self.children_task_ids)
     if self.deduped_from:
       out.deduped_from = self.deduped_from
     key = self.result_summary_key
@@ -821,8 +834,9 @@ class _TaskResultCommon(ndb.Model):
     if self.cas_output_root:
       self.cas_output_root.to_proto(out.cas_output_root)
 
-  def signal_server_version(self, server_version):
-    """Adds `server_version` to self.server_versions if relevant."""
+  def signal_server_version(self):
+    """Adds the current version to self.server_versions."""
+    server_version = utils.get_app_version()
     if not self.server_versions or self.server_versions[-1] != server_version:
       self.server_versions.append(server_version)
 
@@ -895,7 +909,7 @@ class _TaskResultCommon(ndb.Model):
           raise datastore_errors.BadValueError(
               'exit_code must be set with state %s' %
               State.to_string(self.state))
-    elif self.state != State.BOT_DIED:
+    elif self.state != State.BOT_DIED and self.state != State.CLIENT_ERROR:
       # Allow duration and exit_code to be either missing or set for BOT_DIED,
       # but they should be not present for any running/pending states.
       if self.duration is not None:
@@ -931,9 +945,6 @@ class _TaskResultCommon(ndb.Model):
         raise datastore_errors.BadValueError(
             'failure can\'t be True on deduped task %s' % self.deduped_from)
 
-    self.children_task_ids = sorted(
-        set(self.children_task_ids), key=lambda x: int(x, 16))
-
   @classmethod
   def _properties_fixed(cls):
     """Returns all properties with their member name, excluding computed
@@ -957,7 +968,14 @@ class TaskRunResult(_TaskResultCommon):
   Existence of this entity means a bot requested a task and started executing
   it. Everything beside created_ts and bot_id can be modified.
   """
+  # Bot that ran this task.
+  #
+  # The index is used in task listing queries to filter by a specific bot.
+  bot_id = ndb.StringProperty()
+
   # Current state of this task.
+  #
+  # The index is used in task listing queries to filter by state.
   state = StateProperty(default=State.RUNNING, validator=_validate_not_pending)
 
   # Effective cost of this task.
@@ -967,6 +985,15 @@ class TaskRunResult(_TaskResultCommon):
   # KILLED. It is set to true only for the time between the user request and
   # this task to be set to state == KILLED.
   killing = ndb.BooleanProperty(indexed=False)
+
+  # Copied from TaskRequest.
+  request_created = ndb.DateTimeProperty(indexed=False)
+  # Copied from TaskRequest.
+  request_tags = ndb.StringProperty(indexed=False, repeated=True)
+  # Copied from TaskRequest.
+  request_name = ndb.StringProperty(indexed=False)
+  # Copied from TaskRequest.
+  request_user = ndb.StringProperty(indexed=False)
 
   # A task run execution can't by definition save any cost.
   cost_saved_usd = None
@@ -980,11 +1007,17 @@ class TaskRunResult(_TaskResultCommon):
   # if a bot has not sent an update after this time while running the task,
   # it is considered dead. It is set after every ping from the bot if the
   # task is RUNNING and set to None once the task terminates.
-  dead_after_ts = ndb.DateTimeProperty()
+  dead_after_ts = ndb.DateTimeProperty(indexed=False)
 
   @property
   def created_ts(self):
-    return self.request.created_ts
+    # Use the copied property if available (it is missing for older entities),
+    # then fallback to fetching it from the TaskRequest (self.request is
+    # secretly making a datastore get).
+    #
+    # TODO: To remove the fallback, either wait until ~2026 for all old entities
+    # to naturally expire, or run a backfill job to populate old entities.
+    return self.request_created or self.request.created_ts
 
   @property
   def performance_stats_key(self):
@@ -992,7 +1025,8 @@ class TaskRunResult(_TaskResultCommon):
 
   @property
   def name(self):
-    return self.request.name
+    # See the comment in created_ts.
+    return self.request_name or self.request.name
 
   @property
   def request_key(self):
@@ -1030,8 +1064,13 @@ class TaskRunResult(_TaskResultCommon):
     assert self.stdout_chunks <= TaskOutput.PUT_MAX_CHUNKS
     return entities
 
-  def to_dict(self):
-    out = super(TaskRunResult, self).to_dict()
+  def to_dict(self, **kwargs):
+    out = super(TaskRunResult, self).to_dict(exclude=[
+        'request_created',
+        'request_tags',
+        'request_name',
+        'request_user',
+    ])
     out['try_number'] = self.try_number
     return out
 
@@ -1057,16 +1096,29 @@ class TaskResultSummary(_TaskResultCommon):
   It's primary purpose is for status pages listing all the active tasks or
   recently completed tasks.
   """
-  # These properties are directly copied from TaskRequest. They are only copied
-  # here to simplify searches with the Web UI and to enable DB queries based on
-  # both user and results properties (e.g. all requests from X which succeeded).
-  # They are immutable.
-  # TODO(maruel): Investigate what is worth copying over.
-  created_ts = ndb.DateTimeProperty(required=True)
-  name = ndb.StringProperty()
-  user = ndb.StringProperty()
+  # When the task was submitted.
+  created_ts = ndb.DateTimeProperty(indexed=False, required=True)
+
+  # All task tags, copied from TaskRequest.
+  #
+  # The index is used in global task listing queries to filter by.
   tags = ndb.StringProperty(repeated=True)
+
+  # Copied from TaskRequest.
+  name = ndb.StringProperty(indexed=False)
+  # Copied from TaskRequest.
+  user = ndb.StringProperty(indexed=False)
+
+  # Copied from TaskRequest.
   priority = ndb.IntegerProperty(indexed=False)
+  # Copied from TaskRequest.
+  request_authenticated = auth.IdentityProperty(indexed=False, required=False)
+  # Copied from TaskRequest.
+  request_realm = ndb.StringProperty(indexed=False, required=False)
+  # Extracted from dimensions in TaskRequest.
+  request_pool = ndb.StringProperty(indexed=False, required=False)
+  # Extracted from dimensions in TaskRequest.
+  request_bot_id = ndb.StringProperty(indexed=False, required=False)
 
   # Value of TaskRequest.properties.properties_hash only when these conditions
   # are met:
@@ -1074,13 +1126,28 @@ class TaskResultSummary(_TaskResultCommon):
   # - self.state == State.COMPLETED
   # - self.failure == False
   # - self.internal_failure == False
+  #
+  # The index is used to find duplicate tasks.
   properties_hash = ndb.BlobProperty(indexed=True)
 
+  # Bot that ran this task.
+  bot_id = ndb.StringProperty(indexed=False)
+
   # State of this task. The value from TaskRunResult will be copied over.
+  #
+  # The index is used in task listing queries to filter by state.
   state = StateProperty(default=State.PENDING)
 
-  # Represent the last try attempt of the task. Starts at 1 EXCEPT when the
-  # results were deduped, in this case it's 0.
+  # Possible values:
+  #   None: if the task is still pending, has expired or was canceled.
+  #   1: if the task was assigned to a bot and either currently runs or has
+  #      finished or crashed already.
+  #   0: if the task was dedupped.
+  #
+  # This field is left over from when swarming had internal retries.
+  # See https://crbug.com/1065101
+  #
+  # The index is used in global task listing queries to find dedupped tasks.
   try_number = ndb.IntegerProperty()
 
   # Effective cost of this task for each try. Use self.cost_usd for the sum.
@@ -1102,6 +1169,12 @@ class TaskResultSummary(_TaskResultCommon):
   deduped_from = ndb.StringProperty(indexed=False)
 
   # Delay from TaskRequest.expiratoin_ts to the actual expired time.
+  #
+  # This is set at expiration process if the last task slice expired by reaching
+  # its deadline. Unset if the last slice expired because there were no bots
+  # that could run it.
+  #
+  # Exclusively for monitoring.
   expiration_delay = ndb.FloatProperty(indexed=False)
 
   # Previous state, will be set in _pre_put_hook and compared in _post_pre_hook
@@ -1137,8 +1210,7 @@ class TaskResultSummary(_TaskResultCommon):
 
     if not self.try_number:
       return None
-    return task_pack.result_summary_key_to_run_result_key(
-        self.key, self.try_number)
+    return task_pack.result_summary_key_to_run_result_key(self.key)
 
   @property
   def task_id(self):
@@ -1156,7 +1228,7 @@ class TaskResultSummary(_TaskResultCommon):
     if self.state in State.STATES_RUNNING:
       return
     # Don't use process cache to retrieve the original object
-    orig = self.key.get(use_cache=False)
+    orig = self.key.get(use_cache=False, use_memcache=False)
     if not orig:
       return
     self._prev_state = orig.state
@@ -1181,7 +1253,7 @@ class TaskResultSummary(_TaskResultCommon):
 
     if self.request.resultdb_update_token:
       run_id = task_pack.pack_run_result_key(
-          task_pack.result_summary_key_to_run_result_key(self.key, 1))
+          task_pack.result_summary_key_to_run_result_key(self.key))
       # TODO(crbug.com/1065139): remove get_result() if ndb.toplevel works fine.
       resultdb.finalize_invocation_async(
           run_id, self.request.resultdb_update_token).get_result()
@@ -1201,7 +1273,7 @@ class TaskResultSummary(_TaskResultCommon):
         '_send_job_completed_metric: '
         'Task completed. prev_state:"%s", current_state:"%s".\n'
         'Sending metric...', prev_state, State.to_string(self.state))
-    import ts_mon_metrics
+    import ts_mon_metrics  # pylint: disable=cyclic-import
     ts_mon_metrics.on_task_completed(self)
 
   def reset_to_pending(self):
@@ -1224,18 +1296,24 @@ class TaskResultSummary(_TaskResultCommon):
     assert ndb.in_transaction()
     assert isinstance(request, task_request.TaskRequest), request
     assert isinstance(run_result, TaskRunResult), run_result
+
+    # Copy all fields defined through shared _TaskResultCommon.
     for property_name in _TaskResultCommon._properties_fixed():
       setattr(self, property_name, getattr(run_result, property_name))
-    # Include explicit support for 'state' and 'try_number'. TaskRunResult.state
-    # is a ComputedProperty so it can't be copied as-is, and try_number is a
-    # generated property.
-    # pylint: disable=W0201
+
+    # Copy fields that are defined separately in TaskRunResult and
+    # TaskResultSummary. They have slightly different types.
+    self.bot_id = run_result.bot_id
     self.state = run_result.state
     self.try_number = run_result.try_number
+    self.missing_cas = run_result.missing_cas
+    self.missing_cipd = run_result.missing_cipd
 
-    while len(self.costs_usd) < run_result.try_number:
-      self.costs_usd.append(0.)
-    self.costs_usd[run_result.try_number-1] = run_result.cost_usd
+    # try_number == 0 implies dedup so set cost to 0.
+    if run_result.try_number == 0:
+      self.costs_usd = [0.]
+    else:
+      self.costs_usd = [run_result.cost_usd]
 
     # Update the automatic tags, removing the ones from the other
     # TaskProperties.
@@ -1250,32 +1328,9 @@ class TaskResultSummary(_TaskResultCommon):
         not self.deduped_from):
       # Signal the results are valid and can be reused. If the request has a
       # SecretBytes, it is GET, which is a performance concern.
-      self.properties_hash = t.properties_hash(request)
+      self.properties_hash = t.get_properties_hash(request)
 
-  def need_update_from_run_result(self, run_result):
-    """Returns True if set_from_run_result() would modify this instance.
-
-    E.g. they are different and TaskResultSummary needs to be updated from the
-    corresponding TaskRunResult.
-    """
-    assert isinstance(run_result, TaskRunResult), run_result
-    # A previous try is still sending update. Ignore it from a result summary
-    # PoV.
-    if self.try_number and self.try_number > run_result.try_number:
-      return False
-
-    for property_name in _TaskResultCommon._properties_fixed():
-      if getattr(self, property_name) != getattr(run_result, property_name):
-        return True
-    # Include explicit support for 'state' and 'try_number'. TaskRunResult.state
-    # is a ComputedProperty so it can't be copied as-is, and try_number is a
-    # generated property.
-    # pylint: disable=W0201
-    return (
-        self.state != run_result.state or
-        self.try_number != run_result.try_number)
-
-  def to_dict(self):
+  def to_dict(self, **kwargs):
     return super(TaskResultSummary, self).to_dict(exclude=['properties_hash'])
 
 
@@ -1373,12 +1428,12 @@ def _output_append(output_key, number_chunks, output, output_chunk_start):
       # If the gap overlaps the chunk being written, strip it. Cases:
       #   Gap:     |   |
       #   Chunk: |   |
-      if start <= gap_start <= end and end <= gap_end:
+      if start <= gap_start <= end <= gap_end:
         gap_start = end
 
       #   Gap:     |   |
       #   Chunk:     |   |
-      if gap_start <= start and start <= gap_end <= end:
+      if gap_start <= start <= gap_end <= end:
         gap_end = start
 
       #   Gap:       |  |
@@ -1485,6 +1540,9 @@ def filter_query(cls, q, start, end, sort, state):
   if state == 'bot_died':
     return q.filter(cls.state == State.BOT_DIED)
 
+  if state == 'client_error':
+    return q.filter(cls.state == State.CLIENT_ERROR)
+
   if state == 'canceled':
     return q.filter(cls.state == State.CANCELED)
 
@@ -1494,7 +1552,7 @@ def filter_query(cls, q, start, end, sort, state):
   if state == 'no_resource':
     return q.filter(cls.state == State.NO_RESOURCE)
 
-  raise ValueError('Invalid state')
+  raise ValueError('Invalid state %s' % state)
 
 
 def state_to_string(state_obj):
@@ -1514,17 +1572,21 @@ def new_result_summary(request):
 
   The caller must save it in the DB.
   """
-  return TaskResultSummary(
-      key=task_pack.request_key_to_result_summary_key(request.key),
-      created_ts=request.created_ts,
-      name=request.name,
-      server_versions=[utils.get_app_version()],
-      user=request.user,
-      tags=request.tags,
-      priority=request.priority)
+  key = task_pack.request_key_to_result_summary_key(request.key)
+  return TaskResultSummary(key=key,
+                           created_ts=request.created_ts,
+                           name=request.name,
+                           server_versions=[utils.get_app_version()],
+                           user=request.user,
+                           tags=request.tags,
+                           priority=request.priority,
+                           request_authenticated=request.authenticated,
+                           request_realm=request.realm,
+                           request_pool=request.pool,
+                           request_bot_id=request.bot_id)
 
 
-def new_run_result(request, to_run, bot_id, bot_version, bot_dimensions,
+def new_run_result(request, to_run, bot_id, bot_details, bot_dimensions,
                    resultdb_info):
   """Returns a new TaskRunResult for a TaskRequest.
 
@@ -1535,12 +1597,16 @@ def new_run_result(request, to_run, bot_id, bot_version, bot_dimensions,
   assert isinstance(request, task_request.TaskRequest)
   summary_key = task_pack.request_key_to_result_summary_key(request.key)
   return TaskRunResult(
-      key=task_pack.result_summary_key_to_run_result_key(
-          summary_key, to_run.try_number),
+      key=task_pack.result_summary_key_to_run_result_key(summary_key),
       bot_dimensions=bot_dimensions,
       bot_id=bot_id,
-      bot_version=bot_version,
+      bot_version=bot_details.bot_version,
+      bot_logs_cloud_project=bot_details.logs_cloud_project,
       resultdb_info=resultdb_info,
+      request_created=request.created_ts,
+      request_tags=request.tags,
+      request_name=request.name,
+      request_user=request.user,
       current_task_slice=to_run.task_slice_index,
       server_versions=[utils.get_app_version()])
 
@@ -1551,16 +1617,7 @@ def yield_result_summary_by_parent_task_id(parent_task_id):
   for request_key in q:
     result_summary_key = (
         task_pack.request_key_to_result_summary_key(request_key))
-    yield result_summary_key.get()
-
-
-def yield_active_run_result_keys():
-  """Yields all the TaskRunResult ndb.Key of running tasks.
-
-  In practice it is returning a ndb.QueryIterator but this is equivalent.
-  """
-  q = TaskRunResult.query(TaskRunResult.completed_ts == None)
-  return q.iter(keys_only=True)
+    yield result_summary_key.get(use_cache=False, use_memcache=False)
 
 
 def get_run_results_query(start, end, sort, state, bot_id):
@@ -1573,9 +1630,20 @@ def get_run_results_query(start, end, sort, state, bot_id):
         be used along start and end.
     state: One of State enum value as str. Use 'all' to get all tasks.
     bot_id: (required) bot id to filter on.
+
+  Raises:
+    ValueError: If the sort or state filter is not valid.
   """
   if not bot_id:
     raise ValueError('bot_id is required')
+  # Check is required since there is only a composite
+  # index for bot_id for created_ts, started_ts and completed_ts
+  if sort not in _BOT_TASK_ALLOWED_SORTS:
+    raise ValueError('invalid sort %s' % sort)
+
+  # TODO(jonahhooper) improve proto docs for this specific route.
+  if state in _BOT_TASK_DISALLOWED_STATES:
+    raise ValueError("invalid state %s" % state)
   # Disable the in-process local cache. This is important, as there can be up to
   # a thousand entities loaded in memory, and this is a pure memory leak, as
   # there's no chance this specific instance will need these again, therefore
@@ -1614,120 +1682,25 @@ def get_result_summaries_query(start, end, sort, state, tags):
       if len(parts) != 2 or any(i.strip() != i or not i for i in parts):
         raise ValueError('Invalid tags')
       values = parts[1].split(OR_DIM_SEP)
+      if len(values) > 1:
+        logging.info('OR_TAG_QUERY: %s', tag)
       separated_tags = ['%s:%s' % (parts[0], v) for v in values]
       q = q.filter(TaskResultSummary.tags.IN(separated_tags))
 
   return filter_query(TaskResultSummary, q, start, end, sort, state)
 
 
-def task_bq_run(start, end):
-  """Sends TaskRunResult to BigQuery swarming.task_results_run table.
-
-  Multiple queries are run one after the other. This is because ndb.OR() cannot
-  be used when the subqueries are inequalities on different fields.
-  """
-  def _convert(e):
-    """Returns a tuple(bq_key, row)."""
-    out = swarming_pb2.TaskResult()
-    e.to_proto(out, append_root_ids=True)
-    return (e.task_id, out)
-
-  total = 0
-  seen = set()
-
-  # Completed
-  q = TaskRunResult.query(
-      TaskRunResult.completed_ts >= start,
-      TaskRunResult.completed_ts <= end,
-      # Disable cache for consistency.
-      default_options=ndb.QueryOptions(use_cache=False, use_memcache=False))
-  cursor = None
-  more = True
-  while more:
-    entities, cursor, more = q.fetch_page(
-        bq_state.RAW_LIMIT, start_cursor=cursor)
-    rows = [_convert(e) for e in entities]
-    seen.update(e.task_id for e in entities)
-    total += len(rows)
-    bq_state.send_to_bq('task_results_run', rows)
-    if rows:
-      pubsub.publish_multi(
-          'projects/%s/topics/task_results_run' %
-          (app_identity.get_application_id()), ((json_format.MessageToJson(
-              result, preserving_proto_field_name=True), None)
-                                                for _task_id, result in rows))
-  return total
-
-
-def task_bq_summary(start, end):
-  """Sends TaskResultSummary to BigQuery swarming.task_results_summary table.
-
-  Multiple queries are run one after the other. This is because ndb.OR() cannot
-  be used when the subqueries are inequalities on different fields.
-  """
-  def _convert(e):
-    """Returns a tuple(bq_key, row)."""
-    out = swarming_pb2.TaskResult()
-    e.to_proto(out, append_root_ids=True)
-    if not out.HasField('end_time'):
-      logging.warning('crbug.com/1064833: task %s does not have end_time %s',
-                      e.task_id, out)
-    return (e.task_id, out)
-
-  total = 0
-  seen = set()
-
-  # Completed
-  q = TaskResultSummary.query(
-      TaskResultSummary.completed_ts >= start,
-      TaskResultSummary.completed_ts <= end,
-      # Disable cache for consistency.
-      default_options=ndb.QueryOptions(use_cache=False, use_memcache=False))
-  cursor = None
-  more = True
-  while more:
-    entities, cursor, more = q.fetch_page(
-        bq_state.RAW_LIMIT, start_cursor=cursor)
-    rows = [_convert(e) for e in entities]
-    seen.update(e.task_id for e in entities)
-    total += len(rows)
-    bq_state.send_to_bq('task_results_summary', rows)
-    if rows:
-      pubsub.publish_multi(
-          'projects/%s/topics/task_results_summary' %
-          (app_identity.get_application_id()), ((json_format.MessageToJson(
-              summary, preserving_proto_field_name=True), None)
-                                                for _task_id, summary in rows))
-
-  return total
-
-
 def fetch_task_results(task_ids):
-  # type: (Sequence[str]) ->
-  #     Sequence[Union[task_result._TaskResultCommon, None]]
   """Returns the task results for the given tasks in the same order.
 
   Raises:
     ValueError if any task_id is in an unexpected format.
   """
-  result_keys = [
+  return fetch_task_result_summaries([
       task_pack.get_request_and_result_keys(task_id)[1] for task_id in task_ids
-  ]
+  ])
 
-  # Hot path. Fetch everything we can from memcache.
-  task_results = ndb.get_multi(result_keys, use_datastore=False)
 
-  # Fetch ones in a non-stable state or not in memcache.
-  missing_keys = [
-      result_keys[i]
-      for i, result in enumerate(task_results)
-      if result is None or result.state in State.STATES_RUNNING
-  ]
-  if missing_keys:
-    more_results = ndb.get_multi(
-        missing_keys, use_cache=False, use_memcache=False)
-    for i, result in enumerate(task_results):
-      if result is None or result.state in State.STATES_RUNNING:
-        task_results[i] = more_results.pop(0)
-
-  return task_results
+def fetch_task_result_summaries(keys):
+  """Fetches a bunch of TaskResultSummary given their keys."""
+  return ndb.get_multi(keys, use_cache=False, use_memcache=False)

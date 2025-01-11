@@ -3,7 +3,9 @@
 # that can be found in the LICENSE file.
 """Functions that do common acl checking/processing on internal ndb objects."""
 
+import bisect
 import datetime
+import itertools
 import logging
 import re
 
@@ -16,6 +18,7 @@ import handlers_exceptions
 from server import acl
 from server import config
 from server import pools_config
+from server import rbe
 from server import realms
 from server import service_accounts
 from server import service_accounts_utils
@@ -36,6 +39,15 @@ def process_task_request(tr, template_apply):
     auth.AuthorizationError: if a realms action is not allowed.
   """
 
+  # Refuse tags reserved for internal use. They can only be set by Swarming
+  # itself. These are tags that have any inherent magical meaning that some
+  # other parts of Swarming rely on.
+  for tag in itertools.chain(tr.manual_tags, tr.tags):
+    if task_request.is_reserved_tag(tag):
+      raise handlers_exceptions.BadRequestException(
+          'Tag %s is reserved for internal use and can\'t be assigned manually'
+          % tag)
+
   try:
     task_request.init_new_request(tr, acl.can_schedule_high_priority_tasks(),
                                   template_apply)
@@ -50,6 +62,21 @@ def process_task_request(tr, template_apply):
     logging.warning('Pool "%s" is not in pools.cfg', tr.pool)
     raise handlers_exceptions.PermissionException(
         'No such pool or no permission to use it: %s' % tr.pool)
+
+  # Use the scheduling algorithm configured for the pool.
+  assert pool_cfg.scheduling_algorithm is not None
+  tr.scheduling_algorithm = pool_cfg.scheduling_algorithm
+
+  # Decide if the task should use the RBE Scheduler.
+  tr.rbe_instance = rbe.get_rbe_instance_for_task(tr.tags, pool_cfg)
+  if tr.rbe_instance:
+    logging.info('RBE: scheduling through %s', tr.rbe_instance)
+
+  # For tasks in pools that have the RBE config, add an extra tag useful to see
+  # what tasks are *actually* scheduled through RBE. Note that init_new_request
+  # sorted tags already.
+  if pool_cfg.rbe_migration and pool_cfg.rbe_migration.rbe_instance:
+    bisect.insort(tr.tags, u'rbe:%s' % (tr.rbe_instance or 'none'))
 
   # TODO(crbug.com/1109378): Check ACLs before calling init_new_request to
   # avoid leaking information about pool templates to unauthorized callers.
@@ -135,24 +162,48 @@ def cache_request(namespace, request_uuid, func):
   return result, False
 
 
-def validate_backend_configs(configs):
-  # type: (Sequence[swarming_bb_pb2.SwarmingBackendConfig]) ->
+def validate_backend_configs(configs, full_validation=False):
+  # type: (Sequence[swarming_pb2.SwarmingTaskBackendConfig], Bool) ->
   #     Sequence[Tuple[int, str]]
   """Checks the validity of each config.
 
-    Returns a tuple of (i, error_message) where i is the index of the
-    config that has the error.
+  This function will be called to validate the configs sent to ValidateConfig
+  and the config sent by RunTask. The two require different validation.
+
+  For the config provided in RunTask, the following fields are required:
+    - agent_binary_cipd_filename
+    - agent_binary_cipd_pkg
+    - agent_binary_cipd_vers
+    - bot_ping_tolerance
+    - priority
+    - tags
+
+  When validating configs sent to ValidateConfig, some fields (like
+  agent_binary_cipd fields) are not available since they are added to the config
+  when the buildbucket build is created. Thus we only need to validate fields
+  that are provided in the config, meaning that an empty config will return
+  without errors.
+
+    Args
+      configs: The configs that need to be validated.
+      full_validation: (optional) If set True, the above mentioned fields
+        will be required to be validated.
+    Return
+      A tuple of (i, error_message) where i is the index of the
+      config that has the error.
   """
   errors = []  # type: Sequence[Tuple[int, str]]
   for i, cfg in enumerate(configs):
     try:
-      task_request.validate_priority(cfg.priority)
+      if cfg.priority or full_validation:
+        task_request.validate_priority(cfg.priority)
     except (datastore_errors.BadValueError, TypeError) as e:
       errors.append((i, e.message))
 
     try:
-      task_request.validate_ping_tolerance(
-          'bot_ping_tolerance', cfg.bot_ping_tolerance)
+      if cfg.bot_ping_tolerance or full_validation:
+        task_request.validate_ping_tolerance('bot_ping_tolerance',
+                                             cfg.bot_ping_tolerance)
     except datastore_errors.BadValueError as e:
       errors.append((i, e.message))
 
@@ -170,18 +221,24 @@ def validate_backend_configs(configs):
         errors.append((i, e.message))
 
     try:
-      task_request.validate_package_name_template(
-          'agent_binary_cipd_pkg', cfg.agent_binary_cipd_pkg)
+      if cfg.agent_binary_cipd_pkg or full_validation:
+        task_request.validate_package_name_template('agent_binary_cipd_pkg',
+                                                    cfg.agent_binary_cipd_pkg)
     except datastore_errors.BadValueError as e:
       errors.append((i, e.message))
 
     try:
-      task_request.validate_package_version(
-          'agent_binary_cipd_vers', cfg.agent_binary_cipd_vers)
+      if cfg.agent_binary_cipd_vers or full_validation:
+        task_request.validate_package_version('agent_binary_cipd_vers',
+                                              cfg.agent_binary_cipd_vers)
     except datastore_errors.BadValueError as e:
       errors.append((i, e.message))
 
-    if not cfg.agent_binary_cipd_filename:
+    if full_validation and not cfg.agent_binary_cipd_filename:
       errors.append((i, 'missing `agent_binary_cipd_filename`'))
+
+    for tag in cfg.tags:
+      if ':' not in tag:
+        errors.append((i, 'tag must be in key:value form, not {}'.format(tag)))
 
   return errors

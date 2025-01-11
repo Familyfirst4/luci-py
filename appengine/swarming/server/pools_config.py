@@ -57,6 +57,10 @@ PoolConfig = collections.namedtuple(
         'external_schedulers',
         # resolved default CipdServer
         'default_cipd',
+        # Controls RBE migration parameters, pools_pb2.Pool.RBEMigration.
+        'rbe_migration',
+        # Controls scheduling algorithm, pools_pb2.Pool.SchedulingAlgorithm.
+        'scheduling_algorithm',
     ])
 
 
@@ -75,6 +79,8 @@ def init_pool_config(**kwargs):
       'bot_monitoring': None,
       'external_schedulers': None,
       'default_cipd': None,
+      'rbe_migration': None,
+      'scheduling_algorithm': None,
   }
   args.update(kwargs)
   return PoolConfig(**args)
@@ -397,11 +403,23 @@ def known():
   return sorted(_fetch_pools_config().pools)
 
 
+def all_pools_migrated_to_rbe():
+  """Returns True if all pools have been migrated to RBE."""
+  pools = _fetch_pools_config().pools
+  if not pools:
+    return False  # just to simplify tests that don't setup any pool configs
+  for pool in pools.values():
+    cfg = pool.rbe_migration
+    if not cfg or cfg.rbe_mode_percent != 100:
+      return False
+  return True
+
+
 ### Private stuff.
 
 
-# Used only on dev server as an ultimate fallback to enable local_smoke_test to
-# work.
+# Used only on dev server as an ultimate fallback to enable local_smoke_testing
+# to work.
 _LOCAL_FAKE_CONFIG = None
 
 # Parsed representation of pools.cfg ready for queries.
@@ -553,6 +571,35 @@ def _validate_external_services(ctx, cfg):
   _validate_external_services_cipd(ctx, cfg.cipd)
 
 
+def _vaildate_rbe_migration(ctx, msg):
+  """Validates pools_pb2.Pool.RBEMigration."""
+  BotMode = pools_pb2.Pool.RBEMigration.BotModeAllocation.BotMode
+
+  if not msg.rbe_instance:
+    ctx.error('rbe_instance is required')
+  if not (0 <= msg.rbe_mode_percent <= 100):
+    ctx.error('rbe_mode_percent should be in [0; 100]')
+
+  allocs = {}
+  for i, alloc in enumerate(msg.bot_mode_allocation):
+    with ctx.prefix('bot_mode_allocation #%d:', i):
+      if alloc.mode == BotMode.UNKNOWN:
+        ctx.error('mode is require')
+        continue
+      if alloc.mode in allocs:
+        ctx.error('allocation for mode %s was already defined', alloc.mode)
+        continue
+      if not (0 <= alloc.percent <= 100):
+        ctx.error('percent should be in [0; 100]')
+        continue
+      allocs[alloc.mode] = alloc.percent
+
+  total = (allocs.get(BotMode.SWARMING, 0) + allocs.get(BotMode.HYBRID, 0) +
+           allocs.get(BotMode.RBE, 0))
+  if total != 100:
+    ctx.error('bot_mode_allocation percents should sum up to 100')
+
+
 @utils.cache_with_expiration(60)
 def _fetch_pools_config():
   """Loads pools.cfg and parses it into a _PoolsCfg instance."""
@@ -607,7 +654,12 @@ def _fetch_pools_config():
           bot_monitoring=bot_monitorings.get(name),
           external_schedulers=_resolve_external_schedulers(
               msg.external_schedulers),
-          default_cipd=default_cipd)
+          default_cipd=default_cipd,
+          rbe_migration=(msg.rbe_migration
+                         if msg.HasField('rbe_migration') else None),
+          scheduling_algorithm=(msg.scheduling_algorithm
+                                or pools_pb2.Pool.SCHEDULING_ALGORITHM_UNKNOWN),
+      )
   return _PoolsCfg(pools, (default_cipd))
 
 
@@ -673,16 +725,20 @@ def _validate_pools_cfg(cfg, ctx):
               ctx.error('peer "%s" was specified twice', d.peer_id)
             elif peer_id:
               seen_peers.add(peer_id)
-          for i, tag in enumerate(d.require_any_of.tag):
+          for j, tag in enumerate(d.require_any_of.tag):
             if ':' not in tag:
-              ctx.error('bad tag #%d "%s" - must be <key>:<value>', i, tag)
+              ctx.error('bad tag #%d "%s" - must be <key>:<value>', j, tag)
 
       # Validate external schedulers.
-      for i, es in enumerate(msg.external_schedulers):
+      for j, es in enumerate(msg.external_schedulers):
         if not es.address:
-          ctx.error('%sth external scheduler config had no address', i)
+          ctx.error('%sth external scheduler config had no address', j)
 
       _resolve_deployment(ctx, msg, template_map, deployment_map)
+
+      if msg.HasField('rbe_migration'):
+        with ctx.prefix('rbe_migration: '):
+          _vaildate_rbe_migration(ctx, msg.rbe_migration)
 
       if msg.bot_monitoring:
         if msg.bot_monitoring not in bot_monitorings:
@@ -702,15 +758,15 @@ def bootstrap_dev_server_acls():
   _LOCAL_FAKE_CONFIG = _PoolsCfg(
       {
           'default':
-              init_pool_config(
-                  name='default',
-                  rev='pools_cfg_rev',
-                  scheduling_users=frozenset([
-                      auth.Identity(auth.IDENTITY_USER,
-                                    'smoke-test@example.com'),
-                      auth.Identity(auth.IDENTITY_BOT, 'whitelisted-ip'),
-                  ]),
-              ),
+          init_pool_config(
+              name='default',
+              rev='pools_cfg_rev',
+              scheduling_users=frozenset([
+                  auth.Identity(auth.IDENTITY_USER, 'smoke-test@example.com'),
+                  auth.Identity(auth.IDENTITY_BOT, 'whitelisted-ip'),
+              ]),
+              scheduling_algorithm=pools_pb2.Pool.SCHEDULING_ALGORITHM_LIFO,
+          ),
       },
       (None, None),
   )

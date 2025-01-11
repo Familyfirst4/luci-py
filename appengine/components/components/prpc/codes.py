@@ -5,9 +5,9 @@
 """Definition of possible RPC response status codes."""
 
 import collections
+from six.moves import http_client
 
 StatusCodeBase = collections.namedtuple('StatusCodeBase', ['value', 'name'])
-
 
 class StatusCode(StatusCodeBase):
   """Mirrors grpc.StatusCode in the gRPC Core.
@@ -32,6 +32,12 @@ class StatusCode(StatusCodeBase):
   DATA_LOSS           = StatusCodeBase(15, 'data loss')
   UNAUTHENTICATED     = StatusCodeBase(16, 'unauthenticated')
 
+  @staticmethod
+  def to_http_code(status_code):
+    httpCode = _PRPC_TO_HTTP_STATUS.get(status_code, None)
+    if httpCode == None:
+      raise ValueError('%s is not a valid StatusCode' % status_code)
+    return httpCode
 
 # Used in ServicerContext.set_code to assert that the code is known.
 ALL_CODES = frozenset(
@@ -40,3 +46,23 @@ ALL_CODES = frozenset(
     if isinstance(getattr(StatusCode, k), StatusCodeBase))
 
 INT_TO_CODE = {c[0]: c for c in ALL_CODES}
+
+_PRPC_TO_HTTP_STATUS = {
+    StatusCode.OK: http_client.OK,
+    StatusCode.CANCELLED: http_client.NO_CONTENT,
+    StatusCode.UNKNOWN: http_client.INTERNAL_SERVER_ERROR,
+    StatusCode.INVALID_ARGUMENT: http_client.BAD_REQUEST,
+    StatusCode.DEADLINE_EXCEEDED: http_client.SERVICE_UNAVAILABLE,
+    StatusCode.NOT_FOUND: http_client.NOT_FOUND,
+    StatusCode.ALREADY_EXISTS: http_client.CONFLICT,
+    StatusCode.PERMISSION_DENIED: http_client.FORBIDDEN,
+    StatusCode.RESOURCE_EXHAUSTED: http_client.SERVICE_UNAVAILABLE,
+    StatusCode.FAILED_PRECONDITION: http_client.PRECONDITION_FAILED,
+    StatusCode.ABORTED: http_client.CONFLICT,
+    StatusCode.OUT_OF_RANGE: http_client.BAD_REQUEST,
+    StatusCode.UNIMPLEMENTED: http_client.NOT_IMPLEMENTED,
+    StatusCode.INTERNAL: http_client.INTERNAL_SERVER_ERROR,
+    StatusCode.UNAVAILABLE: http_client.SERVICE_UNAVAILABLE,
+    StatusCode.DATA_LOSS: http_client.GONE,
+    StatusCode.UNAUTHENTICATED: http_client.UNAUTHORIZED,
+}

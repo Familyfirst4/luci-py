@@ -179,7 +179,7 @@ class EntityHandlerBase(handler.ApiHandler):
     return entity.to_serializable_dict(with_id_as='name')
 
   @classmethod
-  def do_get(cls, name, request):  # pylint: disable=unused-argument
+  def do_get(cls, name, request):
     """Returns an entity given its name or None if no such entity.
 
     Can be called in any mode (including on replicas).
@@ -207,7 +207,7 @@ class EntityHandlerBase(handler.ApiHandler):
     raise NotImplementedError()
 
   @classmethod
-  def can_update(cls, entity):  # pylint: disable=unused-argument
+  def can_update(cls, entity):
     """True if the caller is allowed to update a given entity."""
     return acl.is_admin()
 
@@ -223,7 +223,7 @@ class EntityHandlerBase(handler.ApiHandler):
     raise NotImplementedError()
 
   @classmethod
-  def can_delete(cls, entity):  # pylint: disable=unused-argument
+  def can_delete(cls, entity):
     """True if the caller is allowed to delete a given entity."""
     return acl.is_admin()
 
@@ -412,9 +412,8 @@ class EntityHandlerBase(handler.ApiHandler):
                 '%s was deleted by someone else' %
                 self.entity_kind_title.capitalize(),
           }
-        else:
-          # Unconditionally deleting it, and it's already gone -> success.
-          return None, None
+        # Unconditionally deleting it, and it's already gone -> success.
+        return None, None
       if (expected_ts and
           utils.datetime_to_rfc2822(entity.modified_ts) != expected_ts):
         return None, {
@@ -833,7 +832,7 @@ class GroupHandler(EntityHandlerBase):
 class ReplicationHandler(handler.AuthenticatingHandler):
   """Accepts AuthDB push from Primary."""
 
-  # Handler uses X-Appengine-Inbound-Appid header protected by GAE.
+  # Handler checks headers already protected by CORS mechanism.
   xsrf_token_enforce_on = ()
 
   def send_response(self, response):
@@ -850,18 +849,27 @@ class ReplicationHandler(handler.AuthenticatingHandler):
     response.auth_code_version = version.__version__
     self.send_response(response)
 
-  # Check that request came from some GAE app. More thorough check is inside.
-  @api.require(lambda: api.get_current_identity().is_service)
+  # The ACL check is inside.
+  @api.public
   def post(self):
+    logging.info('Push from %s', api.get_current_identity().to_bytes())
+
     # Check that current service is a Replica.
     if not model.is_replica():
       self.send_error(replication_pb2.ReplicationPushResponse.NOT_A_REPLICA)
       return
 
+    # This is e.g. "chrome-infra-auth".
+    primary_id = model.get_replication_state().primary_id
+
     # Check that request came from expected Primary service.
-    expected_ident = model.Identity(
-        model.IDENTITY_SERVICE, model.get_replication_state().primary_id)
-    if api.get_current_identity() != expected_ident:
+    expected_ident = (
+        # For GAE => GAE requests using URL Fetch API.
+        model.Identity(model.IDENTITY_SERVICE, primary_id),
+        # For requests authenticated with OAuth access tokens.
+        model.Identity(model.IDENTITY_USER,
+                       primary_id + '@appspot.gserviceaccount.com'))
+    if api.get_current_identity() not in expected_ident:
       self.send_error(replication_pb2.ReplicationPushResponse.FORBIDDEN)
       return
 
@@ -882,6 +890,20 @@ class ReplicationHandler(handler.AuthenticatingHandler):
     # Deserialize the request, check it is valid.
     request = replication_pb2.ReplicationPushRequest.FromString(body)
     if not request.revision or not request.HasField('auth_db'):
+      self.send_error(replication_pb2.ReplicationPushResponse.BAD_REQUEST)
+      return
+
+    # Check the AuthDB in the request is not malformed.
+    try:
+      api.AuthDB.from_proto(
+          replication_state=model.AuthReplicationState(),
+          auth_db=request.auth_db,
+          additional_client_ids=[],
+      )
+    except ValueError as e:
+      logging.error('bad AuthDB from %s at rev %d: %s',
+                    request.revision.primary_id, request.revision.auth_db_rev,
+                    e)
       self.send_error(replication_pb2.ReplicationPushResponse.BAD_REQUEST)
       return
 

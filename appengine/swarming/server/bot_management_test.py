@@ -25,7 +25,6 @@ from components import utils
 from test_support import test_case
 
 from proto.api import swarming_pb2  # pylint: disable=no-name-in-module
-from server import bq_state
 from server import bot_management
 from server import config
 from server import task_queues
@@ -34,7 +33,8 @@ from server import task_queues
 _VERSION = unicode(hashlib.sha256().hexdigest())
 
 
-def _bot_event(bot_id=None,
+def _bot_event(event_type,
+               bot_id=None,
                external_ip='8.8.4.4',
                authenticated_as=None,
                dimensions=None,
@@ -56,20 +56,23 @@ def _bot_event(bot_id=None,
     }
   if not authenticated_as:
     authenticated_as = u'bot:%s.domain' % bot_id
-  register_dimensions = kwargs.get('event_type').startswith('request_')
-  return bot_management.bot_event(
-      bot_id=bot_id,
-      external_ip=external_ip,
-      authenticated_as=authenticated_as,
-      dimensions=dimensions,
-      state=state or {'ram': 65},
-      version=version,
-      quarantined=quarantined,
-      maintenance_msg=maintenance_msg,
-      task_id=task_id,
-      task_name=task_name,
-      register_dimensions=register_dimensions,
-      **kwargs)
+  register_dimensions = event_type.startswith('request_') or event_type in (
+      'bot_idle',
+      'bot_polling',
+  )
+  return bot_management.bot_event(event_type=event_type,
+                                  bot_id=bot_id,
+                                  external_ip=external_ip,
+                                  authenticated_as=authenticated_as,
+                                  dimensions=dimensions,
+                                  state=state or {'ram': 65},
+                                  version=version,
+                                  quarantined=quarantined,
+                                  maintenance_msg=maintenance_msg,
+                                  task_id=task_id,
+                                  task_name=task_name,
+                                  register_dimensions=register_dimensions,
+                                  **kwargs)
 
 
 def _ensure_bot_info(bot_id=u'id1', **kwargs):
@@ -78,8 +81,10 @@ def _ensure_bot_info(bot_id=u'id1', **kwargs):
 
 
 def _gen_bot_info(**kwargs):
+  now = kwargs.get('last_seen_ts') or utils.utcnow()
   out = {
-      'authenticated_as': u'bot:id1.domain',
+      'authenticated_as':
+      u'bot:id1.domain',
       'composite': [
           bot_management.BotInfo.NOT_IN_MAINTENANCE,
           bot_management.BotInfo.ALIVE,
@@ -91,31 +96,52 @@ def _gen_bot_info(**kwargs):
           u'os': [u'Ubuntu', u'Ubuntu-16.04'],
           u'pool': [u'default'],
       },
-      'external_ip': u'8.8.4.4',
-      'first_seen_ts': utils.utcnow(),
-      'id': 'id1',
-      'idle_since_ts': None,
-      'is_dead': False,
-      'last_seen_ts': utils.utcnow(),
-      'lease_id': None,
-      'lease_expiration_ts': None,
-      'leased_indefinitely': None,
-      'machine_lease': None,
-      'machine_type': None,
-      'quarantined': False,
-      'maintenance_msg': None,
+      'expire_at':
+      now + bot_management._OLD_BOT_INFO_CUT_OFF,
+      'external_ip':
+      u'8.8.4.4',
+      'first_seen_ts':
+      now,
+      'id':
+      'id1',
+      'idle_since_ts':
+      None,
+      'is_dead':
+      False,
+      'last_seen_ts':
+      now,
+      'lease_id':
+      None,
+      'lease_expiration_ts':
+      None,
+      'leased_indefinitely':
+      None,
+      'machine_lease':
+      None,
+      'machine_type':
+      None,
+      'quarantined':
+      False,
+      'maintenance_msg':
+      None,
+      'session_id':
+      None,
       'state': {
           u'ram': 65
       },
-      'task_id': None,
-      'task_name': None,
-      'version': _VERSION,
+      'task_id':
+      None,
+      'task_name':
+      None,
+      'version':
+      _VERSION,
   }
   out.update(kwargs)
   return out
 
 
 def _gen_bot_event(**kwargs):
+  ts = kwargs.get('ts') or utils.utcnow()
   out = {
       'authenticated_as': u'bot:id1.domain',
       'dimensions': {
@@ -123,9 +149,10 @@ def _gen_bot_event(**kwargs):
           u'os': [u'Ubuntu', u'Ubuntu-16.04'],
           u'pool': [u'default'],
       },
+      'expire_at': ts + bot_management._OLD_BOT_EVENTS_CUT_OFF,
       'external_ip': u'8.8.4.4',
       'idle_since_ts': None,
-      'last_seen_ts': None,
+      'last_seen_ts': kwargs.get('ts') or utils.utcnow(),
       'lease_id': None,
       'lease_expiration_ts': None,
       'leased_indefinitely': None,
@@ -134,11 +161,12 @@ def _gen_bot_event(**kwargs):
       'message': None,
       'quarantined': False,
       'maintenance_msg': None,
+      'session_id': None,
       'state': {
           u'ram': 65
       },
       'task_id': None,
-      'ts': utils.utcnow(),
+      'ts': ts,
       'version': _VERSION,
   }
   out.update(kwargs)
@@ -202,7 +230,7 @@ class BotManagementTest(test_case.TestCase):
     for name in bot_management.BotEvent.ALLOWED_EVENTS:
       event_key = _bot_event(
           event_type=name, bot_id=u'id1', dimensions=dimensions)
-      if name == u'task_update':
+      if name in (u'task_update', u'bot_polling'):
         # TODO(maruel): Store request_sleep IFF the state changed.
         self.assertIsNone(event_key, name)
         continue
@@ -301,13 +329,14 @@ class BotManagementTest(test_case.TestCase):
         expected, bot_management.get_info_key('id1').get().to_dict())
 
   @parameterized.expand([
-      (u'task_completed', True, False),
-      (u'task_error', True, False),
-      (u'task_killed', True, False),
-      (u'request_sleep', True, True),
-      (u'task_update', False, True),
+      (u'task_completed', True, False, 0),
+      (u'task_error', True, False, 1),
+      (u'task_killed', True, False, 2),
+      (u'request_sleep', True, True, 3),
+      (u'task_update', False, True, 4),
   ])
-  def test_bot_event_reset_task(self, event, reset_task, skip_store_event):
+  def test_bot_event_reset_task(self, event, reset_task, skip_store_event,
+                                increment):
     bot_id = u'id1'
     task_id = u'12311'
     task_name = u'yo'
@@ -316,8 +345,13 @@ class BotManagementTest(test_case.TestCase):
         u'os': [u'Ubuntu', u'Ubuntu-16.04'],
         u'pool': [u'default'],
     }
+    # Create two timestamps because _ensure_bot_info might create a
+    # `request_sleep` event. Make sure that it is always behind the event we
+    # will test as the last created event.
+    t1 = self.mock_now(self.now, increment * 2)
     bot_info = _ensure_bot_info(
         bot_id=bot_id, dimensions=d, task_id=task_id, task_name=task_name)
+    t2 = self.mock_now(self.now, increment * 2 + 1)
     _bot_event(
         event_type=event,
         bot_id=bot_id,
@@ -333,44 +367,104 @@ class BotManagementTest(test_case.TestCase):
     ]
     if event == 'request_sleep':
       composite += [bot_management.BotInfo.IDLE]
-      idle_since_ts = self.now
+      idle_since_ts = t1
     else:
       composite += [bot_management.BotInfo.BUSY]
       idle_since_ts = None
 
     if reset_task:
       # bot_info.task_id and bot_info.task_name should be reset
-      expected = _gen_bot_info(
-          composite=composite,
-          id=bot_id,
-          task_name=None,
-          idle_since_ts=idle_since_ts)
+      expected = _gen_bot_info(first_seen_ts=t1,
+                               composite=composite,
+                               id=bot_id,
+                               task_name=None,
+                               idle_since_ts=idle_since_ts)
     else:
       # bot_info.task_id and bot_info.task_name should be kept
-      expected = _gen_bot_info(
-          composite=composite,
-          id=bot_id,
-          task_id=task_id,
-          task_name=task_name,
-          idle_since_ts=None)
+      expected = _gen_bot_info(first_seen_ts=t1,
+                               composite=composite,
+                               id=bot_id,
+                               task_id=task_id,
+                               task_name=task_name,
+                               idle_since_ts=None)
 
     self.assertEqual(expected, bot_info.key.get().to_dict())
 
     # bot_event should have task_id
     if not skip_store_event:
-      expected_event = _gen_bot_event(event_type=event, task_id=task_id)
-      last_event = bot_management.get_events_query(bot_id, True).get()
+      expected_event = _gen_bot_event(event_type=event, task_id=task_id, ts=t2)
+      last_event = bot_management.get_events_query(bot_id).get()
       self.assertEqual(expected_event, last_event.to_dict())
 
   def test_get_events_query(self):
     _bot_event(event_type='bot_connected')
     expected = [_gen_bot_event(event_type=u'bot_connected')]
     self.assertEqual(
-        expected,
-        [i.to_dict() for i in bot_management.get_events_query('id1', True)])
+        expected, [i.to_dict() for i in bot_management.get_events_query('id1')])
 
-  def test_bot_event_poll_sleep(self):
-    _bot_event(event_type='request_sleep')
+  def test_get_latest_info(self):
+    stored = _ensure_bot_info('bot-id')
+    fetched, alive = bot_management.get_latest_info('bot-id')
+    self.assertEqual(stored.dimensions_flat, fetched.dimensions_flat)
+    self.assertTrue(alive)
+
+  def test_get_latest_info_dead(self):
+    stored = _ensure_bot_info('bot-id')
+    stored.key.delete()
+    fetched, alive = bot_management.get_latest_info('bot-id')
+    self.assertEqual(stored.dimensions_flat, fetched.dimensions_flat)
+    self.assertFalse(alive)
+
+  def test_get_latest_info_missing(self):
+    fetched, alive = bot_management.get_latest_info('bot-id')
+    self.assertIsNone(fetched)
+    self.assertFalse(alive)
+
+  def test_get_latest_info_race_condition_crbug_1407381(self):
+    stored = _ensure_bot_info('bot-id')
+    stored.key.delete()
+
+    # The bot is considered dead now.
+    fetched, alive = bot_management.get_latest_info('bot-id')
+    self.assertIsNotNone(fetched)
+    self.assertFalse(alive)
+
+    # Has an event history.
+    self.assertTrue(bot_management.get_events_query('bot-id').fetch(1))
+
+    get_events_query = bot_management.get_events_query
+
+    # A bot reappears when the history is being fetched.
+    def get_events_query_mock(bot_id):
+      self.assertEqual(bot_id, 'bot-id')
+      _ensure_bot_info(bot_id)
+      return get_events_query(bot_id)
+
+    with mock.patch('server.bot_management.get_events_query',
+                    side_effect=get_events_query_mock) as m:
+      fetched, alive = bot_management.get_latest_info('bot-id')
+      self.assertEqual(stored.dimensions_flat, fetched.dimensions_flat)
+      self.assertTrue(alive)  # considered alive now
+      m.assert_called_once()
+
+  def test_get_bot_pools(self):
+    _ensure_bot_info(bot_id='bot-id', dimensions={'pool': ['p1', 'p2']})
+    self.assertEqual(bot_management.get_bot_pools('bot-id'), ['p1', 'p2'])
+
+  def test_get_bot_pools_dead(self):
+    e = _ensure_bot_info(bot_id='bot-id', dimensions={'pool': ['p1', 'p2']})
+    e.key.delete()
+    self.assertEqual(bot_management.get_bot_pools('bot-id'), ['p1', 'p2'])
+
+  def test_get_bot_pools_missing(self):
+    self.assertEqual(bot_management.get_bot_pools('bot-id'), [])
+
+  @parameterized.expand([
+      (u'request_sleep', ),
+      (u'bot_idle', ),
+  ])
+  def test_bot_event_poll_sleep(self, event_type):
+    _bot_event(event_type=event_type)
 
     # Assert that BotInfo was updated too.
     expected = _gen_bot_info(
@@ -386,46 +480,50 @@ class BotManagementTest(test_case.TestCase):
     self.assertEqual(expected, bot_info.to_dict())
 
     # BotEvent is registered for poll when BotInfo creates
-    expected_event = _gen_bot_event(event_type=u'request_sleep')
-    bot_events = bot_management.get_events_query('id1', True)
+    expected_event = _gen_bot_event(event_type=event_type,
+                                    idle_since_ts=utils.utcnow())
+    bot_events = bot_management.get_events_query('id1')
     self.assertEqual([expected_event], [e.to_dict() for e in bot_events])
 
     # flush bot events
     ndb.delete_multi(e.key for e in bot_events)
 
     # BotEvent is not registered for poll when no dimensions change
-    _bot_event(event_type='request_sleep')
-    self.assertEqual([], bot_management.get_events_query('id1', True).fetch())
+    _bot_event(event_type=event_type)
+    self.assertEqual([], bot_management.get_events_query('id1').fetch())
 
     # BotEvent is registered for poll when dimensions change
     dims = {u'foo': [u'bar']}
-    _bot_event(event_type='request_sleep', dimensions=dims)
+    _bot_event(event_type=event_type, dimensions=dims)
     expected_event['dimensions'] = dims
-    bot_events = bot_management.get_events_query('id1', True).fetch()
+    bot_events = bot_management.get_events_query('id1').fetch()
     self.assertEqual([expected_event], [e.to_dict() for e in bot_events])
 
   def test_bot_event_busy(self):
+    ticker = test_case.Ticker(self.now)
+    t1 = self.mock_now(ticker())
     _bot_event(event_type='bot_connected')
+    t2 = self.mock_now(ticker())
     _bot_event(event_type='request_task', task_id='12311', task_name='yo')
-    expected = _gen_bot_info(
-        composite=[
-          bot_management.BotInfo.NOT_IN_MAINTENANCE,
-          bot_management.BotInfo.ALIVE,
-          bot_management.BotInfo.HEALTHY,
-          bot_management.BotInfo.BUSY,
-        ],
-        task_id=u'12311',
-        task_name=u'yo')
+    expected_events = [
+        bot_management.BotInfo.NOT_IN_MAINTENANCE,
+        bot_management.BotInfo.ALIVE,
+        bot_management.BotInfo.HEALTHY,
+        bot_management.BotInfo.BUSY,
+    ]
+    expected = _gen_bot_info(composite=expected_events,
+                             task_id=u'12311',
+                             task_name=u'yo',
+                             first_seen_ts=t1)
     bot_info = bot_management.get_info_key('id1').get()
     self.assertEqual(expected, bot_info.to_dict())
 
     expected = [
-        _gen_bot_event(event_type=u'request_task', task_id=u'12311'),
-        _gen_bot_event(event_type=u'bot_connected'),
+        _gen_bot_event(event_type=u'request_task', task_id=u'12311', ts=t2),
+        _gen_bot_event(event_type=u'bot_connected', ts=t1),
     ]
     self.assertEqual(
-        expected,
-        [e.to_dict() for e in bot_management.get_events_query('id1', True)])
+        expected, [e.to_dict() for e in bot_management.get_events_query('id1')])
 
   def test_bot_event_update_dimensions(self):
     bot_id = 'id1'
@@ -442,9 +540,9 @@ class BotManagementTest(test_case.TestCase):
     self.assertEqual(bot_info_key.get().dimensions_flat,
                      [u'id:id1', u'pool:default'])
 
-    # 'bot_hook_log' event does not register dimensions other than id and pool.
+    # 'bot_error' event does not register dimensions other than id and pool.
     _bot_event(
-        bot_id=bot_id, event_type='bot_hook_log', dimensions=dimensions_invalid)
+        bot_id=bot_id, event_type='bot_error', dimensions=dimensions_invalid)
     self.assertEqual(bot_info_key.get().dimensions_flat,
                      [u'id:id1', u'pool:default'])
 
@@ -482,10 +580,6 @@ class BotManagementTest(test_case.TestCase):
     expected = ndb.Key(
         bot_management.BotRoot, 'foo', bot_management.BotSettings, 'settings')
     self.assertEqual(expected, bot_management.get_settings_key('foo'))
-
-  def test_get_aggregation_key(self):
-    expected = ndb.Key(bot_management.DimensionAggregation, 'foo')
-    self.assertEqual(expected, bot_management.get_aggregation_key('foo'))
 
   def test_has_capacity(self):
     # The bot can service this dimensions.
@@ -610,17 +704,19 @@ class BotManagementTest(test_case.TestCase):
     check_alive([bot1_alive, bot2_alive])
 
     # Just stale enough to trigger the dead logic.
-    then = self.mock_now(self.now, timeout)
+    now = self.mock_now(self.now, timeout)
     # The cron job didn't run yet, so it still has ALIVE bit.
     check_dead([])
     check_alive([bot1_alive, bot2_alive])
     self.assertEqual(1, bot_management.cron_update_bot_info())
-    # The cron job ran, so it's now correct.
+    # The cron job ran, so it's now correct. This also bumped expiry time of
+    # the dead bot's BotInfo (when emitting the `bot_missing` event).
+    bot1_dead['expire_at'] = now + bot_management._OLD_BOT_INFO_CUT_OFF
     check_dead([bot1_dead])
     check_alive([bot2_alive])
 
     # the last event should be bot_missing
-    events = list(bot_management.get_events_query('id1', order=True))
+    events = list(bot_management.get_events_query('id1'))
     event = events[0]
     bq_event = swarming_pb2.BotEvent()
     event.to_proto(bq_event)
@@ -633,154 +729,11 @@ class BotManagementTest(test_case.TestCase):
     last_seen_ts.FromDatetime(bot1_dead['last_seen_ts'])
     self.assertEqual(bq_event.bot.info.last_seen_ts, last_seen_ts)
 
-  def test_cron_delete_old_bot_events(self):
-    # Create an old BotEvent right at the cron job cut off, and another one one
-    # second later (that will be kept).
-    _bot_event(event_type='bot_connected')
-    now = self.now
-    self.mock_now(now, 1)
-    event_key = _bot_event(event_type='bot_connected')
-    self.mock_now(now + bot_management._OLD_BOT_EVENTS_CUT_OFF, 0)
-    self.assertEqual(1, bot_management.cron_delete_old_bot_events())
-    actual = bot_management.BotEvent.query().fetch(keys_only=True)
-    self.assertEqual([event_key], actual)
-
-  def test_cron_delete_old_bot(self):
-    # Create a Bot with no BotEvent and another bot with one.
-    event_key = _bot_event(bot_id=u'id1', event_type='request_sleep')
-    # Delete the BotEvent entity.
-    _bot_event(bot_id=u'id2', event_type='request_sleep').delete()
-    # BotRoot + BotInfo.
-    self.assertEqual(2, bot_management.cron_delete_old_bot())
-    actual = bot_management.BotEvent.query().fetch(keys_only=True)
-    self.assertEqual([event_key], actual)
-    self.assertEqual(
-        [u'id1'],
-        [k.string_id() for k in
-          bot_management.BotRoot.query().fetch(keys_only=True)])
-
-  def test_cron_aggregate_dimensions(self):
-    _ensure_bot_info(
-        bot_id='id1', dimensions={
-            'pool': ['p1', 'p2'],
-            'foo1': ['bar1']
-        })
-    _ensure_bot_info(
-        bot_id='id2', dimensions={
-            'pool': ['p3'],
-            'foo2': ['bar2']
-        })
-    bot_management.cron_aggregate_dimensions()
-
-    # dimensions of all pools.
-    dims_all = bot_management.get_aggregation_key('all').get().dimensions
-    self.assertEqual(dims_all, [
-        bot_management.DimensionValues(dimension='foo1', values=['bar1']),
-        bot_management.DimensionValues(dimension='foo2', values=['bar2']),
-        bot_management.DimensionValues(
-            dimension='pool', values=['p1', 'p2', 'p3']),
-    ])
-
-    # dimensions of p1.
-    dims_p1 = bot_management.get_aggregation_key('p1').get().dimensions
-    self.assertEqual(dims_p1, [
-        bot_management.DimensionValues(dimension='foo1', values=['bar1']),
-        bot_management.DimensionValues(dimension='pool', values=['p1', 'p2']),
-    ])
-
-    # dimensions of p2.
-    dims_p1 = bot_management.get_aggregation_key('p2').get().dimensions
-    self.assertEqual(dims_p1, [
-        bot_management.DimensionValues(dimension='foo1', values=['bar1']),
-        bot_management.DimensionValues(dimension='pool', values=['p1', 'p2']),
-    ])
-
-    # dimensions of p2.
-    dims_p1 = bot_management.get_aggregation_key('p3').get().dimensions
-    self.assertEqual(dims_p1, [
-        bot_management.DimensionValues(dimension='foo2', values=['bar2']),
-        bot_management.DimensionValues(dimension='pool', values=['p3']),
-    ])
-
   def test_filter_dimensions(self):
     pass # Tested in handlers_endpoints_test
 
   def test_filter_availability(self):
     pass # Tested in handlers_endpoints_test
-
-  def test_task_bq_empty(self):
-    # Empty, nothing is done.
-    start = utils.utcnow()
-    end = start+datetime.timedelta(seconds=60)
-    self.assertEqual(0, bot_management.task_bq_events(start, end))
-
-  def test_task_bq_events(self):
-    payloads = []
-    def send_to_bq(table_name, rows):
-      self.assertEqual('bot_events', table_name)
-      payloads.append(rows)
-
-    self.mock(bq_state, 'send_to_bq', send_to_bq)
-
-    # Generate a few events.
-    start = self.mock_now(self.now, 10)
-    _bot_event(bot_id=u'id1', event_type='bot_connected')
-    self.mock_now(self.now, 11)
-    _bot_event(event_type='request_sleep')  # stored
-    self.mock_now(self.now, 12)
-    _bot_event(event_type='request_sleep')  # not stored
-    self.mock_now(self.now, 13)
-    _bot_event(event_type='request_sleep', quarantined=True)  # stored
-    self.mock_now(self.now, 14)
-    _bot_event(event_type='request_sleep', quarantined=True)  # not stored
-    self.mock_now(self.now, 15)
-    _bot_event(event_type='request_sleep')  # stored
-    self.mock_now(self.now, 16)
-    _bot_event(event_type='request_sleep')  # not stored
-    self.mock_now(self.now, 17)
-    _bot_event(event_type='request_sleep', maintenance_msg='foo')  # stored
-    self.mock_now(self.now, 18)
-    _bot_event(event_type='request_sleep', maintenance_msg='bar')  # not stored
-    self.mock_now(self.now, 19)
-    _bot_event(event_type='request_sleep')  # stored
-    self.mock_now(self.now, 20)
-    _bot_event(event_type='request_sleep')  # not stored
-    self.mock_now(self.now, 21)
-    _bot_event(event_type='request_task', task_id='12311', task_name='yo')
-    self.mock_now(self.now, 22)
-    _bot_event(event_type='task_update', task_id='12311') # not stored
-    self.mock_now(self.now, 23)
-    _bot_event(event_type='task_completed', task_id='12311')
-    self.mock_now(self.now, 24)
-    _bot_event(event_type='request_sleep')  # stored
-    end = self.mock_now(self.now, 25)
-
-    with mock.patch(
-        'components.pubsub.publish_multi',
-        side_effect=lambda _topic, messages: list(messages)) as mocked:
-      # normal request_sleep is not streamed.
-      bot_management.task_bq_events(start, end)
-      mocked.assert_called()
-    self.assertEqual(1, len(payloads))
-    actual_rows = payloads[0]
-    expected = [
-        (r[0], bot_management.BotEvent._MAPPING[r[1]]) for r in [
-            # (bq_key, event)
-            ('id1:2010-01-02T03:04:15.000006Z', 'bot_connected'),
-            ('id1:2010-01-02T03:04:16.000006Z',
-             'request_sleep'),  # dimensions update
-            ('id1:2010-01-02T03:04:18.000006Z',
-             'request_sleep'),  # quarantine start
-            ('id1:2010-01-02T03:04:20.000006Z', 'request_sleep'),  # recovered
-            ('id1:2010-01-02T03:04:22.000006Z',
-             'request_sleep'),  # maintenance start
-            ('id1:2010-01-02T03:04:24.000006Z', 'request_sleep'),  # recovered
-            ('id1:2010-01-02T03:04:26.000006Z', 'request_task'),
-            ('id1:2010-01-02T03:04:28.000006Z', 'task_completed'),
-            ('id1:2010-01-02T03:04:29.000006Z', 'request_sleep'),  # first idle
-        ]
-    ]
-    self.assertEqual(expected, [(r[0], r[1].event) for r in actual_rows])
 
 
 if __name__ == '__main__':

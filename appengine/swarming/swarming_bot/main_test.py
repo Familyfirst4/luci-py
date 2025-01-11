@@ -57,25 +57,20 @@ class SimpleMainTest(TestCase):
         subprocess42.check_output(
             [sys.executable, self._zip_file, 'attributes'],
             stderr=subprocess42.PIPE))
-    # get_config() doesn't work when called outside of a zip, so patch the
-    # server_version manually with the default value in config/config.json.
-    expected = bot_main.get_attributes(None)
-    self.assertEqual(['N/A'], expected['dimensions']['server_version'])
-    expected['dimensions']['server_version'] = ['1']
+
+    botobj = bot_main.get_bot(bot_main.get_config())
+    expected = bot_main.get_attributes(botobj)
 
     NON_DETERMINISTIC = ('cwd', 'disks', 'nb_files_in_temp', 'pid',
-                         'running_time', 'started_ts', 'uptime')
+                         'running_time', 'started_ts', 'uptime', 'temp')
     for key in NON_DETERMINISTIC:
-      del actual['state'][key]
-      del expected['state'][key]
-    actual['state'].pop('temp', None)
-    expected['state'].pop('temp', None)
+      actual['state'].pop(key, None)
+      expected['state'].pop(key, None)
     del actual['version']
     del expected['version']
-    self.assertAlmostEqual(
-        actual['state'].pop('cost_usd_hour'),
-        expected['state'].pop('cost_usd_hour'),
-        places=5)
+    self.assertAlmostEqual(actual['state'].pop('cost_usd_hour'),
+                           expected['state'].pop('cost_usd_hour'),
+                           places=4)
     self.assertEqual(expected, actual)
 
   def test_version(self):

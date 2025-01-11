@@ -104,6 +104,39 @@ VCED exceptions         : not available
 VCEI exceptions         : not available
 """
 
+PPC64_CPU_INFO = r"""
+processor  : 0
+cpu        : POWER10 (architected), altivec supported
+clock      : 2750.000000MHz
+revision   : 2.0 (pvr 0080 0200)
+
+processor  : 1
+cpu        : POWER10 (architected), altivec supported
+clock      : 2750.000000MHz
+revision   : 2.0 (pvr 0080 0200)
+
+processor  : 2
+cpu        : POWER10 (architected), altivec supported
+clock      : 2750.000000MHz
+revision   : 2.0 (pvr 0080 0200)
+
+processor  : 3
+cpu        : POWER10 (architected), altivec supported
+clock      : 2750.000000MHz
+revision   : 2.0 (pvr 0080 0200)
+
+processor  : 4
+cpu        : POWER10 (architected), altivec supported
+clock      : 2750.000000MHz
+revision   : 2.0 (pvr 0080 0200)
+
+timebase   : 512000000
+platform   : pSeries
+model      : IBM,9105-42A
+machine    : CHRP IBM,9105-42A
+MMU        : Radix
+"""
+
 
 @unittest.skipUnless(sys.platform == 'linux', 'linux only test')
 class TestCPUInfo(auto_stub.TestCase):
@@ -119,6 +152,12 @@ class TestCPUInfo(auto_stub.TestCase):
   def get_cpuinfo(self, text):
     self.mock(linux, '_read_cpuinfo', lambda: text)
     return linux.get_cpuinfo()
+
+  def test_get_cpuinfo_empty(self):
+    self.assertEqual({}, self.get_cpuinfo(''))
+
+  def test_get_cpuinfo_empty(self):
+    self.assertEqual({'vendor': 'N/A'}, self.get_cpuinfo('foo: bar'))
 
   def test_get_cpuinfo_exynos(self):
     self.assertEqual(
@@ -174,6 +213,11 @@ class TestCPUInfo(auto_stub.TestCase):
             'flags': ['mips2', 'mips3', 'mips4', 'mips5', 'mips64r2'],
             'name': 'Cavium Octeon II V0.1',
         }, self.get_cpuinfo(MIPS64_CPU_INFO))
+
+  def test_get_cpuinfo_ppc64(self):
+    self.assertEqual({
+        'name': 'POWER10',
+    }, self.get_cpuinfo(PPC64_CPU_INFO))
 
   def test_get_num_processors(self):
     self.assertTrue(linux.get_num_processors() != 0)
@@ -258,7 +302,7 @@ class TestLinux(auto_stub.TestCase):
     """)
     self.assertEqual(linux.get_ssd(), ('nvme0n1',))
 
-  def test_get_gpu(self):
+  def test_get_gpu_nvidia(self):
     # pylint: disable=line-too-long
     self.mock_check_output.return_value = textwrap.dedent("""\
       18:00.0 "VGA compatible controller [0300]" "NVIDIA Corporation [10de]" "GP107GL [Quadro P1000] [1cb1]" -ra1 "NVIDIA Corporation [10de]" "GP107GL [Quadro P1000] [11bc]"
@@ -268,17 +312,119 @@ class TestLinux(auto_stub.TestCase):
                        (['10de', '10de:1cb1', '10de:1cb1-440.82'
                         ], ['Nvidia GP107GL [Quadro P1000] 440.82']))
 
-  def test_get_intel_version(self):
+  def test_get_gpu_intel(self):
+    # pylint: disable=line-too-long
+    self.mock_check_output.side_effect = (
+        # lscpi -mm -nn
+        '00:02.0 "VGA compatible controller [0300]" "Intel Corporation [8086]" "Device [9bc5]" -r05 "Dell [1028]" "Device [09a4]"'
+        .encode('utf-8'),
+        # dpkg -s libgl1-mesa-dri
+        'Version: 23.2.1-1ubuntu3.1~22.04.2'.encode('utf-8'),
+    )
+    self.assertEqual(linux.get_gpu(),
+                     (['8086', '8086:9bc5', '8086:9bc5-23.2.1'
+                       ], ['Intel Comet Lake S UHD Graphics 630 23.2.1']))
+
+  def test_get_gpu_amd(self):
+    # pylint: disable=line-too-long
+    self.mock_check_output.side_effect = (
+        # lscpi -mm -nn
+        '03:00.0 "VGA compatible controller [0300]" "Advanced Micro Devices, Inc. [AMD/ATI] [1002]" "Navi 14 [Radeon RX 5500/5500M / Pro 5500M] [7340]" -rc5 "Gigabyte Technology Co., Ltd [1458]" "Navi 14 [Radeon RX 5500/5500M / Pro 5500M] [2319]"'
+        .encode('utf-8'),
+        # dpkg -s libgl1-mesa-dri
+        'Version: 23.2.1-1ubuntu3.1~22.04.2'.encode('utf-8'),
+    )
+    self.assertEqual(linux.get_gpu(),
+                     (['1002', '1002:7340', '1002:7340-23.2.1'
+                       ], ['AMD Radeon RX 5500 XT 23.2.1']))
+
+  def test_get_mesa_version(self):
     self.mock_check_output.return_value = textwrap.dedent("""\
       Version: 1.2.3
     """).encode()
-    self.assertEqual(linux._get_intel_version(), '1.2.3')
+    self.assertEqual(linux._get_mesa_version(), '1.2.3')
 
   def test_get_device_tree_compatible(self):
     with mock.patch('builtins.open') as mock_open:
       mock_open.return_value = io.BytesIO(b'foo,bar')
       self.assertEqual(linux.get_device_tree_compatible(),
                        sorted(['foo', 'bar']))
+
+  def test_is_display_attached_true(self):
+    # Real output from a Linux machine with a display attached.
+    self.mock_check_output.return_value = """\
+Screen 0: minimum 320 x 200, current 1280 x 1024, maximum 16384 x 16384
+DisplayPort-0 disconnected (normal left inverted right x axis y axis)
+DisplayPort-1 disconnected (normal left inverted right x axis y axis)
+DisplayPort-2 disconnected (normal left inverted right x axis y axis)
+HDMI-A-0 connected primary 1280x1024+0+0 (normal left inverted right x axis y axis) 450mm x 360mm
+   1280x1024     60.02*+  75.02
+   1280x800      60.02
+   1152x864      75.00    59.97
+   1280x720      60.02
+   1024x768      85.00    75.03    70.07    60.00
+   800x600       85.06    72.19    75.00    60.32    56.25
+   640x480       85.01    75.00    72.81    60.00    59.94
+   720x400       70.08
+"""
+    self.assertTrue(linux.is_display_attached())
+
+  def test_is_display_attached_false(self):
+    # Real output from a Linux machine with a display attached, but not
+    # functioning properly.
+    self.mock_check_output.return_value = """\
+Screen 0: minimum 320 x 200, current 1024 x 768, maximum 16384 x 16384
+DisplayPort-0 disconnected primary (normal left inverted right x axis y axis)
+DisplayPort-1 disconnected (normal left inverted right x axis y axis)
+DisplayPort-2 disconnected (normal left inverted right x axis y axis)
+HDMI-A-0 disconnected (normal left inverted right x axis y axis)
+"""
+    self.assertFalse(linux.is_display_attached())
+
+  def test_is_display_attached_unknown(self):
+    self.mock_check_output.side_effect = OSError('Executable not found')
+    with self.assertLogs(level='ERROR') as logging_manager:
+      self.assertIsNone(linux.is_display_attached())
+    self.assertIn('ERROR:root:is_display_attached(): Executable not found',
+                  logging_manager.output)
+
+  def test_get_display_resolution_success(self):
+    # Real output from a Linux machine with a 2560x144 display attached.
+    self.mock_check_output.return_value = """\
+Screen 0: minimum 320 x 200, current 4000 x 2560, maximum 16384 x 16384
+DisplayPort-0 disconnected (normal left inverted right x axis y axis)
+DisplayPort-1 disconnected (normal left inverted right x axis y axis)
+DisplayPort-2 connected primary 2560x1440+0+518 (normal left inverted right x axis y axis) 597mm x 336mm
+   2560x1440     59.95*+
+   1920x1200     59.88
+   1920x1080     60.00    50.00    59.94    49.95
+   1600x1200     60.00
+   1680x1050     59.95
+   1600x900      60.00
+   1280x1024     60.02
+   1440x900      59.89
+   1280x800      59.95
+   1280x720      60.00    50.00    59.94
+   1024x768      60.00
+   800x600       60.32
+   720x576       50.00
+   720x480       60.00    59.94
+   640x480       60.00    59.94
+"""
+    horizontal, vertical = linux.get_display_resolution()
+    self.assertEqual(horizontal, 2560)
+    self.assertEqual(vertical, 1440)
+
+  def test_get_display_resolution_unknown(self):
+    self.mock_check_output.return_value = ''
+    self.assertIsNone(linux.get_display_resolution())
+
+  def test_get_display_resolution_command_error(self):
+    self.mock_check_output.side_effect = OSError('Executable not found')
+    with self.assertLogs(level='ERROR') as logging_manager:
+      self.assertIsNone(linux.get_display_resolution())
+    self.assertIn('ERROR:root:get_display_resolution(): Executable not found',
+                  logging_manager.output)
 
 
 if __name__ == '__main__':

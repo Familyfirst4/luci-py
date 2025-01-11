@@ -2,103 +2,65 @@
 # Use of this source code is governed under the Apache License, Version 2.0
 # that can be found in the LICENSE file.
 
-"""Bot interface used in bot_config.py."""
+"""Bot interface used in bot own code and in bot_config.py."""
 
+import contextlib
 import copy
-import inspect
 import hashlib
+import inspect
 import logging
+import os
 import os
 import struct
 import sys
 import threading
 import time
+import uuid
 
 from api import os_utilities
-
-# Method could be a function - pylint: disable=R0201
-
-
-def _get_stripper(paths):
-  """Returns a function to strip common path prefixes.
-
-  There are 3 kinds of paths:
-    - relative paths
-    - absolute paths
-    - absolute paths in stdlib
-  """
-  if not paths:
-    return lambda f: f
-
-  stdlib = os.path.dirname(os.__file__)
-  # Find the common root for paths not in stdlib and not relative.
-  split_paths = [[c
-                  for c in p.split(os.path.sep)
-                  if c]
-                 for p in paths
-                 if os.path.isabs(p) and not p.startswith(stdlib)]
-  common = None
-  if split_paths:
-    common = []
-    for c1, c2 in zip(min(split_paths), max(split_paths)):
-      if c1 != c2:
-        break
-      common.append(c1)
-    if common:
-      if sys.platform == 'win32':
-        common = os.path.sep.join(common)
-      else:
-        common = os.path.sep + os.path.sep.join(common)
-
-  def stripper(f):
-    if f.startswith(stdlib):
-      return f[len(stdlib) + 1:]
-    if os.path.isabs(f) and common:
-      return f[len(common) + 1:]
-    if f.startswith('./'):
-      return f[2:]
-    return f
-
-  return stripper
-
-
-def _make_stack():
-  """Returns a well formatted call stack."""
-  frame = inspect.currentframe().f_back
-  frames = []
-  while frame and len(frames) < 50:
-    frames.append(frame)
-    frame = frame.f_back
-  strip = _get_stripper(f.f_code.co_filename for f in frames)
-  return '\n'.join('  %-2d %s:%s:%s()' % (i, strip(f.f_code.co_filename),
-                                          f.f_lineno, f.f_code.co_name)
-                   for i, f in enumerate(frames))
 
 
 class Bot(object):
 
-  def __init__(self, remote, attributes, server, server_version, base_dir,
-               shutdown_hook):
-    # Do not expose attributes for now, as attributes may be refactored.
+  def __init__(self, remote, attributes, server, base_dir, shutdown_hook):
     assert server is None or not server.endswith('/'), server
+
+    # TODO(vadimsh): Make bot ID immutable. Changing it after the handshake is
+    # undefined behavior on Swarming and an error on RBE.
+
     # Immutable.
     self._base_dir = base_dir
     self._remote = remote
     self._server = server
-    self._server_version = server_version
     self._shutdown_hook = shutdown_hook
+    self._session_id = _gen_session_id()
 
-    # Mutable.
+    # Mutable, see BotMutator.
     self._lock = threading.Lock()
-    self._attributes = attributes or {}
-    self._bot_group_cfg_ver = None
+    self._exit_hook = None
+    self._idle = False
+    self._dimensions = (attributes or {}).get('dimensions') or {}
+    self._state = (attributes or {}).get('state') or {}
+    self._bot_version = (attributes or {}).get('version') or 'unknown'
     self._server_side_dimensions = {}
     self._bot_restart_msg = None
     self._bot_config = {}
+    self._rbe_instance = None
+    self._rbe_worker_properties = None
+    self._rbe_hybrid_mode = False
+    self._rbe_session = None
+
+    # Mutable in response to other Bot calls.
+    self._shutdown_event_posted = False
+
+    # Populate parts of self._dimensions and self._state that depend on other
+    # fields with default values.
+    with self.mutate_internals() as mut:
+      mut._refresh_attributes()
 
   @property
   def base_dir(self):
-    """Returns the working directory.
+    """The working directory.
 
     It is normally the current working directory, e.g. os.getcwd() but it is
     preferable to not assume that.
@@ -107,16 +69,16 @@ class Bot(object):
 
   @property
   def config_dir(self):
-    """Returns the directory used for configuration files on the machine."""
+    """The directory used for configuration files on the machine."""
     if sys.platform == 'win32':
       return 'C:\\swarming_config'
-    elif sys.platform == 'cygwin':
+    if sys.platform == 'cygwin':
       return '/cygdrive/c/swarming_config'
     return '/etc/swarming_config'
 
   @property
   def dimensions(self):
-    """The bot's current dimensions.
+    """A copy of bot's current dimensions dict.
 
     Dimensions are relatively static and not expected to change much. They
     should change only when it effectively affects the bot's capacity to execute
@@ -140,13 +102,23 @@ class Bot(object):
     server side we can use them as security boundaries.
     """
     with self._lock:
-      return copy.deepcopy(self._attributes.get('dimensions', {}))
+      return copy.deepcopy(self._dimensions)
 
   @property
   def id(self):
-    """Returns the bot's ID."""
+    """The bot's ID."""
     with self._lock:
-      return self._attributes.get('dimensions', {}).get('id', ['unknown'])[0]
+      return self._dimensions.get('id', ['unknown'])[0]
+
+  @property
+  def session_id(self):
+    """Bot session ID generated when the bot was instantiated."""
+    return self._session_id
+
+  @property
+  def session_token(self):
+    """The current session token. It is refreshed by various RPC calls."""
+    return self._remote.session_token
 
   @property
   def remote(self):
@@ -166,20 +138,18 @@ class Bot(object):
     return self._server
 
   @property
-  def server_version(self):
-    """Version of the server's implementation.
+  def bot_version(self):
+    """Version of the running swarming_bot.zip file."""
+    return self._bot_version
 
-    The form is nnn-hhhhhhh for pristine version and nnn-hhhhhhh-tainted-uuuu
-    for non-upstreamed code base:
-      nnn: revision pseudo number
-      hhhhhhh: git commit hash
-      uuuu: username
-    """
-    return self._server_version
+  @property
+  def rbe_worker_properties(self):
+    """Worker properties to report to RBE, if any."""
+    return self._rbe_worker_properties
 
   @property
   def state(self):
-    """Current bot state dict, as sent to the server.
+    """A copy of the current bot state dict, as sent to the server.
 
     It is accessible from the UI and usually contains various helpful info about
     the bot status.
@@ -187,7 +157,17 @@ class Bot(object):
     The state may change often, but it can't be used in scheduling decisions.
     """
     with self._lock:
-      return copy.deepcopy(self._attributes.get('state', {}))
+      return copy.deepcopy(self._state)
+
+  @property
+  def attributes(self):
+    """A copy of the dict with bot attributes to send to the server."""
+    with self._lock:
+      return {
+          'dimensions': copy.deepcopy(self._dimensions),
+          'state': copy.deepcopy(self._state),
+          'version': self._bot_version,
+      }
 
   @property
   def swarming_bot_zip(self):
@@ -201,6 +181,11 @@ class Bot(object):
     automatically start upon boot.
     """
     return os.path.join(self.base_dir, 'swarming_bot.zip')
+
+  @property
+  def shutdown_event_posted(self):
+    """True if already submitted `bot_shutdown` or `bot_rebooting` events."""
+    return self._shutdown_event_posted
 
   def get_pseudo_rand(self, width):
     """Returns a constant pseudo-random factor for the bot within +/-width.
@@ -218,9 +203,9 @@ class Bot(object):
 
   def post_event(self, event_type, message):
     """Posts an event to the server."""
-    with self._lock:
-      attr = copy.deepcopy(self._attributes)
-    self._remote.post_bot_event(event_type, message, attr)
+    self._remote.post_bot_event(event_type, message, self.attributes)
+    if event_type in ('bot_shutdown', 'bot_rebooting'):
+      self._shutdown_event_posted = True
 
   def post_error(self, message):
     """Posts given string as a failure.
@@ -247,11 +232,23 @@ class Bot(object):
     quarantined mode.
     """
     self.post_event('bot_rebooting', message)
+
+    # The shutdown hook is called when the host machine is restarting.
     if self._shutdown_hook:
       try:
         self._shutdown_hook(self)
       except Exception as e:
         logging.exception('shutdown hook failed: %s', e)
+
+    # The exit hook is called when the bot process itself is exiting (which
+    # also happens when the machine is restarting).
+    exit_hook = self._exit_hook
+    if exit_hook:
+      try:
+        exit_hook(self)
+      except Exception as e:
+        logging.exception('exit hook failed: %s', e)
+
     # os_utilities.host_reboot should never return, unless the reboot is not
     # happening (e.g. sudo shutdown requires a password). If rebooting the host
     # is taking longer than N minutes, it probably not going to finish at all.
@@ -291,8 +288,32 @@ class Bot(object):
     with self._lock:
       return self._bot_restart_msg
 
-  def _update_bot_group_cfg(self, cfg_version, cfg):
-    """Called internally to update server-provided per-bot config.
+  @contextlib.contextmanager
+  def mutate_internals(self):
+    """Executes a mutation of the internal bot state under a lock.
+
+    Must never be used from hooks, only from Swarming bot code itself.
+
+    Inside the context manager it is generally unsafe to call Bot methods
+    directly. Instead use the emitted BotMutator methods (for both reads and
+    writes).
+    """
+    with self._lock:
+      yield BotMutator(self)
+
+
+class BotMutator(object):
+  """Exposes methods to mutate the internal state of a bot."""
+
+  def __init__(self, bot):
+    self._bot = bot
+
+  def update_session_token(self, session_token):
+    """Updates the session token used by the bot."""
+    self._bot._remote.session_token = session_token
+
+  def update_bot_group_cfg(self, cfg):
+    """Picks up the server-provided per-bot config.
 
     This is called once, right after the handshake and it may modify values of
     'state' and 'dimensions' (by augmenting them with server-provided details).
@@ -302,40 +323,147 @@ class Bot(object):
 
     See docs for '/handshake' call for the format of 'cfg' dict.
     """
-    with self._lock:
-      self._bot_group_cfg_ver = cfg_version
-      self._server_side_dimensions = (cfg or {}).get('dimensions')
-      # Apply changes to 'self._attributes'.
-      self._update_dimensions(self._attributes.get('dimensions', {}))
-      self._update_state(self._attributes.get('state', {}))
+    self._bot._server_side_dimensions = (cfg or {}).get('dimensions')
+    self._refresh_attributes()
 
-  def _update_bot_config(self, name, rev):
-    """ Update bot_config script name and revision.
+  def update_bot_config(self, name, rev):
+    """Picks up bot_config script name and revision.
 
-    This is called at start, and aftre handshake if a custom script is injected.
+    This is called at start, and after handshake if a custom script is injected.
     """
-    with self._lock:
-      self._bot_config = {
-          'name': name,
-          'revision': rev,
-      }
-      # Apply changes to 'self._attributes'.
-      self._update_dimensions(self._attributes.get('dimensions', {}))
-      self._update_state(self._attributes.get('state', {}))
+    self._bot._bot_config = {'name': name, 'revision': rev}
+    self._refresh_attributes()
 
-  def _update_dimensions(self, new_dimensions):
-    """Called internally to update Bot.dimensions."""
+  def update_idleness(self, idle):
+    """Changes the idleness state of the bot, returns the previous value."""
+    idle = bool(idle)
+    if self._bot._idle == idle:
+      return idle
+    prev, self._bot._idle = self._bot._idle, idle
+    self._refresh_attributes()
+    return prev
+
+  def update_auto_cleanup(self, auto_cleanup):
+    """Asks Swarming to cleanup after this bot once it's gone."""
+    # TODO: Implement.
+    _ = auto_cleanup
+
+  def update_rbe_state(self, instance, hybrid_mode, session):
+    self._bot._rbe_instance = instance
+    self._bot._rbe_hybrid_mode = hybrid_mode
+    self._bot._rbe_session = session
+    self._refresh_attributes()
+
+  def update_rbe_worker_properties(self, worker_properties):
+    self._bot._rbe_worker_properties = worker_properties
+    self._refresh_attributes()
+
+  def update_dimensions(self, new_dimensions):
+    """Updates `bot.dimensions` by merging-in automatically set dimensions."""
     dimensions = new_dimensions.copy()
-    dimensions.update(self._server_side_dimensions)
-    bot_config_name = self._bot_config.get('name')
+    dimensions.update(self._bot._server_side_dimensions)
+    bot_config_name = self._bot._bot_config.get('name')
     if bot_config_name:
       dimensions['bot_config'] = [bot_config_name]
-    self._attributes['dimensions'] = dimensions
+    self._bot._dimensions = dimensions
+    if self._bot._remote:
+      self._bot._remote.bot_id = dimensions.get('id', [None])[0]
 
-  def _update_state(self, new_state):
-    """Called internally to update Bot.state."""
+  def update_state(self, new_state):
+    """Updates `bot.state` by merging-in automatically set keys."""
     state = new_state.copy()
-    state['bot_group_cfg_version'] = self._bot_group_cfg_ver
-    if self._bot_config:
-      state['bot_config'] = self._bot_config
-    self._attributes['state'] = state
+    state['rbe_instance'] = self._bot._rbe_instance
+    if self._bot._rbe_instance:
+      state['rbe_session'] = self._bot._rbe_session
+      state['rbe_hybrid_mode'] = self._bot._rbe_hybrid_mode
+      state['rbe_idle'] = self._bot._idle
+    else:
+      state.pop('rbe_session', None)
+      state.pop('rbe_hybrid_mode', None)
+      state.pop('rbe_idle', None)
+    if self._bot._rbe_worker_properties:
+      state['rbe_worker_props'] = self._bot._rbe_worker_properties.to_dict()
+    else:
+      state.pop('rbe_worker_props', None)
+    if self._bot._bot_config:
+      state['bot_config'] = self._bot._bot_config
+    self._bot._state = state
+
+  def set_exit_hook(self, hook):
+    """Registers a hook called before the bot process terminates.
+
+    If the bot is very broken (e.g. can't reboot), this hook can be called
+    multiple times or even periodically. It must be idempotent.
+    """
+    self._bot._exit_hook = hook
+
+  def get_exit_hook(self):
+    """Returns the registered exit hook."""
+    return self._bot._exit_hook
+
+  def _refresh_attributes(self):
+    """Updates automatically set keys in `bot.dimensions` and `bot.state`."""
+    self.update_dimensions(self._bot._dimensions)
+    self.update_state(self._bot._state)
+
+
+### Private stuff.
+
+
+def _get_stripper(paths):
+  """Returns a function to strip common path prefixes.
+
+  There are 3 kinds of paths:
+    - relative paths
+    - absolute paths
+    - absolute paths in stdlib
+  """
+  if not paths:
+    return lambda f: f
+
+  stdlib = os.path.dirname(os.__file__)
+  # Find the common root for paths not in stdlib and not relative.
+  split_paths = [[c for c in p.split(os.path.sep) if c] for p in paths
+                 if os.path.isabs(p) and not p.startswith(stdlib)]
+  common = None
+  if split_paths:
+    common = []
+    for c1, c2 in zip(min(split_paths), max(split_paths)):
+      if c1 != c2:
+        break
+      common.append(c1)
+    if common:
+      if sys.platform == 'win32':
+        common = os.path.sep.join(common)
+      else:
+        common = os.path.sep + os.path.sep.join(common)
+
+  def stripper(f):
+    if f.startswith(stdlib):
+      return f[len(stdlib) + 1:]
+    if os.path.isabs(f) and common:
+      return f[len(common) + 1:]
+    if f.startswith('./'):
+      return f[2:]
+    return f
+
+  return stripper
+
+
+def _make_stack():
+  """Returns a well formatted call stack."""
+  frame = inspect.currentframe().f_back
+  frames = []
+  while frame and len(frames) < 50:
+    frames.append(frame)
+    frame = frame.f_back
+  strip = _get_stripper(f.f_code.co_filename for f in frames)
+  return '\n'.join(
+      '  %-2d %s:%s:%s()' %
+      (i, strip(f.f_code.co_filename), f.f_lineno, f.f_code.co_name)
+      for i, f in enumerate(frames))
+
+
+def _gen_session_id():
+  """Generates a new bot session ID."""
+  return '%s/%d' % (uuid.uuid4().hex, os.getpid())

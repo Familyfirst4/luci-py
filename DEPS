@@ -9,7 +9,7 @@ deps = {
     'packages': [
       {
         'package': 'infra/3pp/tools/nodejs/${{platform}}',
-        'version': 'version:13.3.0',
+        'version': 'version:2@20.10.0',
       }
     ],
     'dep_type': 'cipd',
@@ -21,19 +21,19 @@ deps = {
     'packages': [
       {
         'package': 'infra/tools/luci/cas/${{platform}}',
-        'version': 'git_revision:d3fd72180a6407c392ffd55a686dd4420a667aba',
+        'version': 'git_revision:320a8df0f7934159fda7721f3b507e707531d284',
       },
       {
         'package': 'infra/tools/luci/fakecas/${{platform}}',
-        'version': 'git_revision:d3fd72180a6407c392ffd55a686dd4420a667aba',
+        'version': 'git_revision:304584d35c7523e8d07c0c5222033acf9e69e91e',
       },
       {
         'package': 'infra/tools/luci/isolate/${{platform}}',
-        'version': 'git_revision:d3fd72180a6407c392ffd55a686dd4420a667aba',
+        'version': 'git_revision:86e1e222575e40a48da50295d4712c9fbab58dd9',
       },
       {
         'package': 'infra/tools/luci/swarming/${{platform}}',
-        'version': 'git_revision:15b72ff5a21cc0fe50aa940ce1d97aed4285274a',
+        'version': 'git_revision:1aabb0b2b3f24633b2768c2e9e9fa839ee8fddf6',
       }
     ],
     'dep_type': 'cipd',

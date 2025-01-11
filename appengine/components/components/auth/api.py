@@ -11,10 +11,6 @@ Functions that operate on the latest state of the DB are in model.py. And they
 generally should not be used outside of Auth components implementation.
 """
 
-# Pylint doesn't like ndb.transactional(...).
-# pylint: disable=E1120
-# pylint: disable=redefined-outer-name
-
 import collections
 import functools
 import json
@@ -156,17 +152,19 @@ SecretKey = collections.namedtuple('SecretKey', ['name'])
 # The representation of AuthGroup used by AuthDB, preprocessed for faster
 # membership checks. We keep it in AuthDB in place of AuthGroup to reduce RAM
 # usage.
-CachedGroup = collections.namedtuple('CachedGroup', [
-  'members',  # == frozenset(m.to_bytes() for m in auth_group.members)
-  'globs',
-  'nested',
-  'description',
-  'owners',
-  'created_ts',
-  'created_by',
-  'modified_ts',
-  'modified_by',
-])
+CachedGroup = collections.namedtuple(
+    'CachedGroup',
+    [
+        'members',  # frozenset(m.to_normalized_bytes() for m in group.members)
+        'globs',
+        'nested',
+        'description',
+        'owners',
+        'created_ts',
+        'created_by',
+        'modified_ts',
+        'modified_by',
+    ])
 
 
 # GroupListing is returned by list_group.
@@ -250,7 +248,7 @@ class AuthDB(object):
     cached_groups = {}
     for entity in (groups or []):
       cached_groups[entity.key.string_id()] = CachedGroup(
-          members=frozenset(m.to_bytes() for m in entity.members),
+          members=frozenset(m.to_normalized_bytes() for m in entity.members),
           globs=tuple(entity.globs or ()),
           nested=tuple(entity.nested or ()),
           description=entity.description,
@@ -293,7 +291,7 @@ class AuthDB(object):
     cached_groups = {}
     for gr in auth_db.groups:
       cached_groups[gr.name] = CachedGroup(
-          members=frozenset(gr.members),
+          members=frozenset(model.Identity.normalize(m) for m in gr.members),
           globs=tuple(model.IdentityGlob.from_bytes(x) for x in gr.globs),
           nested=tuple(gr.nested),
           description=gr.description,
@@ -457,10 +455,9 @@ class AuthDB(object):
           if p.startswith('group:'):
             groups.append(p[6:])  # 6 == len('group:')
           else:
-            idents.append(p)
+            idents.append(model.Identity.normalize(p))
         principals_set = ConditionalPrincipalsSet(
-            tuple(groups),
-            frozenset(idents),
+            tuple(groups), frozenset(idents),
             tuple(condition(idx) for idx in b.conditions))
         for perm_idx in b.permissions:
           per_permission_sets.setdefault(perm_idx, []).append(principals_set)
@@ -494,7 +491,8 @@ class AuthDB(object):
 
     Returns:
       (
-        Members index as dict(Identity.to_bytes() str => [str with group name]),
+        Members index as
+          dict(Identity.to_normalized_bytes() str => [str with group name]),
         Globs index as OrderedDict(IndentityGlob => [str with group name],
         Nested groups index as dict(group name => [str with group name]),
         Ownership index as dict(group name => [str with group name]),
@@ -552,13 +550,18 @@ class AuthDB(object):
     """URL of a token server to use to generate tokens, provided by Primary."""
     return self._token_server_url
 
+  @property
+  def group_count(self):
+    """Number of groups in the auth DB."""
+    return len(self._groups)
+
   def is_group_member(self, group_name, identity):
     """Returns True if |identity| belongs to group |group_name|.
 
     Unknown groups are considered empty.
     """
     # Will be used when checking self._groups[...].members sets.
-    ident_as_bytes = identity.to_bytes()
+    ident_as_bytes = identity.to_normalized_bytes()
 
     # While the code to add groups refuses to add cycle, this code ensures that
     # it doesn't go in a cycle by keeping track of the groups currently being
@@ -615,7 +618,8 @@ class AuthDB(object):
     """Returns AuthGroup entity reconstructing it from the cache.
 
     It slightly differs from the original entity:
-      - 'members' list is always sorted.
+      - 'members' have been normalized (i.e. transformed to lowercase) and then
+        sorted.
       - 'auth_db_rev' and 'auth_db_prev_rev' are not set.
 
     Returns:
@@ -760,7 +764,7 @@ class AuthDB(object):
             add_edge(glob_id, Graph.IN, traverse(group))
 
       # Find all groups that directly mention the identity.
-      for group in members_idx.get(principal.to_bytes(), ()):
+      for group in members_idx.get(principal.to_normalized_bytes(), ()):
         add_edge(graph.root_id, Graph.IN, traverse(group))
 
     elif isinstance(principal, model.IdentityGlob):
@@ -852,6 +856,7 @@ class AuthDB(object):
         self._internal_domains_re and
         self._internal_domains_re.match(domain))
 
+  # pylint: disable=redefined-outer-name
   def has_permission(self, permission, realms, identity, attributes=None):
     """Returns True if the identity has the given permission in any of `realms`.
 
@@ -1008,7 +1013,7 @@ class AuthDB(object):
     # applied", and all([]) correctly returns True for this case.
     if not all(cond(attributes) for cond in principals.conditions):
       return False
-    if ident.to_bytes() in principals.idents:
+    if ident.to_normalized_bytes() in principals.idents:
       return True
     for gr in principals.groups:
       if gr not in checked_groups:
@@ -1594,10 +1599,11 @@ def get_process_auth_db():
     # on the lock.
     _auth_db_fetching_thread = threading.current_thread()
     known_auth_db = _auth_db
-    logging.debug('Refetching AuthDB')
+    logging.debug('Refetching AuthDB (cur rev is %d)', _auth_db.auth_db_rev)
 
   # Do the actual fetch outside the lock. Be careful to handle any unexpected
   # exception by 'fixing' the global state before leaving this function.
+  fetched = None
   try:
     # Note: if process doesn't use 'get_latest_auth_db' this lock is noop, since
     # the dance we do with _auth_db_fetching_thread already guarantees there's
@@ -1605,20 +1611,17 @@ def get_process_auth_db():
     # conjunction with concurrent 'get_latest_auth_db' calls.
     with _auth_db_fetch_lock:
       fetched = fetch_auth_db(known_auth_db=known_auth_db)
-  except Exception:
-    # Be sure to allow other threads to try the fetch. Meanwhile log the
-    # exception and return a stale copy of AuthDB. Better than nothing.
-    logging.exception('Failed to refetch AuthDB, returning stale cached copy')
+  finally:
     with _auth_db_lock:
       assert _auth_db_fetching_thread == threading.current_thread()
       _auth_db_fetching_thread = None
-      return _auth_db
-
-  # Fetch has completed successfully. Update the process cache now.
-  with _auth_db_lock:
-    assert _auth_db_fetching_thread == threading.current_thread()
-    _auth_db_fetching_thread = None
-    return _roll_auth_db_cache(fetched)
+      if fetched:
+        # Fetch has completed successfully. Update the process cache now.
+        # pylint: disable=lost-exception
+        return _roll_auth_db_cache(fetched)
+      # The fetch has failed. An exception is already being raised and will be
+      # propagated up the stack.
+  raise AssertionError('This line should be unreachable')
 
 
 def get_latest_auth_db():
@@ -1678,7 +1681,8 @@ def _initialize_auth_db_cache():
   logging.info('Initial fetch of AuthDB')
   _auth_db = fetch_auth_db()
   _auth_db_expiration = time.time() + _process_cache_expiration_sec
-  logging.info('Fetched AuthDB at rev %d', _auth_db.auth_db_rev)
+  logging.info('Fetched AuthDB at rev %d (%d groups)', _auth_db.auth_db_rev,
+               _auth_db.group_count)
 
   return _auth_db
 
@@ -1723,10 +1727,12 @@ def _roll_auth_db_cache(candidate):
   # some internal caches we want to keep. So update _auth_db only if candidate
   # is strictly fresher.
   if candidate.auth_db_rev > _auth_db.auth_db_rev:
+    logging.info('Updated cached AuthDB: rev %d->%d (%d groups)',
+                 _auth_db.auth_db_rev, candidate.auth_db_rev,
+                 candidate.group_count)
     _auth_db = candidate
-    logging.info(
-        'Updated cached AuthDB: rev %d->%d',
-        _auth_db.auth_db_rev, candidate.auth_db_rev)
+  else:
+    logging.info('Reusing cached AuthDB rev %d', _auth_db.auth_db_rev)
 
   # Bump the expiration time even if the candidate's version is same as the
   # current cached one. We've just confirmed it is still fresh, we can keep
@@ -2034,10 +2040,10 @@ def require(callback, error_msg=None, log_identity=False):
 
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
-      if not callback():
-        raise AuthorizationError(error_msg)
       if log_identity:
         logging.info('Accessed from %s' % get_current_identity().to_bytes())
+      if not callback():
+        raise AuthorizationError(error_msg)
       return func(*args, **kwargs)
 
     # Propagate reference to original function, mark function as decorated.
@@ -2249,6 +2255,7 @@ def validate_realm_name(name):
         (name, _REALM_NAME_RE.pattern, ' or '.join(_SPECIAL_REALMS)))
 
 
+# pylint: disable=redefined-outer-name
 def has_permission(permission, realms, identity=None, attributes=None):
   """Returns True if the identity has the given permission in any of the realms.
 
@@ -2280,6 +2287,7 @@ def has_permission(permission, realms, identity=None, attributes=None):
       permission, realms, identity or get_current_identity(), attributes)
 
 
+# pylint: disable=redefined-outer-name
 def has_permission_dryrun(
       permission,
       realms,

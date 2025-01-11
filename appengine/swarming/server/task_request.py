@@ -37,7 +37,7 @@ Graph of the schema:
         |          |      |
         v          |      v
     +-----------+  | +----------+
-    |SecretBytes|  | |BuildToken|
+    |SecretBytes|  | |BuildTask|
     |id=1       |  | |build_id  |
     +-----------+  | |token     |
                    | |bb_host   |
@@ -70,12 +70,12 @@ from components import pubsub
 from components import utils
 from components.config import validation
 
-from proto.api import swarming_pb2
-from server import bq_state
+from proto.config import pools_pb2
 from server import config
 from server import directory_occlusion
 from server import pools_config
 from server import service_accounts_utils
+from server import string_pairs_serializer
 from server import task_pack
 from server import task_queues
 from server.constants import OR_DIM_SEP
@@ -96,20 +96,34 @@ TEMPLATE_CANARY_PREFER = TemplateApplyEnum('TEMPLATE_CANARY_PREFER')
 TEMPLATE_CANARY_NEVER = TemplateApplyEnum('TEMPLATE_CANARY_NEVER')
 TEMPLATE_SKIP = TemplateApplyEnum('TEMPLATE_SKIP')
 
+# Default value to wait for pings from bot.
+DEFAULT_BOT_PING_TOLERANCE = 1200
+
+# Default value for grace_period for task cancellation.
+DEFAULT_GRACE_PERIOD_SECS = 30
+
+# Maximum allowed grace_period for task cancellation.
+#
+# This is the maximum amount the bot will spend waiting for a canceled or
+# timed out task to react to SIGTERM before forcefully killing it. For timed out
+# tasks it applies after `execution_timeout_secs` has already passed.
+MAX_GRACE_PERIOD_SECS = 60 * 60
+
 # Maximum allowed timeout for I/O and hard timeouts.
 #
-# Seven days in seconds. Includes an additional 10s to account for small jitter.
-MAX_TIMEOUT_SECS = 7 * 24 * 60 * 60 + 10
+# The overall timeout including the grace period and all overheads must fit
+# under 7 days (per RBE limits). So this value is slightly less than 7 days.
+MAX_TIMEOUT_SECS = 7 * 24 * 60 * 60 - MAX_GRACE_PERIOD_SECS - 60
 
 # Maximum allowed expiration for a pending task.
 #
-# Seven days in seconds. Includes an additional 10s to account for small jitter.
-MAX_EXPIRATION_SECS = 7 * 24 * 60 * 60 + 10
+# Seven days in seconds.
+MAX_EXPIRATION_SECS = 7 * 24 * 60 * 60
 
 # Minimum value for timeouts.
 #
 # The rationale for 1s on local dev server is to enable quicker testing in
-# local_smoke_test.py.
+# local_smoke_testing.py.
 _MIN_TIMEOUT_SECS = 1 if utils.is_local_dev_server() else 30
 
 # The world started on 2010-01-01 at 00:00:00 UTC. The rationale is that using
@@ -131,16 +145,6 @@ _CACHE_NAME_RE = re.compile(r'^[a-z0-9_]{1,4096}$')
 # Early verification of environment variable key name.
 _ENV_KEY_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 
-# TaskRequest entity groups are deleted when they are older than the cutoff.
-_OLD_TASK_REQUEST_CUT_OFF = datetime.timedelta(days=18 * 31)
-
-# Number of TaskRequest entity groups to be deleted per GAE task. In practice
-# we've observed it's possible to delete 1500 TaskRequest groups per 4.5
-# minutes, so there's ~3x room.
-#
-# Defined here so it can be reduced in tests.
-_TASKS_DELETE_CHUNK_SIZE = 1000
-
 # If no update is received from bot after max seconds lapsed from its last ping
 # to the server, it will be considered dead.
 _MAX_BOT_PING_TOLERANCE_SECS = 1200
@@ -151,6 +155,13 @@ _MIN_BOT_PING_TOLERANCE_SECS = 60
 # Full CAS instance name verification.
 # The name should be `projects/{project}/instances/{instance}`.
 _CAS_INSTANCE_RE = re.compile(r'^projects/[a-z0-9-]+/instances/[a-z0-9-_]+$')
+
+# Tag keys that can't be set via public API because they are used internally by
+# Swarming and have some extra meaning.
+_RESERVED_TAGS = frozenset([
+    'swarming.terminate',  # used to identify tasks created by TerminateBot RPC
+])
+
 
 ### Properties validators must come before the models.
 
@@ -203,11 +214,11 @@ def _validate_dimensions(_prop, value):
           u'dimensions must be a dict of strings or list of string, not %r' %
           value)
 
-    for value in values:
-      if not value:
+    for val in values:
+      if not val:
         raise datastore_errors.BadValueError(
             u'dimensions value must be a string, not None')
-      or_dimensions_num *= len(value.split(OR_DIM_SEP))
+      or_dimensions_num *= len(val.split(OR_DIM_SEP))
       if or_dimensions_num > max_or_dimensions_num:
         raise datastore_errors.BadValueError(
             'possible dimension subset for \'or\' dimensions '
@@ -226,12 +237,12 @@ def _validate_dimensions(_prop, value):
           u'dimension key %r has repeated values' % k)
 
     normalized_values = []
-    for value in values:
-      or_values = value.split(OR_DIM_SEP)
+    for val in values:
+      or_values = val.split(OR_DIM_SEP)
       for v in or_values:
         if not config.validate_dimension_value(v):
           raise datastore_errors.BadValueError(
-              u'dimension key %r has invalid value %r' % (k, value))
+              u'dimension key %r has invalid value %r' % (k, val))
       # sorts OR's operands, so that dimension_hash for semantically equivalent
       # dimension values will be the same.
       normalized_values.append(OR_DIM_SEP.join(sorted(or_values)))
@@ -312,8 +323,8 @@ def _check_expiration_secs(name, value):
   """Validates expiration_secs."""
   if not (_MIN_TIMEOUT_SECS <= value <= MAX_EXPIRATION_SECS):
     raise datastore_errors.BadValueError(
-        '%s (%s) must be between %ds and 7 days' %
-        (name, value, _MIN_TIMEOUT_SECS))
+        '%s (%s) must be between %ds and %ds' %
+        (name, value, _MIN_TIMEOUT_SECS, MAX_EXPIRATION_SECS))
 
 
 def _validate_expiration_ts(prop, value):
@@ -332,9 +343,10 @@ def _validate_expiration_secs(prop, value):
 def _validate_grace(prop, value):
   """Validates grace_period_secs in TaskProperties."""
   # pylint: disable=protected-access
-  if not (0 <= value <= 60 * 60):
+  if not (0 <= value <= MAX_GRACE_PERIOD_SECS):
     raise datastore_errors.BadValueError(
-        '%s (%ds) must be between 0s and one hour' % (prop._name, value))
+        '%s (%ds) must be between 0s and %ds' %
+        (prop._name, value, MAX_GRACE_PERIOD_SECS))
 
 
 def _validate_priority(_prop, value):
@@ -358,8 +370,8 @@ def _validate_hard_timeout(prop, value):
     # 0 is tolerated for termination task, but we don't advertize that, that's
     # an internal detail.
     raise datastore_errors.BadValueError(
-        '%s (%ds) must be between %ds and seven days' %
-        (prop._name, value, _MIN_TIMEOUT_SECS))
+        '%s (%ds) must be between %ds and %ds' %
+        (prop._name, value, _MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS))
 
 
 def _validate_io_timeout(prop, value):
@@ -367,8 +379,8 @@ def _validate_io_timeout(prop, value):
   # pylint: disable=protected-access
   if value and not (_MIN_TIMEOUT_SECS <= value <= MAX_TIMEOUT_SECS):
     raise datastore_errors.BadValueError(
-        '%s (%ds) must be 0 or between %ds and seven days' %
-        (prop._name, value, _MIN_TIMEOUT_SECS))
+        '%s (%ds) must be 0 or between %ds and %ds' %
+        (prop._name, value, _MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS))
 
 
 def _validate_tags(prop, value):
@@ -572,6 +584,18 @@ class CASReference(ndb.Model):
     out.cas_instance = self.cas_instance
     self.digest.to_proto(out.digest)
 
+  @classmethod
+  def create_from_json(cls, json):
+    """Create a CASReference from JSON input"""
+    cas_instance = json.get('instance')
+    digest = json.get('digest')
+    h = ''
+    size = 0
+    if digest:
+      h, size = digest.split('/')
+    return cls(cas_instance=cas_instance,
+               digest=Digest(hash=h, size_bytes=int(size)))
+
 
 class SecretBytes(ndb.Model):
   """Defines an optional secret byte string logically defined with the
@@ -584,17 +608,32 @@ class SecretBytes(ndb.Model):
       validator=_get_validate_length(20 * 1024), indexed=False)
 
 
-class BuildToken(ndb.Model):
-  """Stores the build_id and a token sent by buildbucket.
+class BuildTask(ndb.Model):
+  """Stores the buildbucket related fields sent by buildbucket.
 
-  When a task changes state, the token is used in the request to Buildbucket
-  to update the status of the build.
+  Also stores latest task state.
   """
-
+  # Disable in-process per-request cache and memcache, since Go service will
+  # perform some writes and cannot update the same caches.
+  _use_cache = False
   _use_memcache = False
+
   build_id = ndb.StringProperty(required=True, indexed=False)
-  token = ndb.StringProperty(required=True, indexed=False)
   buildbucket_host = ndb.StringProperty(required=True, indexed=False)
+  # A monotonically increasing integer that is used to compare when updates
+  # (state changes) have occured. A timestamp measured in ms is used.
+  update_id = ndb.IntegerProperty(required=True, indexed=False)
+  # A TaskResult.State that will keep the latest task status
+  # that has been converted to a common_pb2.Status sent to buildbucket.
+  latest_task_status = ndb.IntegerProperty(required=True, indexed=False)
+  # The pubsub topic name that will be used to send UpdateBuildTask
+  # messages to buildbucket.
+  pubsub_topic = ndb.StringProperty(required=True, indexed=False)
+  # Bot dimensions for the task. Stored when bot_update_task is first called for
+  # a task backend build, thus that bot_update_task does not have to make any
+  # more extra datastore calls in subsequent bot_update_task calls.
+  bot_dimensions = datastore_utils.DeterministicJsonProperty(json_type=dict,
+                                                             required=False)
 
 
 class CipdPackage(ndb.Model):
@@ -632,6 +671,13 @@ class CipdPackage(ndb.Model):
       raise datastore_errors.BadValueError('CIPD package name is required')
     if not self.version:
       raise datastore_errors.BadValueError('CIPD package version is required')
+
+  @classmethod
+  def create_from_json(cls, json):
+    result = {}
+    for name in ('package_name', 'version', 'path'):
+      result[name] = json.get(name)
+    return cls(**result)
 
 
 class CipdInput(ndb.Model):
@@ -813,8 +859,10 @@ class TaskProperties(ndb.Model):
   # Grace period is the time between signaling the task it timed out and killing
   # the process. During this time the process should clean up itself as quickly
   # as possible, potentially uploading partial results back.
-  grace_period_secs = ndb.IntegerProperty(
-      validator=_validate_grace, default=30, indexed=False)
+  grace_period_secs = ndb.IntegerProperty(validator=_validate_grace,
+                                          default=DEFAULT_GRACE_PERIOD_SECS,
+                                          required=True,
+                                          indexed=False)
 
   # Bot controlled timeout for new bytes from the subprocess. If a subprocess
   # doesn't output new data to stdout for .io_timeout_secs, consider the command
@@ -1027,39 +1075,74 @@ class TaskSlice(ndb.Model):
   # set to False to avoid unnecessary waiting.
   wait_for_capacity = ndb.BooleanProperty(default=False)
 
-  def properties_hash(self, request):
-    """Calculates the properties_hash for this request, if applicable.
+  # Precalculated properties hash for deduplication and BQ exports.
+  #
+  # Populated in task_scheduler.schedule_request(...) before storing the entity.
+  properties_hash = ndb.BlobProperty(indexed=False)
 
-    Note: if the property has secret bytes, this function call causes a DB GET.
+  def precalculate_properties_hash(self, secret_bytes):
+    """Calculates the hash of properties for this slice.
+
+    Populates self.properties_hash.
+
+    Args:
+      secret_bytes: SecretBytes entity for the request, if any.
     """
-    if not self.properties.idempotent:
-      return None
-    return self._properties_hash_raw(request).digest()
+    self.properties_hash = self.calculate_properties_hash(secret_bytes)
 
-  def _properties_hash_raw(self, request):
-    """Calculates the properties_hash for this request."""
+  def calculate_properties_hash(self, secret_bytes):
+    """Calculates the hash of properties for this slice.
+
+    Return the hash without populating self.properties_hash.
+
+    Args:
+      secret_bytes: SecretBytes entity for the request, if any.
+    """
     props = self.properties.to_dict()
-    if self.properties.has_secret_bytes:
-      # When called from task_scheduler.schedule_task(), this function is called
-      # in the same context that stored the SecretBytes entity, so the entity is
-      # still in the in process cache.
-      #
-      # When called in the context of an idempotent TaskRunResult that is
-      # COMPLETED with success, this is much more costly since this happens
-      # inside a transaction.
-      s = task_pack.request_key_to_secret_bytes_key(request.key).get()
-      if s:
-        props['secret_bytes'] = s.secret_bytes.encode('hex')
-      else:
-        # A TaskRequest is broken if the corresponding SecretBytes is not
-        # present. Tolerate it here but log a warning.
-        logging.warning('%s is broken; SecretBytes is missing', request.task_id)
-    return self.HASHING_ALGO(utils.encode_to_json(props))
+    if secret_bytes:
+      props['secret_bytes'] = secret_bytes.secret_bytes.encode('hex')
+    return self.HASHING_ALGO(utils.encode_to_json(props)).digest()
+
+  def calculate_properties_hash_v2(self, secret_bytes):
+    """Calculates the hash of properties for this slice the same way as go side.
+
+    Return the hash without populating self.properties_hash.
+
+    Args:
+      secret_bytes: SecretBytes entity for the request, if any.
+    """
+    serializer = string_pairs_serializer.StringPairsSerializer()
+    serialized = serializer.to_bytes(self.properties, secret_bytes)
+    sha256_hash = hashlib.sha256()
+    sha256_hash.update(serialized)
+    return sha256_hash.digest()
+
+  def get_properties_hash(self, request):
+    """Returns the hash of properties for this slice.
+
+    For newer entities, this just returns the precalculated `properties_hash`
+    value. For older entities it calculates the hash on the fly, potentially
+    fetching the SecretBytes entity if necessary.
+
+    Args:
+      request: the parent TaskRequest.
+
+    Returns:
+      Raw digest as a byte string.
+    """
+    if not self.properties_hash:
+      secret_bytes = None
+      if self.properties.has_secret_bytes:
+        secret_bytes = task_pack.request_key_to_secret_bytes_key(
+            request.key).get()
+      self.precalculate_properties_hash(secret_bytes)
+    return self.properties_hash
 
   def to_dict(self):
     # to_dict() doesn't recurse correctly into ndb.LocalStructuredProperty! It
     # will call the default method and not the overridden one. :(
-    out = super(TaskSlice, self).to_dict(exclude=['properties'])
+    out = super(TaskSlice,
+                self).to_dict(exclude=['properties', 'properties_hash'])
     out['properties'] = self.properties.to_dict()
     return out
 
@@ -1067,7 +1150,7 @@ class TaskSlice(ndb.Model):
     """Converts self to a swarming_pb2.TaskSlice."""
     if self.properties:
       self.properties.to_proto(out.properties)
-      out.properties_hash = self._properties_hash_raw(request).hexdigest()
+      out.properties_hash = self.get_properties_hash(request).encode('hex')
     out.wait_for_capacity = self.wait_for_capacity
     if self.expiration_secs:
       out.expiration.seconds = self.expiration_secs
@@ -1079,6 +1162,31 @@ class TaskSlice(ndb.Model):
     self.properties._pre_put_hook()
     if self.wait_for_capacity is None:
       raise datastore_errors.BadValueError('wait_for_capacity is required')
+
+
+class TaskRequestID(ndb.Model):
+  """Defines a mapping between request_id and task_id.
+
+  request_id is passed to create_key to create the key for this entity.
+
+  This model is immutable.
+  """
+  # Disable memcache and in-memory cache since this entity is almost
+  # always written and read only once.
+  _use_cache = False
+  _use_memcache = False
+
+  # The task_id (TaskResultSummay packed key) from a task that was created from
+  # a request_id.
+  task_id = ndb.StringProperty(required=True, indexed=False)
+
+  # When this entity should expire and be removed from datastore.
+  # TTL https://cloud.google.com/datastore/docs/ttl
+  expire_at = ndb.DateTimeProperty(indexed=False)
+
+  @classmethod
+  def create_key(cls, request_id):
+    return ndb.Key(cls, request_id)
 
 
 class TaskRequest(ndb.Model):
@@ -1093,18 +1201,24 @@ class TaskRequest(ndb.Model):
   # Time this request was registered. It is set manually instead of using
   # auto_now_add=True so that expiration_ts can be set very precisely relative
   # to this property.
+  #
+  # The index is used in BQ exports and when cleaning up old tasks.
   created_ts = ndb.DateTimeProperty(required=True)
+
+  # Used to make the transaction that creates TaskRequest idempotent.
+  # Just a random string. Should not be used for anything else. Should not show
+  # up anywhere.
+  txn_uuid = ndb.StringProperty(indexed=False, required=False)
 
   ## What
 
   # The TaskSlice describes what to run. When the list has more than one item,
   # this is to enable task fallback.
-  task_slices = ndb.LocalStructuredProperty(
-      TaskSlice, compressed=True, repeated=True)
+  task_slices = ndb.LocalStructuredProperty(TaskSlice, repeated=True)
   # Old way of specifying task properties. Only one of properties or
   # task_slices can be set.
   properties_old = ndb.LocalStructuredProperty(
-      TaskProperties, compressed=True, name='properties')
+      TaskProperties, name='properties')
 
   # If the task request is not scheduled by this moment, it will be aborted by a
   # cron job. It is saved instead of scheduling_expiration_secs so finding
@@ -1117,37 +1231,69 @@ class TaskRequest(ndb.Model):
   ## Why and other contexts
 
   # The name for this task request. It's only for description.
-  name = ndb.StringProperty(required=True)
+  name = ndb.StringProperty(indexed=False, required=True)
 
   # Authenticated client that triggered this task.
-  authenticated = auth.IdentityProperty()
+  authenticated = auth.IdentityProperty(indexed=False)
 
   # Which user to blame for this task. Can be arbitrary, not asserted by any
   # credentials.
-  user = ndb.StringProperty(default='')
+  user = ndb.StringProperty(default='', indexed=False)
 
   # Indicates what OAuth2 credentials the task uses when calling other services.
   #
   # Possible values are: 'none', 'bot' or <email>. For more information see
   # swarming_rpcs.NewTaskRequest.
-  service_account = ndb.StringProperty(validator=_validate_service_account)
+  service_account = ndb.StringProperty(
+      indexed=False, validator=_validate_service_account)
 
   # Priority of the task to be run. A lower number is higher priority, thus will
   # preempt requests with lower priority (higher numbers).
   priority = ndb.IntegerProperty(
       indexed=False, validator=_validate_priority, required=True)
 
+  # Scheduling algorithm set in pools.cfg at the time the request was created.
+  #
+  # The value is pools_pb2.Pool.SchedulingAlgorithm enum (including UNKNOWN).
+  scheduling_algorithm = ndb.IntegerProperty(
+      indexed=False,
+      required=False,
+      default=pools_pb2.Pool.SCHEDULING_ALGORITHM_UNKNOWN)
+
+  # RBE instance to send the task to or None to use Swarming native scheduler.
+  #
+  # Initialized in process_task_request based on the target pool config.
+  rbe_instance = ndb.StringProperty(indexed=False, required=False)
+
   # Tags that specify the category of the task. This property contains both the
   # tags specified by the user and the tags for every TaskSlice.
-  tags = ndb.StringProperty(repeated=True, validator=_validate_tags)
+  tags = ndb.StringProperty(
+      indexed=False, repeated=True, validator=_validate_tags)
   # Tags that are provided by the user. This is used to regenerate the list of
   # tags for TaskResultSummary based on the actual TaskSlice used.
   manual_tags = ndb.StringProperty(
-      repeated=True, validator=_validate_tags, indexed=False)
+      indexed=False, repeated=True, validator=_validate_tags)
 
   # Set when a task (the parent) reentrantly create swarming tasks. Must be set
   # to a valid task_id pointing to a TaskRunResult or be None.
+  #
+  # The index is used to find children of a particular parent task to cancel
+  # them when the parent task dies.
   parent_task_id = ndb.StringProperty(validator=_validate_task_run_id)
+
+  # Identifies the task run that started the tree of Swarming tasks.
+  #
+  # If a new task doesn't have a parent, this is set to None. Otherwise if
+  # the parent task has `root_task_id`, this value is used in the new task.
+  # Otherwise `parent_task_id` itself is used.
+  #
+  # That way all tasks from the same task tree (except the root one itself) will
+  # have `root_task_id` populated.
+  #
+  # This is used in BQ exported. Not clear if anyone actually consumes this
+  # information.
+  root_task_id = ndb.StringProperty(indexed=False,
+                                    validator=_validate_task_run_id)
 
   # PubSub topic to send task completion notification to.
   pubsub_topic = ndb.StringProperty(
@@ -1165,7 +1311,10 @@ class TaskRequest(ndb.Model):
   # I/O bound, so they would require higher threshold specified by the
   # user request.
   bot_ping_tolerance_secs = ndb.IntegerProperty(
-      indexed=False, validator=_validate_ping_tolerance, default=1200)
+      indexed=False,
+      validator=_validate_ping_tolerance,
+      required=True,
+      default=DEFAULT_BOT_PING_TOLERANCE)
 
   # The ResultDB invocation's update token for the task run that was created for
   # this request.
@@ -1175,17 +1324,17 @@ class TaskRequest(ndb.Model):
 
   # Task realm.
   # See api/swarming.proto for more details.
-  realm = ndb.StringProperty(validator=_validate_realm)
+  realm = ndb.StringProperty(indexed=False, validator=_validate_realm)
 
   # Realm enforcement flag.
   # Use Realm-aware ACLs if True is set.
   realms_enabled = ndb.BooleanProperty(default=False, indexed=False)
 
   # ResultDB property in task new request.
-  resultdb = ndb.LocalStructuredProperty(ResultDBCfg, compressed=True)
+  resultdb = ndb.LocalStructuredProperty(ResultDBCfg)
 
-  # If True, the TaskRequest has an associated BuildToken.
-  has_build_token = ndb.BooleanProperty(default=False, indexed=False)
+  # If True, the TaskRequest has an associated BuildTask.
+  has_build_task = ndb.BooleanProperty(default=False, indexed=False)
 
   @property
   def num_task_slices(self):
@@ -1225,9 +1374,9 @@ class TaskRequest(ndb.Model):
           return task_pack.request_key_to_secret_bytes_key(self.key)
 
   @property
-  def build_token_key(self):
-    if self.has_build_token:
-      return task_pack.request_key_to_build_token_key(self.key)
+  def build_task_key(self):
+    if self.has_build_task:
+      return task_pack.request_key_to_build_task_key(self.key)
 
   @property
   def task_id(self):
@@ -1271,8 +1420,13 @@ class TaskRequest(ndb.Model):
     # to_dict() doesn't recurse correctly into ndb.LocalStructuredProperty! It
     # will call the default method and not the overridden one. :(
     out = super(TaskRequest, self).to_dict(exclude=[
-        'manual_tags', 'properties_old', 'pubsub_auth_token',
-        'resultdb_update_token', 'task_slice'
+        'manual_tags',
+        'properties_old',
+        'pubsub_auth_token',
+        'resultdb_update_token',
+        'task_slice',
+        'scheduling_algorithm',
+        'txn_uuid',
     ])
     if self.properties_old:
       out['properties'] = self.properties_old.to_dict()
@@ -1430,7 +1584,7 @@ def _get_automatic_tags_from_slice(task_slice):
 def _get_automatic_tags(request):
   """Returns tags that should automatically be added to the TaskRequest.
 
-  This includes geneated tags from all TaskSlice.
+  This includes generated tags from all TaskSlice.
   """
   tags = set((
       u'priority:%s' % request.priority,
@@ -1449,6 +1603,11 @@ def _get_automatic_tags(request):
 ### Public API.
 
 
+def is_reserved_tag(tag):
+  """Returns True if this task tag is not allowed to be set via public API."""
+  return tag.split(':', 1)[0] in _RESERVED_TAGS
+
+
 def get_automatic_tags(request, index):
   """Returns tags that should automatically be added to the TaskRequest for one
   specific TaskSlice.
@@ -1462,10 +1621,10 @@ def get_automatic_tags(request, index):
   return tags
 
 
-def create_termination_task(bot_id, wait_for_capacity):
+def create_termination_task(bot_id, rbe_instance=None, reason=None):
   """Returns a task to terminate the given bot.
 
-  ACL check must have been done before.
+  ACL check and the check that the bot exists must have been done before.
 
   Returns:
     TaskRequest for priority 0 (highest) termination task.
@@ -1476,18 +1635,26 @@ def create_termination_task(bot_id, wait_for_capacity):
       grace_period_secs=0,
       io_timeout_secs=0)
   now = utils.utcnow()
+  if reason:
+    name = u'Terminate %s: %s' % (bot_id, reason)
+  else:
+    name = u'Terminate %s' % bot_id
   request = TaskRequest(
       created_ts=now,
-      expiration_ts=now + datetime.timedelta(days=1),
-      name=u'Terminate %s' % bot_id,
+      expiration_ts=now + datetime.timedelta(days=5),
+      name=name,
       priority=0,
+      rbe_instance=rbe_instance,
+      scheduling_algorithm=pools_pb2.Pool.SCHEDULING_ALGORITHM_FIFO,
       task_slices=[
-          TaskSlice(
-              expiration_secs=24 * 60 * 60,
-              properties=properties,
-              wait_for_capacity=wait_for_capacity),
+          TaskSlice(expiration_secs=5 * 24 * 60 * 60,
+                    properties=properties,
+                    wait_for_capacity=False),
       ],
-      manual_tags=[u'terminate:1'])
+      manual_tags=[
+          u'swarming.terminate:1',
+          u'rbe:%s' % (rbe_instance or 'none'),
+      ])
   assert request.task_slice(0).properties.is_terminate
   init_new_request(request, True, TEMPLATE_SKIP)
   return request
@@ -1521,19 +1688,6 @@ def new_request_key():
   # TODO(maruel): Use real randomness.
   suffix = random.getrandbits(16)
   return convert_to_request_key(utils.utcnow(), suffix)
-
-
-def request_key_to_datetime(request_key):
-  """Converts a TaskRequest.key to datetime.
-
-  See new_request_key() for more details.
-  """
-  if request_key.kind() != 'TaskRequest':
-    raise ValueError('Expected key to TaskRequest, got %s' % request_key.kind())
-  # Ignore lowest 20 bits.
-  xored = request_key.integer_id() ^ task_pack.TASK_REQUEST_KEY_ID_MASK
-  offset_ms = (xored >> 20) / 1000.
-  return _BEGINING_OF_THE_WORLD + datetime.timedelta(seconds=offset_ms)
 
 
 def datetime_to_request_base_id(now):
@@ -1753,6 +1907,8 @@ def init_new_request(request, allow_high_priority, template_apply):
       raise ValueError('parent_task_id is not a valid task')
     # Drop the previous user.
     request.user = parent.user
+    # Propagate `root_task_id`.
+    request.root_task_id = parent.root_task_id or request.parent_task_id
 
   # If the priority is below 20, make sure the user has right to do so.
   if request.priority < 20 and not allow_high_priority:
@@ -1904,134 +2060,7 @@ def yield_request_keys_by_parent_task_id(parent_task_id):
   """Returns an iterator of child TaskRequest keys."""
   parent_summary_key = task_pack.unpack_result_summary_key(parent_task_id)
   run_result_key = task_pack.result_summary_key_to_run_result_key(
-      parent_summary_key, 1)
+      parent_summary_key)
   run_result_id = task_pack.pack_run_result_key(run_result_key)
   return TaskRequest.query(TaskRequest.parent_task_id == run_result_id).iter(
       keys_only=True)
-
-
-def cron_delete_old_task_requests():
-  """Deletes very old TaskRequest entities and their children entities.
-
-  This function doesn't really delete the entities, instead of collect the
-  task_id for each of them, and trigger batches of deletion to a task queue.
-
-  This is needed because the rate of deletion is slower than the incoming rate,
-  so we need to delete batches of old TaskRequest in parallel on instances with
-  high utilization.
-  """
-  start = utils.utcnow()
-  # Run for 4.5 minutes and schedule the cron job every 5 minutes. Running for
-  # 9.5 minutes (out of 10 allowed for a cron job) results in 'Exceeded soft
-  # private memory limit of 512 MB with 512 MB' even if this loop should be
-  # fairly light on memory usage.
-  time_to_stop = start + datetime.timedelta(seconds=int(4.5 * 60))
-  # Total TaskRequest entities processed
-  total = 0
-  # GAE tasks queues that were created to do the actual deletion.
-  tasks_succeeded = 0
-  tasks_failed = 0
-  end_ts = start - _OLD_TASK_REQUEST_CUT_OFF
-  first = None
-  last = None
-  try:
-    # Key ordering is by most recent first. We want the reverse, delete the
-    # oldest first. That would require ordering by -TaskRequest.key, which would
-    # require a new composite index. We don't want that. So instead use
-    # .created_ts directly, which is ordered by what is needed.
-    opt = ndb.QueryOptions(use_cache=False, use_memcache=False, keys_only=True)
-    # Using a keys_only request is eventually consistent, which is normally
-    # risky. Here this is fine because this is year+ old entities, so the index
-    # should be consistent. :)
-    q = TaskRequest.query(default_options=opt).filter(
-        TaskRequest.created_ts <= end_ts)
-    cursor = None
-    while utils.utcnow() <= time_to_stop:
-      keys, cursor, more = q.fetch_page(
-          _TASKS_DELETE_CHUNK_SIZE, start_cursor=cursor)
-      if not keys:
-        break
-      total += len(keys)
-      data = {u'task_ids': [task_pack.pack_request_key(k) for k in keys]}
-      if not first:
-        first = keys[0]
-      last = keys[-1]
-      ok = utils.enqueue_task(
-          '/internal/taskqueue/cleanup/tasks/delete',
-          'delete-tasks',
-          payload=utils.encode_to_json(data))
-      if not ok:
-        logging.info('Failed to enqueue %d tasks for deletion', len(keys))
-        tasks_failed += 1
-      else:
-        tasks_succeeded += 1
-      if not more:
-        break
-  finally:
-    first_ts = request_key_to_datetime(first) if first else None
-    last_ts = request_key_to_datetime(last) if last else None
-
-    def _format_ts(t):
-      # datetime.datetime
-      return t.strftime(u'%Y-%m-%d %H:%M') if t else 'N/A'
-
-    def _format_delta(e, s):
-      # datetime.timedelta
-      return str(e - s).rsplit('.', 1)[0] if e and s else 'N/A'
-
-    logging.info(
-        'Found %d TaskRequest entities to delete. %d tasks triggered;'
-        ' %d failed\n'
-        'From %s to %s (%s)\n'
-        'Cut off was %s; trailing by %s', total, tasks_succeeded, tasks_failed,
-        _format_ts(first_ts), _format_ts(last_ts),
-        _format_delta(last_ts, first_ts), _format_ts(end_ts),
-        _format_delta(end_ts, last_ts))
-  return total
-
-
-def task_delete_tasks(task_ids):
-  """Deletes the specified tasks, a list of string encoded task ids."""
-  total = 0
-  count = 0
-  opt = ndb.QueryOptions(use_cache=False, use_memcache=False, keys_only=True)
-  try:
-    for task_id in task_ids:
-      request_key = task_pack.unpack_request_key(task_id)
-      # Delete the whole group. An ancestor query will retrieve the entity
-      # itself too, so no need to explicitly delete it.
-      keys = ndb.Query(default_options=opt, ancestor=request_key).fetch()
-      if not keys:
-        # Can happen if it is a retry.
-        continue
-      ndb.delete_multi(keys)
-      total += len(keys)
-      count += 1
-    return count
-  finally:
-    logging.info('Deleted %d TaskRequest groups; %d entities in total', count,
-                 total)
-
-
-def task_bq(start, end):
-  """Sends TaskRequest to BigQuery swarming.task_requests table."""
-
-  # TODO(maruel): What about shutdown requests.
-  def _convert(e):
-    """Returns a tuple(bq_key, row)."""
-    out = swarming_pb2.TaskRequest()
-    e.to_proto(out, append_root_ids=True)
-    return (e.task_id, out)
-
-  total = 0
-
-  q = TaskRequest.query(TaskRequest.created_ts >= start,
-                        TaskRequest.created_ts <= end)
-  cursor = None
-  more = True
-  while more:
-    entities, cursor, more = q.fetch_page(
-        bq_state.RAW_LIMIT, start_cursor=cursor)
-    total += len(entities)
-    bq_state.send_to_bq('task_requests', [_convert(e) for e in entities])
-  return total

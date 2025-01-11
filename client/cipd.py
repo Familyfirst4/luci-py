@@ -24,6 +24,7 @@ from utils import net
 from utils import subprocess42
 from utils import tools
 
+import errors
 import local_caching
 
 
@@ -94,7 +95,10 @@ def add_cipd_options(parser):
       '--cipd-cache',
       help='CIPD cache directory, separate from isolate cache. '
       'Only relevant with --cipd-enabled or --cipd-package. '
-      'Default: "%default".',
+      'Default is a path to tempdir. '
+      '`task_runner.py` always sets this as $bot_dir/cipd_cache '
+      'if `--cipd-enabled` so it would only be tmpdir during testing'
+      'scenarios. ',
       default='')
   parser.add_option_group(group)
 
@@ -234,15 +238,32 @@ class CipdClient:
           logging.info('cipd client: %s', line)
 
       exit_code = process.wait(timeout=timeoutfn())
+
+      ensure_result = {}
+      if os.path.exists(json_file_path):
+        with open(json_file_path) as jfile:
+          result_json = json.load(jfile)
+          ensure_result = result_json['result']
+          status = result_json.get('error_code')
+          if status in ('auth_error', 'bad_argument_error',
+                        'invalid_version_error', 'stale_error',
+                        'hash_mismatch_error'):
+            details = result_json.get('error_details')
+            cipd_package = cipd_version = cipd_subdir = None
+            if details:
+              cipd_package = details.get('package')
+              cipd_version = details.get('version')
+              cipd_subdir = details.get('subdir')
+            raise errors.NonRecoverableCipdException(status, cipd_package,
+                                                     cipd_subdir, cipd_version)
+
       if exit_code != 0:
         raise Error(
             'Could not install packages; exit code %d\noutput:%s' % (
             exit_code, '\n'.join(output)))
-      with open(json_file_path) as jfile:
-        result_json = json.load(jfile)
       return {
-          subdir: [(x['package'], x['instance_id']) for x in pins
-                  ] for subdir, pins in result_json['result'].items()
+          subdir: [(x['package'], x['instance_id']) for x in pins]
+          for subdir, pins in ensure_result.items()
       }
     finally:
       fs.remove(ensure_file_path)
@@ -250,19 +271,23 @@ class CipdClient:
 
 
 def get_platform():
-  """Returns ${platform} parameter value.
-
-  The logic is similar to
-  https://chromium.googlesource.com/chromium/tools/build/+/6c5c7e9c/scripts/slave/infra_platform.py
-  """
-  # linux, mac or windows.
+  """Returns ${platform} parameter value."""
+  # Specifically known OSes. See also os_utilities.get_cipd_os().
   os_name = {
       'darwin': 'mac',
       'linux': 'linux',
       'win32': 'windows',
+      'sunos5': 'solaris',
   }.get(sys.platform)
   if not os_name:
-    raise Error('Unknown OS: %s' % sys.platform)
+    os_name = sys.platform.lower().rstrip('0123456789.-_')
+
+  # Use a specific architecture if told to. Happens on Swarming bots.
+  arch_override = os.getenv('CIPD_ARCHITECTURE')
+  if arch_override:
+    return '%s-%s' % (os_name, arch_override)
+
+  python_bits = 64 if sys.maxsize > 2**32 else 32
 
   # Normalize machine architecture. Some architectures are identical or
   # compatible with others. We collapse them into one.
@@ -276,6 +301,15 @@ def get_platform():
     arch = 'amd64'
   elif arch in ('i386', 'i686', 'x86'):
     arch = '386'
+  elif arch == 'i86pc':  # Solaris doesn't distinguish between 64 and 32-bit.
+    arch = '386' if python_bits == 32 else 'amd64'
+  elif arch == 'evbarm':  # NetBSD's name for ARM, both 32 and 64-bit
+    arch = 'armv6l' if python_bits == 32 else 'arm64'
+  elif arch == 'powerpc64':  # OpenBSD's name for ppc64
+    arch = 'ppc64'
+  elif arch == 'loongarch64':
+    arch = 'loong64'
+
   elif not arch and os_name == 'windows':
     # On some 32bit Windows7, platform.machine() returns None.
     # Fallback to 386 in that case.
@@ -285,7 +319,6 @@ def get_platform():
 
   # If using a 32-bit python on x86_64 kernel on Linux, "downgrade" the arch to
   # 32-bit too (this is the bitness of the userland).
-  python_bits = 64 if sys.maxsize > 2**32 else 32
   if os_name == 'linux' and arch == 'amd64' and python_bits == 32:
     arch = '386'
 
@@ -457,7 +490,7 @@ def get_client(cache_dir,
           # 3 weeks.
           max_age_secs=21 * 24 * 60 * 60),
       trim=True)
-  if instance_id not in instance_cache:
+  if not instance_cache.touch(instance_id, local_caching.UNKNOWN_FILE_SIZE):
     logging.info('Fetching CIPD client %s:%s', package_name, instance_id)
     fetch_url = get_client_fetch_url(
         service_url, package_name, instance_id, timeout=timeoutfn())

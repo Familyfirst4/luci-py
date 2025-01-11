@@ -167,7 +167,7 @@ def get_os_values():
       out.append('%s-%s.%s' % (os_name, parts[0], parts[1]))
     out.append('%s-%s' % (os_name, number))
     out.append('%s-%s-%s' % (os_name, number, build))
-  else:
+  elif sys.platform == 'linux':
     # TODO(crbug/1018836): Get rid of this, Linux is not an OS, it's a kernel.
     out.append('Linux')
     number = platforms.linux.get_os_version_number()
@@ -175,6 +175,14 @@ def get_os_values():
     for i in number.split('.'):
       version += '.' + i
       out.append('%s-%s' % (os_name, version[1:]))
+  else:
+    # Split a release into chunks, saving the separators.
+    parts = re.split(r'([-._])', platform.release())
+    # Rejoin, first just the first part, then a separator and the next part
+    # 7.1_FOO -> [7, 7.1, 7.1_FOO]
+    for i in range(len(parts) // 2 + 1):
+      out.append('%s-%s' % (os_name, ''.join(parts[:i * 2 + 1])))
+
   out.sort()
   return out
 
@@ -206,6 +214,7 @@ def get_os_name():
       # TODO(maruel): 'Mac' is an historical accident, it should be named 'OSX'.
       'darwin': 'Mac',
       'win32': 'Windows',
+      'sunos5': 'Solaris',
   }.get(sys.platform)
   if value:
     return value
@@ -221,16 +230,38 @@ def get_os_name():
       # Uppercase the first letter for consistency with the other platforms.
       return os_id[0].upper() + os_id[1:]
 
-  return sys.platform.decode('utf-8')
+  return sys.platform.lower().rstrip('0123456789.-_')
 
 
 @tools.cached
 def get_cpu_type():
   """Returns the type of processor: armv6l, armv7l, arm64 or x86."""
+  # On Windows prefer to use WMI: it is more accurate. Fallback to
+  # platform.machine() if the WMI method is not available (e.g. pywin32 is
+  # missing).
+  if sys.platform == 'win32':
+    cpu_type = platforms.win.get_cpu_type_with_wmi()
+    if cpu_type in ('amd64', 'i686'):
+      return 'x86'
+    if cpu_type:
+      return cpu_type  # e.g. `arm64`
+  elif sys.platform.startswith('aix'):
+    # platform.machine() returns the aix machine ID (uname -m), which is
+    # not useful. Modern AIX only supports powerpc64.
+    return 'ppc64'
+  elif sys.platform.startswith('netbsd') and platform.machine() == 'evbarm':
+    # NetBSD has multiple ARM sub-platforms.
+    processor = platform.processor().lower()
+    if processor == 'aarch64':
+      return 'arm64'
+    # The following are not quite accurate, since there are also big-endian
+    # variants. E.g. earmv7hfeb is ARMv7, hardware FPU, big-endian.
+    if processor.startswith('earmv6'):
+      return 'armv6l'
+    if processor.startswith('earmv'):
+      return 'armv7l'
   machine = platform.machine().lower()
-  if sys.platform == 'win32' and not machine:
-    machine = platforms.win.get_cpu_type_with_wmi()
-  if machine in ('amd64', 'x86_64', 'i386', 'i686'):
+  if machine in ('amd64', 'x86_64', 'i386', 'i686', 'i86pc'):
     return 'x86'
   if machine == 'aarch64':
     return 'arm64'
@@ -250,9 +281,69 @@ def get_cpu_bitness():
   On other platforms (Linux), we explicitly want to report 32 bits userland,
   independent of the kernel bitness.
   """
+  # On Windows prefer to use WMI: it is more accurate. Fallback to
+  # platform.machine() if the WMI method is not available (e.g. pywin32 is
+  # missing).
+  if sys.platform == 'win32':
+    cpu_type = platforms.win.get_cpu_type_with_wmi()
+    try:
+      bitness = {
+          'amd64': '64',
+          'arm64': '64',
+          'i686': '32',
+          None: None,  # need to fallback to `platform.machine()`
+      }[cpu_type]
+      if bitness:
+        return bitness
+    except KeyError as e:
+      logging.error('Unrecognized Windows CPU type %s', e)
+
   if sys.platform in ('darwin', 'win32') and platform.machine().endswith('64'):
     return '64'
   return '64' if sys.maxsize > 2**32 else '32'
+
+
+def get_cipd_os():
+  """Returns the bots CIPD OS variant (e.g. `linux`, `mac`)."""
+  os_name = {
+      'darwin': 'mac',
+      'linux': 'linux',
+      'win32': 'windows',
+      'sunos5': 'solaris',
+  }.get(sys.platform)
+  if not os_name:
+    os_name = sys.platform.lower().rstrip('0123456789.-_')
+  return os_name
+
+
+@tools.cached
+def get_cipd_architecture():
+  """Returns the CPU architecture (e.g. `amd64`, `arm64`) of CIPD packages
+  native to the bot host platform.
+
+  Note it might be different from the python executable architecture if the
+  bot is running through an emulation layer.
+  """
+  cpu_type = get_cpu_type()
+  if cpu_type == 'x86':
+    return 'amd64' if get_cpu_bitness() == '64' else '386'
+  if cpu_type.startswith('armv') and cpu_type.endswith('l'):
+    if get_cipd_os() == 'netbsd':
+      return cpu_type
+    # 32-bit ARM: Standardize on ARM v6 baseline.
+    return 'armv6l'
+  if cpu_type == 'evbarm':  # NetBSD's name for ARM, both 32 and 64-bit
+    return 'arm64' if get_cpu_bitness() == '64' else 'armv6l'
+  if cpu_type == 'powerpc64':  # OpenBSD's name for ppc64
+    return 'ppc64'
+  if cpu_type == 'riscv':
+    return 'riscv64' if get_cpu_bitness() == '64' else 'riscv'
+  if cpu_type == 'loongarch64':
+    return 'loong64'
+
+  # TODO(vadimsh): Detection of following architectures is likely broken:
+  #   mips64, mips64le, mipsle, ppc64, ppc64le, s390x.
+  return cpu_type
 
 
 def _parse_intel_model(name):
@@ -298,7 +389,7 @@ def get_cpu_dimensions():
     if cpu_type != 'arm':
       out.append('arm')
       out.append('arm-' + bitness)
-  elif cpu_type.startswith('mips'):
+  elif cpu_type.startswith('mips') or cpu_type.startswith('ppc64'):
     if name:
       out.append('%s-%s-%s' % (cpu_type, bitness, name.replace(' ', '_')))
   # else AMD like "AMD PRO A6-8500B R5, 6 Compute Cores 2C+4G     "
@@ -316,6 +407,8 @@ def get_cpuinfo():
     info = platforms.win.get_cpuinfo()
   elif sys.platform == 'linux':
     info = platforms.linux.get_cpuinfo()
+  elif sys.platform == 'aix':
+    info = platforms.aix.get_cpuinfo()
   else:
     info = {}
   if platforms.is_gce():
@@ -410,8 +503,7 @@ def get_physical_ram():
     return platforms.win.get_physical_ram()
   if sys.platform == 'darwin':
     return platforms.osx.get_physical_ram()
-  if os.path.isfile('/proc/meminfo'):
-    # linux.
+  if sys.platform == 'linux':
     meminfo = _safe_read('/proc/meminfo') or ''
     matched = re.search(br'MemTotal:\s+(\d+) kB', meminfo)
     if matched:
@@ -419,8 +511,8 @@ def get_physical_ram():
       if 0. < mb < 1.:
         return 1
       return int(round(mb))
+    logging.error('get_physical_ram() failed to query amount of physical RAM')
 
-  logging.error('get_physical_ram() failed to query amount of physical RAM')
   return 0
 
 
@@ -428,8 +520,7 @@ def get_disks_info():
   """Returns a dict of dict of free and total disk space."""
   if sys.platform == 'win32':
     return platforms.win.get_disks_info()
-  else:
-    return platforms.posix.get_disks_info()
+  return platforms.posix.get_disks_info()
 
 
 @tools.cached
@@ -457,9 +548,9 @@ def get_audio():
   # on OSX when an audio cable is plugged in.
   if sys.platform == 'darwin':
     return platforms.osx.get_audio()
-  elif sys.platform == 'linux':
+  if sys.platform == 'linux':
     return platforms.linux.get_audio()
-  elif sys.platform == 'win32':
+  if sys.platform == 'win32':
     return platforms.win.get_audio()
   return None
 
@@ -600,10 +691,10 @@ def get_uptime():
     return platforms.osx.get_uptime()
   if sys.platform == 'win32':
     return platforms.win.get_uptime()
-  if sys.platform == 'cygwin':
-    # Not important.
-    return 0.
-  return platforms.linux.get_uptime()
+  if sys.platform == 'linux':
+    return platforms.linux.get_uptime()
+  # Not important.
+  return 0.
 
 
 def get_reboot_required():
@@ -616,7 +707,9 @@ def get_reboot_required():
     return False
   if sys.platform == 'win32' or sys.platform == 'cygwin':
     return platforms.win.get_reboot_required()
-  return platforms.linux.get_reboot_required()
+  if sys.platform == 'linux':
+    return platforms.linux.get_reboot_required()
+  return False
 
 
 def get_ssd():
@@ -930,6 +1023,7 @@ def get_state_all_devices_android(devices):
 def get_dimensions():
   """Returns the default dimensions."""
   dimensions = {
+      'cipd_platform': ['%s-%s' % (get_cipd_os(), get_cipd_architecture())],
       'cores': [str(get_num_processors())],
       'cpu': get_cpu_dimensions(),
       'gpu': get_gpu()[0],
@@ -996,6 +1090,12 @@ def get_dimensions():
     if gov:
       dimensions['cpu_governor'] = gov
 
+    display_attached = platforms.linux.is_display_attached()
+    if display_attached:
+      dimensions['display_attached'] = ['1']
+    else:
+      dimensions['display_attached'] = ['0']
+
   if sys.platform == 'darwin':
     model = platforms.osx.get_hardware_model_string()
     if model:
@@ -1033,6 +1133,14 @@ def get_dimensions():
     windows_client_versions = platforms.win.get_client_versions()
     if windows_client_versions:
       dimensions['windows_client_version'] = windows_client_versions
+    display_attached = platforms.win.is_display_attached()
+    if display_attached:
+      dimensions['display_attached'] = ['1']
+      screen_scaling_percent = platforms.win.get_screen_scaling_percent()
+      if screen_scaling_percent:
+        dimensions['screen_scaling_percent'] = [screen_scaling_percent]
+    else:
+      dimensions['display_attached'] = ['0']
 
   return dimensions
 
@@ -1051,17 +1159,30 @@ def get_state():
     nb_files_in_temp = len(os.listdir(tmpdir))
   except OSError:
     nb_files_in_temp = 'N/A'
+
+  # Only including a subset of the environment variables that are used by
+  # Swarming, as state is not designed to sustain large load at the moment.
+  env = {}
+  env_keys = [
+      'ISOLATED_CACHE_SIZE',
+      'LUCI_MACHINE_TOKEN',
+      'PATH',
+      'SWARMING_ALLOW_ANY_USER',
+      'SWARMING_EXTERNAL_BOT_SETUP',
+      'SWARMING_NEVER_REBOOT',
+  ]
+  for key in env_keys:
+    val = os.environ.get(key)
+    if val is not None:
+      env[key] = val
+
   state = {
       'audio': get_audio(),
       'cpu_name': get_cpuinfo().get('name'),
       'cost_usd_hour': get_cost_hour(),
-      'cwd': file_path.get_native_path_case(os.getcwd()),
+      'cwd': os.getcwd(),
       'disks': get_disks_info(),
-      # Only including a subset of the environment variable, as state is not
-      # designed to sustain large load at the moment.
-      'env': {
-          'PATH': os.environ['PATH'],
-      },
+      'env': env,
       'gpu': get_gpu()[1],
       'hostname': get_hostname(),
       'ip': get_ip(),
@@ -1086,11 +1207,15 @@ def get_state():
     state['named_caches'] = cache
   if sys.platform in ('cygwin', 'win32'):
     state['cygwin'] = [sys.platform == 'cygwin']
+    _set_display_resolution_state(state, platforms.win.get_display_resolution())
+    active_displays = platforms.win.get_active_displays() or []
+    state['active_displays'] = active_displays
   if sys.platform == 'darwin':
     state['xcode'] = platforms.osx.get_xcode_state()
     temp = platforms.osx.get_temperatures()
     if temp is not None:
       state['temp'] = temp
+    _set_display_resolution_state(state, platforms.osx.get_display_resolution())
   if sys.platform == 'linux':
     temp = platforms.linux.get_temperatures()
     if temp:
@@ -1099,6 +1224,8 @@ def get_state():
     docker_host_hostname = os.environ.get('DOCKER_HOST_HOSTNAME')
     if docker_host_hostname:
       state['docker_host_hostname'] = docker_host_hostname
+    _set_display_resolution_state(state,
+                                  platforms.linux.get_display_resolution())
   if platforms.is_gce():
     networks = platforms.gce.get_networks()
     if networks:
@@ -1110,6 +1237,16 @@ def get_state():
   elif nb_files_in_temp > 1024:
     state['quarantined'] = '> 1024 files in TEMP (%s)' % tmpdir
   return state
+
+
+def _set_display_resolution_state(state, resolution):
+  state['display_resolution'] = {}
+  if resolution:
+    state['display_resolution']['horizontal'] = resolution[0]
+    state['display_resolution']['vertical'] = resolution[1]
+  else:
+    state['display_resolution']['horizontal'] = 'unavailable'
+    state['display_resolution']['vertical'] = 'unavailable'
 
 
 ## State mutating.

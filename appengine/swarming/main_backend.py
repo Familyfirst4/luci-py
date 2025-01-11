@@ -12,13 +12,12 @@ tested via a smoke test.
 import os
 import sys
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(APP_DIR, 'components', 'third_party'))
+from components import utils
+utils.import_third_party()
 
 from google.appengine.ext import ndb
 
 from components import ereporter2
-from components import utils
 
 import gae_ts_mon
 
@@ -53,7 +52,6 @@ def create_application():
   backend_app = handlers_backend.create_application(False)
   gae_ts_mon.initialize_prod(backend_app, is_enabled_fn=is_enabled_callback)
 
-  ts_mon_metrics.initialize()
   utils.report_memory(backend_app)
   return backend_app
 

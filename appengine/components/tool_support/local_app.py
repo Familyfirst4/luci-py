@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # Copyright 2014 The LUCI Authors. All rights reserved.
 # Use of this source code is governed under the Apache License, Version 2.0
 # that can be found in the LICENSE file.
@@ -239,6 +238,8 @@ class LocalApplication(object):
 
 class CustomHTTPErrorHandler(urllib.request.HTTPDefaultErrorHandler):
   """Swallows exceptions that would be thrown on >30x HTTP status."""
+
+  # pylint: disable=arguments-differ
   def http_error_default(self, _request, response, _code, _msg, _hdrs):
     return response
 

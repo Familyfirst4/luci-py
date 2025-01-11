@@ -54,13 +54,13 @@ def _raw_metadata_request(path):
   if not is_gce():
     logging.info('GCE metadata is not available: not on GCE')
     return None
-  url = 'http://metadata.google.internal' + path
+  url = 'http://169.254.169.254' + path
   headers = {'Metadata-Flavor': 'Google'}
-  for i in range(0, 10):
-    time.sleep(i*2)
+  for i in range(0, 6):
+    time.sleep(2**i)
     try:
       resp = urllib.request.urlopen(
-          urllib.request.Request(url, headers=headers), timeout=10)
+          urllib.request.Request(url, headers=headers), timeout=30)
       return resp.read()
     except IOError as e:
       logging.warning(
@@ -98,7 +98,7 @@ def get_metadata_uncached():
 
   To get the at the command line from a GCE VM, use:
     curl --silent \
-      http://metadata.google.internal/computeMetadata/v1/?recursive=true \
+      http://169.254.169.254/computeMetadata/v1/?recursive=true \
       -H "Metadata-Flavor: Google" | python -m json.tool | less
   """
   raw = _raw_metadata_request('/computeMetadata/v1/?recursive=true')
@@ -151,7 +151,7 @@ def oauth2_access_token_with_expiration(account):
     if cached_tok and cached_tok['expiresAt'] >= time.time() + 600:
       return cached_tok['accessToken'], cached_tok['expiresAt']
     # Grab the token.
-    url = ('http://metadata.google.internal/computeMetadata/v1/instance'
+    url = ('http://169.254.169.254/computeMetadata/v1/instance'
            '/service-accounts/%s/token' % account)
     headers = {'Metadata-Flavor': 'Google'}
     access_token, expires_at = oauth.oauth2_access_token_from_url(url, headers)
@@ -178,7 +178,7 @@ def oauth2_available_scopes(account='default'):
   metadata = get_metadata()
   if not metadata:
     return []
-  accounts = metadata['instance']['serviceAccounts']
+  accounts = metadata['instance'].get('serviceAccounts', {})
   return accounts.get(account, {}).get('scopes') or []
 
 
@@ -240,7 +240,10 @@ def get_image():
   """Returns the image used by the GCE VM."""
   # Format is projects/<id>/global/images/<image>
   metadata = get_metadata()
-  return metadata['instance']['image'].rsplit('/', 1)[-1]
+  image = metadata['instance'].get('image')
+  if not image:
+    return 'unknown'
+  return image.rsplit('/', 1)[-1]
 
 
 @tools.cached
@@ -248,7 +251,10 @@ def get_zone():
   """Returns the zone containing the GCE VM."""
   # Format is projects/<id>/zones/<zone>
   metadata = get_metadata()
-  return metadata['instance']['zone'].rsplit('/', 1)[-1]
+  zone = metadata['instance'].get('zone')
+  if not zone:
+    return 'unknown'
+  return zone.rsplit('/', 1)[-1]
 
 
 @tools.cached
@@ -257,7 +263,10 @@ def get_networks():
   metadata = get_metadata()
   names = []
   for network in metadata['instance'].get('networkInterfaces', []):
-    names.append(network['network'])
+    # Can be a nonsense string ("0") when running inside a GKE container that
+    # emulates GCE metadata server in a buggy way. Skip it. We want a dict.
+    if isinstance(network, dict):
+      names.append(network['network'])
   return names
 
 
@@ -282,7 +291,8 @@ def get_zones():
 def get_gcp():
   """Returns the string identifier of the GCE VM's Cloud Project."""
   metadata = get_metadata()
-  return [metadata['project']['projectId']]
+  project = metadata.get('project', {}).get('projectId')
+  return [project] if project else []
 
 
 @tools.cached
@@ -290,16 +300,23 @@ def get_machine_type():
   """Returns the GCE machine type."""
   # Format is projects/<id>/machineTypes/<machine_type>
   metadata = get_metadata()
-  return metadata['instance']['machineType'].rsplit('/', 1)[-1]
+  machine_type = metadata['instance'].get('machineType')
+  if not machine_type:
+    return 'unknown'
+  return machine_type.rsplit('/', 1)[-1]
 
 
 @tools.cached
 def get_cpuinfo():
+  return get_cpuinfo_uncached()
+
+
+def get_cpuinfo_uncached():
   """Returns the GCE CPU information as reported by GCE instance metadata."""
   metadata = get_metadata()
   if not metadata:
     return None
-  cpu_platform = metadata['instance']['cpuPlatform']
+  cpu_platform = metadata['instance'].get('cpuPlatform')
   if not cpu_platform:
     return None
   # Normalize according to the expected name as reported by the CPUID
@@ -320,6 +337,12 @@ def get_cpuinfo():
   elif cpu_platform.startswith('AMD '):
     cpu_name = '%s GCE' % cpu_platform
     vendor = 'AuthenticAMD'
+  elif cpu_platform.startswith('Ampere '):
+    cpu_name = '%s GCE' % cpu_platform
+    vendor = 'ARM'
+  elif cpu_platform.startswith('Google Axion'):
+    cpu_name = '%s GCE' % cpu_platform
+    vendor = 'ARM'
   assert cpu_name is not None, cpu_platform
   return {
       'name': cpu_name,
@@ -330,4 +353,4 @@ def get_cpuinfo():
 @tools.cached
 def get_tags():
   """Returns a list of instance tags or empty list if not GCE VM."""
-  return get_metadata()['instance']['tags']
+  return get_metadata()['instance'].get('tags') or []

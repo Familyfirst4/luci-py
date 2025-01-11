@@ -13,9 +13,8 @@ test_env.setup_test_env()
 from google.appengine.ext import ndb
 
 from components import utils
-from components.auth import ipaddr
 from components.auth import model
-from components.auth.proto import realms_pb2
+from components.auth.proto import permissions_pb2, realms_pb2
 from test_support import test_case
 
 
@@ -225,7 +224,7 @@ class GroupBootstrapTest(test_case.TestCase):
   """Test for bootstrap_group function."""
 
   def test_group_bootstrap_empty(self):
-    mocked_now = datetime.datetime(2014, 01, 01)
+    mocked_now = datetime.datetime(2014, 1, 1)
     self.mock_now(mocked_now)
 
     added = model.bootstrap_group('some-group', [], 'Blah description')
@@ -252,7 +251,7 @@ class GroupBootstrapTest(test_case.TestCase):
     ident1 = model.Identity(model.IDENTITY_USER, 'joe@example.com')
     ident2 = model.Identity(model.IDENTITY_USER, 'sam@example.com')
 
-    mocked_now = datetime.datetime(2014, 01, 01)
+    mocked_now = datetime.datetime(2014, 1, 1)
     self.mock_now(mocked_now)
 
     added = model.bootstrap_group(
@@ -374,7 +373,7 @@ class IpWhitelistTest(test_case.TestCase):
   def test_bootstrap_ip_whitelist_empty(self):
     self.assertIsNone(model.ip_whitelist_key('list').get())
 
-    mocked_now = datetime.datetime(2014, 01, 01)
+    mocked_now = datetime.datetime(2014, 1, 1)
     self.mock_now(mocked_now)
 
     ret = model.bootstrap_ip_whitelist('list', [], 'comment')
@@ -396,7 +395,7 @@ class IpWhitelistTest(test_case.TestCase):
   def test_bootstrap_ip_whitelist(self):
     self.assertIsNone(model.ip_whitelist_key('list').get())
 
-    mocked_now = datetime.datetime(2014, 01, 01)
+    mocked_now = datetime.datetime(2014, 1, 1)
     self.mock_now(mocked_now)
 
     ret = model.bootstrap_ip_whitelist(
@@ -420,7 +419,7 @@ class IpWhitelistTest(test_case.TestCase):
     self.assertFalse(model.bootstrap_ip_whitelist('list', ['not a subnet']))
 
   def test_bootstrap_ip_whitelist_assignment_new(self):
-    self.mock_now(datetime.datetime(2014, 01, 01))
+    self.mock_now(datetime.datetime(2014, 1, 1))
 
     ret = model.bootstrap_ip_whitelist_assignment(
         model.Identity(model.IDENTITY_USER, 'a@example.com'),
@@ -445,7 +444,7 @@ class IpWhitelistTest(test_case.TestCase):
       }, model.ip_whitelist_assignments_key().get().to_dict())
 
   def test_bootstrap_ip_whitelist_assignment_modify(self):
-    self.mock_now(datetime.datetime(2014, 01, 01))
+    self.mock_now(datetime.datetime(2014, 1, 1))
 
     ret = model.bootstrap_ip_whitelist_assignment(
         model.Identity(model.IDENTITY_USER, 'a@example.com'),
@@ -981,6 +980,13 @@ class AuditLogTest(test_case.TestCase):
     }, self.grab_log(model.AuthIPWhitelistAssignments))
 
   def test_realms_globals_log(self):
+    def to_permissionslist_blob(permissions):
+      # This is only similar to (and is not exactly) the format the Go
+      # version uses, but it's the closest we can get to what it looks
+      # like after it's been unmarshalled from Go.
+      perms = permissions_pb2.PermissionsList(permissions=permissions)
+      return perms.SerializeToString()
+
     @ndb.transactional
     def modify(permissions):
       key = model.realms_globals_key()
@@ -990,6 +996,7 @@ class AuditLogTest(test_case.TestCase):
           modified_ts=datetime.datetime(2015, 1, 1, 1, 1),
           comment='Comment')
       e.permissions = permissions
+      e.permissionslist = to_permissionslist_blob(permissions)
       e.put()
       model.replicate_auth_db()
 
@@ -1000,38 +1007,51 @@ class AuditLogTest(test_case.TestCase):
     cpy = lambda rev: ndb.Key(
         'Rev', rev, 'AuthRealmsGlobalsHistory', 'globals',
         parent=model.root_key())
-    self.assertEqual({
-      cpy(1): {
-        'permissions': [],
-        'auth_db_rev': 1,
-        'auth_db_prev_rev': None,
-        'auth_db_app_version': u'v1a',
-        'auth_db_deleted': False,
-        'auth_db_change_comment': u'Comment',
-        'modified_by': model.Identity.from_bytes('user:a@example.com'),
-        'modified_ts': datetime.datetime(2015, 1, 1, 1, 1),
-      },
-      cpy(2): {
-        'permissions': [realms_pb2.Permission(name='luci.dev.p1')],
-        'auth_db_rev': 2,
-        'auth_db_prev_rev': 1,
-        'auth_db_app_version': u'v1a',
-        'auth_db_deleted': False,
-        'auth_db_change_comment': u'Comment',
-        'modified_by': model.Identity.from_bytes('user:a@example.com'),
-        'modified_ts': datetime.datetime(2015, 1, 1, 1, 1),
-      },
-      cpy(3): {
-        'permissions': [],
-        'auth_db_rev': 3,
-        'auth_db_prev_rev': 2,
-        'auth_db_app_version': u'v1a',
-        'auth_db_deleted': False,
-        'auth_db_change_comment': u'Comment',
-        'modified_by': model.Identity.from_bytes('user:a@example.com'),
-        'modified_ts': datetime.datetime(2015, 1, 1, 1, 1),
-      },
-    }, self.grab_log(model.AuthRealmsGlobals))
+    self.assertEqual(
+        {
+            cpy(1): {
+                'permissions': [],
+                'permissionslist': to_permissionslist_blob([]),
+                'auth_db_rev': 1,
+                'auth_db_prev_rev': None,
+                'auth_db_app_version': u'v1a',
+                'auth_db_deleted': False,
+                'auth_db_change_comment': u'Comment',
+                'modified_by': model.Identity.from_bytes('user:a@example.com'),
+                'modified_ts': datetime.datetime(2015, 1, 1, 1, 1),
+            },
+            cpy(2): {
+                'permissions': [realms_pb2.Permission(name='luci.dev.p1')],
+                'permissionslist':
+                to_permissionslist_blob(
+                    [realms_pb2.Permission(name='luci.dev.p1')]),
+                'auth_db_rev':
+                2,
+                'auth_db_prev_rev':
+                1,
+                'auth_db_app_version':
+                u'v1a',
+                'auth_db_deleted':
+                False,
+                'auth_db_change_comment':
+                u'Comment',
+                'modified_by':
+                model.Identity.from_bytes('user:a@example.com'),
+                'modified_ts':
+                datetime.datetime(2015, 1, 1, 1, 1),
+            },
+            cpy(3): {
+                'permissions': [],
+                'permissionslist': to_permissionslist_blob([]),
+                'auth_db_rev': 3,
+                'auth_db_prev_rev': 2,
+                'auth_db_app_version': u'v1a',
+                'auth_db_deleted': False,
+                'auth_db_change_comment': u'Comment',
+                'modified_by': model.Identity.from_bytes('user:a@example.com'),
+                'modified_ts': datetime.datetime(2015, 1, 1, 1, 1),
+            },
+        }, self.grab_log(model.AuthRealmsGlobals))
 
   def test_project_realms_log(self):
     PROJECT_ID = 'pid'

@@ -4,9 +4,11 @@
 
 /** @module swarming-ui/SwarmingAppBoilerplate */
 
-import {errorMessage} from 'elements-sk/errorMessage';
-import {html, render} from 'lit-html';
-import {upgradeProperty} from 'elements-sk/upgradeProperty';
+import { errorMessage } from "elements-sk/errorMessage";
+import { render } from "lit-html";
+import { upgradeProperty } from "elements-sk/upgradeProperty";
+import { TasksService } from "./services/tasks";
+import { BotsService } from "./services/bots";
 
 /** @classdesc
  * The SwarmingAppBoilerplate class deduplicates much of the boilerplate
@@ -29,12 +31,10 @@ import {upgradeProperty} from 'elements-sk/upgradeProperty';
  *
  *  connectedCallback() {
  *   super.connectedCallback();
- *   console.log('client_id is' + this.client_id);
  *  }
  *}
  *
- * @attr client_id - The Client ID for authenticating via OAuth.
- * @attr testing_offline - If true, the real OAuth flow won't be used.
+ * @attr testing_offline - If true, the real login flow won't be used.
  *    Instead, dummy data will be used. Ideal for local testing.
  *
  */
@@ -43,28 +43,27 @@ export default class SwarmingAppBoilerplate extends HTMLElement {
     super();
     this._template = template;
     this._app = null;
-    this._auth_header = '';
+    this._auth_header = "";
     this._profile = null;
     // False until we see a 403 and get a call to setUserNotAuthorized();
     this._notAuthorized = false;
   }
 
   connectedCallback() {
-    upgradeProperty(this, 'client_id');
-    upgradeProperty(this, 'testing_offline');
+    upgradeProperty(this, "testing_offline");
 
     this._authHeaderEvent = (e) => {
-      this._auth_header = e.detail.auth_header;
+      this._auth_header = e.detail.authHeader;
     };
-    this.addEventListener('log-in', this._authHeaderEvent);
+    this.addEventListener("log-in", this._authHeaderEvent);
   }
 
   disconnectedCallback() {
-    this.removeEventListener('log-in', this._authHeaderEvent);
+    this.removeEventListener("log-in", this._authHeaderEvent);
   }
 
   static get observedAttributes() {
-    return ['client_id', 'testing_offline'];
+    return ["testing_offline"];
   }
 
   /** @prop {HTMLElement} app - A reference to the embedded &lt;swarming-app&gt
@@ -74,10 +73,10 @@ export default class SwarmingAppBoilerplate extends HTMLElement {
     return this._app;
   }
 
-  /** @prop {string} auth_header - reflects the auth_header passed up from the
+  /** @prop {string} authHeader - reflects the authHeader passed up from the
                         &lt;oauth-login&gt;.
                         Read only.*/
-  get auth_header() {
+  get authHeader() {
     return this._auth_header;
   }
 
@@ -104,28 +103,49 @@ export default class SwarmingAppBoilerplate extends HTMLElement {
   /** @prop {Object} server_details - reflects the server_details from the
                         included &lt;swarming-app&gt;
                         Read only.*/
-  get server_details() {
-    return (this._app && this._app.server_details) || {};
-  }
-
-  /** @prop {string} client_id Mirrors the attribute 'client_id'. */
-  get client_id() {
-    return this.getAttribute('client_id');
-  }
-  set client_id(val) {
-    return this.setAttribute('client_id', val);
+  get serverDetails() {
+    return (this._app && this._app.serverDetails) || {};
   }
 
   /** @prop {bool} testing_offline Mirrors the attribute 'testing_offline'. */
+  // eslint-disable-next-line camelcase
   get testing_offline() {
-    return this.hasAttribute('testing_offline');
+    return this.hasAttribute("testing_offline");
   }
+  // eslint-disable-next-line camelcase
   set testing_offline(val) {
     if (val) {
-      this.setAttribute('testing_offline', true);
+      this.setAttribute("testing_offline", true);
     } else {
-      this.removeAttribute('testing_offline');
+      this.removeAttribute("testing_offline");
     }
+  }
+
+  /** Handles handles an error from prpc client, possibly signaling the user
+   * isn't authorized to see this page.
+      @param {Object} e - The error given prpc client.
+      @param {String} loadingWhat - A short string to describe what failed.
+                      (e.g. bots/list if the bots/list endpoint was queried)
+      @param {boolean} ignoreAuthError - A flag to ignore 403 error.
+   */
+  prpcError(e, loadingWhat, ignoreAuthError) {
+    if (e.codeName === "PERMISSION_DENIED" && !ignoreAuthError) {
+      this._message =
+        "User unauthorized - try logging in " + "with a different account";
+      this._notAuthorized = true;
+      this.render();
+    } else if (e.name !== "AbortError") {
+      // We can ignore AbortError since they fire anytime a filter is added
+      // or removed (even for fetch promises that have already been resolved).
+      // Chrome and Firefox report a DOMException in this case:
+      // https://developer.mozilla.org/en-US/docs/Web/API/DOMException
+      console.error(e);
+      errorMessage(
+        `Unexpected error loading ${loadingWhat}: ${e.message}`,
+        5000
+      );
+    }
+    this._app.finishedTask();
   }
 
   /** Handles a fetch error, possibly signaling the user isn't authorized to
@@ -137,33 +157,43 @@ export default class SwarmingAppBoilerplate extends HTMLElement {
    */
   fetchError(e, loadingWhat, ignoreAuthError) {
     if (e.status === 403 && !ignoreAuthError) {
-      this._message = 'User unauthorized - try logging in '+
-                      'with a different account';
+      this._message =
+        "User unauthorized - try logging in " + "with a different account";
       this._notAuthorized = true;
       this.render();
-    } else if (e.name !== 'AbortError') {
+    } else if (e.name !== "AbortError") {
       // We can ignore AbortError since they fire anytime a filter is added
       // or removed (even for fetch promises that have already been resolved).
       // Chrome and Firefox report a DOMException in this case:
       // https://developer.mozilla.org/en-US/docs/Web/API/DOMException
       console.error(e);
-      errorMessage(`Unexpected error loading ${loadingWhat}: ${e.message}`,
-          5000);
+      errorMessage(
+        `Unexpected error loading ${loadingWhat}: ${e.message}`,
+        5000
+      );
     }
     this._app.finishedTask();
   }
 
   /** Re-renders the app, starting with the top level template. */
   render() {
-    render(this._template(this), this, {eventContext: this});
+    render(this._template(this), this, { eventContext: this });
     if (!this._app) {
       this._app = this.firstElementChild;
       // render again in case anything was using attributes on this._app.
-      render(this._template(this), this, {eventContext: this});
+      render(this._template(this), this, { eventContext: this });
     }
   }
 
   attributeChangedCallback(attrName, oldVal, newVal) {
     this.render();
+  }
+
+  _createTasksService() {
+    return new TasksService(this.authHeader, this._fetchController.signal);
+  }
+
+  _createBotService() {
+    return new BotsService(this.authHeader, this._fetchController.signal);
   }
 }

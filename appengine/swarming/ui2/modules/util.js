@@ -10,16 +10,16 @@
  * </p>
  */
 
-import * as human from 'common-sk/modules/human';
-import * as query from 'common-sk/modules/query';
-import {upgradeProperty} from 'elements-sk/upgradeProperty';
+import * as human from "common-sk/modules/human";
+import * as query from "common-sk/modules/query";
+import { upgradeProperty } from "elements-sk/upgradeProperty";
 
 /** botPageLink creates a URL to a given bot */
-export function botPageLink(bot_id) {
-  if (!bot_id) {
+export function botPageLink(botId) {
+  if (!botId) {
     return undefined;
   }
-  return '/bot?id=' + bot_id;
+  return "/bot?id=" + botId;
 }
 
 /** Create a link to a bot list with the preloaded filters and columns.
@@ -30,26 +30,26 @@ export function botPageLink(bot_id) {
  *     should be valid filters (e.g. 'foo:bar').
  * @param {Array<String>} columns - the column names that should be shown.
  */
-export function botListLink(filters=[], columns=[]) {
+export function botListLink(filters = [], columns = []) {
   const fArr = [];
   for (const f of filters) {
     if (f.key && f.value) {
       if (Array.isArray(f.value)) {
         for (const v of f.value) {
-          fArr.push(f.key + ':' + v);
+          fArr.push(f.key + ":" + v);
         }
       } else {
-        fArr.push(f.key + ':' + f.value);
+        fArr.push(f.key + ":" + f.value);
       }
     } else {
       fArr.push(f);
     }
-  };
+  }
   const obj = {
     f: fArr,
     c: columns,
   };
-  return '/botlist?' + query.fromParamSet(obj);
+  return "/botlist?" + query.fromParamSet(obj);
 }
 
 /** compareWithFixedOrder returns the sort order of 2 strings. It puts
@@ -62,14 +62,14 @@ export function compareWithFixedOrder(fixedOrder) {
   if (!fixedOrder) {
     fixedOrder = [];
   }
-  return function(a, b) {
+  return function (a, b) {
     let aSpecial = fixedOrder.indexOf(a);
     if (aSpecial === -1) {
-      aSpecial = fixedOrder.length+1;
+      aSpecial = fixedOrder.length + 1;
     }
     let bSpecial = fixedOrder.indexOf(b);
     if (bSpecial === -1) {
-      bSpecial = fixedOrder.length+1;
+      bSpecial = fixedOrder.length + 1;
     }
     if (aSpecial === bSpecial) {
       // Don't need naturalSort since elements shouldn't
@@ -83,23 +83,23 @@ export function compareWithFixedOrder(fixedOrder) {
 
 /** humanDuration formats a duration to be more human readable.
  *
- * @param {Number} timeInSecs - The duration to be formatted.
+ * @param {Number|String} timeInSecs - The duration to be formatted.
  */
 export function humanDuration(timeInSecs) {
   // If the timeInSecs is 0 (e.g. duration of Terminate bot tasks), we
   // still want to display 0s.
-  if (timeInSecs === 0 || timeInSecs === '0') {
-    return '0s';
+  if (timeInSecs === 0 || timeInSecs === "0") {
+    return "0s";
   }
   // Otherwise, if timeInSecs is falsey (e.g. undefined), return empty
   // string to reflect that.
   if (!timeInSecs) {
-    return '--';
+    return "--";
   }
   const ptimeInSecs = parseFloat(timeInSecs);
   // On a bad parse (shouldn't happen), show original.
   if (!ptimeInSecs) {
-    return timeInSecs + ' seconds';
+    return timeInSecs + " seconds";
   }
 
   // For times greater than a minute, make them human readable
@@ -108,7 +108,7 @@ export function humanDuration(timeInSecs) {
     return human.strDuration(ptimeInSecs);
   }
   // For times less than a minute, add 10ms resolution.
-  return ptimeInSecs.toFixed(2)+'s';
+  return ptimeInSecs.toFixed(2) + "s";
 }
 
 /** initPropertyFromAttrOrProperty looks to initialize a property from either
@@ -119,8 +119,8 @@ export function humanDuration(timeInSecs) {
  * @param {boolean} removeAttr - If the attribute is found, if it should be
  *            removed to avoid stale data.
  *
-*/
-export function initPropertyFromAttrOrProperty(ele, prop, removeAttr=true) {
+ */
+export function initPropertyFromAttrOrProperty(ele, prop, removeAttr = true) {
   upgradeProperty(ele, prop);
   if (ele[prop] === undefined && ele.hasAttribute(prop)) {
     ele[prop] = ele.getAttribute(prop);
@@ -154,46 +154,16 @@ export function parseDuration(duration) {
   const unit = duration.slice(-1);
   switch (unit) {
     // the fallthroughs here are intentional
-    case 'h':
+    case "h":
       number *= 60;
-    case 'm':
+    case "m":
       number *= 60;
-    case 's':
+    case "s":
       break;
     default:
       return null;
   }
   return number;
-}
-
-/** sanitizeAndHumanizeTime parses a date string or ms_since_epoch into a JS
- *  Date object, assuming UTC time. It also creates a human readable form in
- *  the obj under a key with a human_ prefix.  E.g.
- *  sanitizeAndHumanizeTime(foo, 'some_ts')
- *  parses the string/int at foo['some_ts'] such that foo['some_ts'] is now a
- *  Date object and foo['human_some_ts'] is the human formated version from
- *  human.localeTime.
- */
-export function sanitizeAndHumanizeTime(obj, key) {
-  obj['human_'+key] = '--';
-  if (obj[key]) {
-    if (obj[key].endsWith && !obj[key].endsWith('Z')) {
-      // Timestamps from the server are missing the 'Z' that specifies Zulu
-      // (UTC) time. If that's not the case, add the Z. Otherwise, some
-      // browsers interpret this as local time, which throws off everything.
-      // TODO(kjlubick): Should the server output milliseconds since the
-      // epoch?  That would be more consistent.
-      // See http://crbug.com/714599
-      obj[key] += 'Z';
-    }
-    obj[key] = new Date(obj[key]);
-
-    // Extract the timezone.
-    const str = obj[key].toString();
-    const timezone = str.substring(str.indexOf('('));
-
-    obj['human_'+key] = obj[key].toLocaleString() + ' ' + timezone;
-  }
 }
 
 /** taskListLink creates a link to a task list with the preloaded
@@ -206,16 +176,16 @@ export function sanitizeAndHumanizeTime(obj, key) {
  *  @param {Date} start - start time of the list.
  *  @param {Date} end - end time of the list.
  */
-export function taskListLink(filters=[], columns=[], start, end) {
+export function taskListLink(filters = [], columns = [], start, end) {
   const fArr = [];
   for (const f of filters) {
     if (f.key && f.value) {
       if (Array.isArray(f.value)) {
         for (const v of f.value) {
-          fArr.push(f.key + ':' + v);
+          fArr.push(f.key + ":" + v);
         }
       } else {
-        fArr.push(f.key + ':' + f.value);
+        fArr.push(f.key + ":" + f.value);
       }
     } else {
       fArr.push(f);
@@ -227,14 +197,14 @@ export function taskListLink(filters=[], columns=[], start, end) {
   };
 
   if (start) {
-    obj['st'] = [start.getTime()];
+    obj["st"] = [start.getTime()];
   }
   if (end) {
-    obj['et'] = [end.getTime()];
-    obj['n'] = [false];
+    obj["et"] = [end.getTime()];
+    obj["n"] = [false];
   }
 
-  return '/tasklist?' + query.fromParamSet(obj);
+  return "/tasklist?" + query.fromParamSet(obj);
 }
 
 /** taskPageLink creates the href attribute for linking to a single task.
@@ -252,7 +222,7 @@ export function taskPageLink(taskId, disableCanonicalID) {
     return undefined;
   }
   if (!disableCanonicalID) {
-    taskId = taskId.substring(0, taskId.length - 1) + '0';
+    taskId = taskId.substring(0, taskId.length - 1) + "0";
   }
   return `/task?id=${taskId}`;
 }
@@ -262,9 +232,9 @@ export function taskPageLink(taskId, disableCanonicalID) {
  */
 export function timeDiffApprox(date) {
   if (!date) {
-    return 'eons';
+    return "eons";
   }
-  return human.diffDate(date.getTime()) || '0s';
+  return human.diffDate(date.getTime()) || "0s";
 }
 
 /** timeDiffExact returns the exact difference between the two specified
@@ -273,10 +243,120 @@ export function timeDiffApprox(date) {
  */
 export function timeDiffExact(first, second) {
   if (!first) {
-    return 'eons';
+    return "eons";
   }
   if (!second) {
     second = new Date();
   }
-  return human.strDuration((second.getTime() - first.getTime())/1000) || '0s';
+  return human.strDuration((second.getTime() - first.getTime()) / 1000) || "0s";
+}
+
+/**
+ * sets window.LIVE_DEMO = true which allows code to adjust itself to being in a demo environment.
+ */
+export function setLiveDemoFlag() {
+  window.LIVE_DEMO = true;
+}
+
+function _base64ToBytes(base64) {
+  const binString = atob(base64);
+  return Uint8Array.from(binString, (m) => m.codePointAt(0));
+}
+
+function _bytesToBase64(bytes) {
+  const binString = Array.from(bytes, (x) => String.fromCodePoint(x)).join("");
+  return btoa(binString);
+}
+
+/**
+ * Decodes b64 encoded string to utf8 encoded string.
+ *
+ * Source: https://developer.mozilla.org/en-US/docs/Glossary/Base64
+ **/
+export function b64toUtf8(str) {
+  return new TextDecoder("utf-8", {
+    fatal: false,
+  }).decode(_base64ToBytes(str));
+}
+
+/**
+ * Encodes utf-8 string to base64.
+ *
+ * Source: https://developer.mozilla.org/en-US/docs/Glossary/Base64
+ **/
+export function utf8tob64(str) {
+  return _bytesToBase64(new TextEncoder().encode(str));
+}
+
+const re = /_[a-zA-Z]/g;
+
+/**
+ * Converts a string from snake_case to camelCase
+ **/
+export function toCamelCase(str) {
+  return str.replace(re, function (match) {
+    return match.substring(1).charAt(0).toUpperCase() + match.substring(2);
+  });
+}
+
+/**
+ * Provides a human view on time.
+ * For example:
+ *
+ * baseObject.humanized.time.fieldName will produce a string representation of fieldName
+ * if fieldName is a date.
+ *
+ * Can be attached to any object as a mixin.
+ *
+ * baseObject.humanized = new Humanizer(baseObject)
+ **/
+export class Humanizer {
+  constructor(base) {
+    this._time = new Proxy(base, {
+      get(target, prop, receiver) {
+        let value = Reflect.get(target, prop, receiver);
+        if (typeof value === "undefined") {
+          return value;
+        }
+        if (typeof value === "string") {
+          value = new Date(value);
+        }
+        // Hack to get a string representation of the timezone.
+        // Borrowed from the old code and probably the best approach without using
+        // an external library...
+        const str = value.toString();
+        const timezone = str.substring(str.indexOf("("));
+        return `${value.toLocaleString()} ${timezone}`;
+      },
+    });
+  }
+
+  get time() {
+    return this._time;
+  }
+}
+
+/**
+ * Adds `baseObject.humanize.time.timeField` using the humanizer mixin and converts all time columns to dates.
+ **/
+export function sanitizeAndHumanizeTime(obj, timeFields) {
+  // Gracefully handle an undefined object to be safe.
+  if (typeof obj === "undefined") {
+    return;
+  }
+  for (const field of timeFields) {
+    const value = obj[field];
+    if (typeof value === "string") {
+      obj[field] = new Date(value);
+    }
+  }
+  obj.humanized = new Humanizer(obj);
+}
+
+export function humanize(obj) {
+  if (typeof obj === "undefined") {
+    return;
+  }
+  obj.humanized = new Humanizer(obj);
+  return obj;
 }

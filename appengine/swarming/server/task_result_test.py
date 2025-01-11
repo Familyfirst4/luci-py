@@ -31,11 +31,11 @@ from components import utils
 from test_support import test_case
 
 from proto.api import swarming_pb2  # pylint: disable=no-name-in-module
-from server import bq_state
 from server import large
 from server import task_pack
 from server import task_request
 from server import task_result
+from server import task_scheduler
 from server import task_to_run
 import ts_mon_metrics
 
@@ -111,8 +111,10 @@ def _gen_run_result(**kwargs):
   result_summary = _gen_summary_result(**kwargs)
   request = result_summary.request_key.get()
   to_run = task_to_run.new_task_to_run(request, 0)
-  run_result = task_result.new_run_result(request, to_run, 'localhost', 'abc',
-                                          {}, result_summary.resultdb_info)
+  bot_details = task_scheduler.BotDetails('abc', 'test_project')
+  run_result = task_result.new_run_result(request, to_run, 'localhost',
+                                          bot_details, {},
+                                          result_summary.resultdb_info)
   run_result.started_ts = result_summary.modified_ts
   run_result.modified_ts = utils.utcnow()
   run_result.dead_after_ts = utils.utcnow() + datetime.timedelta(
@@ -126,6 +128,31 @@ def _gen_run_result(**kwargs):
 def _safe_cmp(a, b):
   # cmp(datetime.datetime.utcnow(), None) throws TypeError. Workaround.
   return cmp(utils.encode_to_json(a), utils.encode_to_json(b))
+
+
+def _need_update_from_run_result(summary, run_result):
+  """Returns True if set_from_run_result() would modify this instance.
+
+  E.g. they are different and TaskResultSummary needs to be updated from the
+  corresponding TaskRunResult.
+  """
+  assert isinstance(run_result, task_result.TaskRunResult), run_result
+  # A previous try is still sending update. Ignore it from a result summary
+  # PoV.
+  if summary.try_number and summary.try_number > run_result.try_number:
+    return False
+
+  # Compare all fields defined through shared _TaskResultCommon.
+  for property_name in task_result._TaskResultCommon._properties_fixed():
+    if getattr(summary, property_name) != getattr(run_result, property_name):
+      return True
+
+  # Compare fields that are defined separately in TaskRunResult and
+  # TaskResultSummary. They have slightly different types.
+  return (
+      summary.bot_id != run_result.bot_id or
+      summary.state != run_result.state or
+      summary.try_number != run_result.try_number)
 
 
 def get_entities(entity_model):
@@ -155,35 +182,70 @@ class TaskResultApiTest(TestCase):
   def _gen_summary(self, **kwargs):
     """Returns TaskResultSummary.to_dict()."""
     out = {
-        'abandoned_ts': None,
-        'bot_dimensions': None,
-        'bot_id': None,
-        'bot_idle_since_ts': None,
-        'bot_version': None,
-        'cipd_pins': None,
-        'children_task_ids': [],
-        'completed_ts': None,
+        'abandoned_ts':
+        None,
+        'bot_dimensions':
+        None,
+        'bot_id':
+        None,
+        'bot_idle_since_ts':
+        None,
+        'bot_version':
+        None,
+        'bot_logs_cloud_project':
+        None,
+        'cipd_pins':
+        None,
+        'completed_ts':
+        None,
         'costs_usd': [],
-        'cost_saved_usd': None,
-        'created_ts': self.now,
-        'current_task_slice': 0,
-        'deduped_from': None,
-        'duration': None,
-        'exit_code': None,
-        'expiration_delay': None,
-        'failure': False,
+        'cost_saved_usd':
+        None,
+        'created_ts':
+        self.now,
+        'current_task_slice':
+        0,
+        'deduped_from':
+        None,
+        'duration':
+        None,
+        'exit_code':
+        None,
+        'expiration_delay':
+        None,
+        'failure':
+        False,
         # Constant due to the mock of both utils.utcnow() and
         # random.getrandbits().
-        'id': '1d69b9f088008810',
-        'internal_failure': False,
-        'modified_ts': None,
-        'name': u'Request name',
-        'priority': 50,
-        'cas_output_root': None,
-        'resultdb_info': None,
+        'id':
+        '1d69b9f088008810',
+        'internal_failure':
+        False,
+        'missing_cas': [],
+        'missing_cipd': [],
+        'modified_ts':
+        None,
+        'name':
+        u'Request name',
+        'priority':
+        50,
+        'request_authenticated':
+        auth_testing.DEFAULT_MOCKED_IDENTITY,
+        'request_bot_id':
+        None,
+        'request_pool':
+        u'default',
+        'request_realm':
+        None,
+        'cas_output_root':
+        None,
+        'resultdb_info':
+        None,
         'server_versions': [u'v1a'],
-        'started_ts': None,
-        'state': task_result.State.PENDING,
+        'started_ts':
+        None,
+        'state':
+        task_result.State.PENDING,
         'tags': [
             u'authenticated:user:mocked@example.com',
             u'pool:default',
@@ -194,8 +256,10 @@ class TaskResultApiTest(TestCase):
             u'tag:1',
             u'user:Jesus',
         ],
-        'try_number': None,
-        'user': u'Jesus',
+        'try_number':
+        None,
+        'user':
+        u'Jesus',
     }
     out.update(kwargs)
     return out
@@ -211,7 +275,8 @@ class TaskResultApiTest(TestCase):
         'bot_id': u'localhost',
         'bot_idle_since_ts': None,
         'bot_version': u'abc',
-        'children_task_ids': [],
+        'bot_logs_cloud_project': None,
+        'cas_output_root': None,
         'cipd_pins': None,
         'completed_ts': None,
         'cost_usd': 0.,
@@ -226,7 +291,8 @@ class TaskResultApiTest(TestCase):
         'internal_failure': False,
         'killing': None,
         'modified_ts': None,
-        'cas_output_root': None,
+        'missing_cipd': [],
+        'missing_cas': [],
         'resultdb_info': None,
         'server_versions': [u'v1a'],
         'started_ts': None,
@@ -306,21 +372,12 @@ class TaskResultApiTest(TestCase):
     actual.completed_ts = self.now
     self.assertEqual(False, actual.can_be_canceled)
 
-    actual.children_task_ids = [
-        '1d69ba3ea8008810',
-        '3d69ba3ea8008810',
-        '2d69ba3ea8008810',
-    ]
-    actual.modified_ts = utils.utcnow()
-    ndb.transaction(actual.put)
-    expected = [u'1d69ba3ea8008810', u'2d69ba3ea8008810', u'3d69ba3ea8008810']
-    self.assertEqual(expected, actual.key.get().children_task_ids)
-
   def test_new_run_result(self):
     request = _gen_request()
     to_run = task_to_run.new_task_to_run(request, 0)
+    bot_details = task_scheduler.BotDetails(u'abc', None)
     actual = task_result.new_run_result(
-        request, to_run, u'localhost', u'abc', {
+        request, to_run, u'localhost', bot_details, {
             u'id': [u'localhost'],
             u'foo': [u'bar', u'biz']
         },
@@ -426,7 +483,9 @@ class TaskResultApiTest(TestCase):
   def test_new_run_result_duration_no_exit_code(self):
     request = _gen_request()
     to_run = task_to_run.new_task_to_run(request, 0)
-    actual = task_result.new_run_result(request, to_run, u'localhost', u'abc', {
+    bot_details = task_scheduler.BotDetails(u'abc', None)
+    actual = task_result.new_run_result(request, to_run, u'localhost',
+        bot_details, {
         u'id': [u'localhost'],
         u'foo': [u'bar', u'biz']
     }, None)
@@ -472,10 +531,11 @@ class TaskResultApiTest(TestCase):
     # Task is reaped after 2 seconds (4 secs total).
     reap_ts = self.now + datetime.timedelta(seconds=4)
     self.mock_now(reap_ts)
-    to_run.queue_number = None
+    to_run.consume(None)
     to_run.put()
+    bot_details = task_scheduler.BotDetails(u'abc', 'test_project')
     run_result = task_result.new_run_result(request, to_run, u'localhost',
-                                            u'abc', {},
+                                            bot_details, {},
                                             result_summary.resultdb_info)
     run_result.started_ts = utils.utcnow()
     run_result.modified_ts = run_result.started_ts
@@ -488,6 +548,7 @@ class TaskResultApiTest(TestCase):
         bot_dimensions={},
         bot_version=u'abc',
         bot_id=u'localhost',
+        bot_logs_cloud_project=u'test_project',
         costs_usd=[0.],
         modified_ts=reap_ts,
         state=task_result.State.RUNNING,
@@ -529,6 +590,7 @@ class TaskResultApiTest(TestCase):
         bot_dimensions={},
         bot_version=u'abc',
         bot_id=u'localhost',
+        bot_logs_cloud_project=u'test_project',
         completed_ts=complete_ts,
         costs_usd=[0.],
         duration=0.1,
@@ -614,73 +676,57 @@ class TaskResultApiTest(TestCase):
     # should find the children by parent_task_id
     result_summary_iter = task_result.yield_result_summary_by_parent_task_id(
         parent_summary.task_id)
-    expected = [child_summary_1, child_summary_2]
-    self.assertEqual(sorted(expected), sorted(s for s in result_summary_iter))
-
-  def test_yield_active_run_result_keys(self):
-    request = _gen_request()
-    result_summary = task_result.new_result_summary(request)
-    result_summary.modified_ts = utils.utcnow()
-    ndb.transaction(result_summary.put)
-    to_run = task_to_run.new_task_to_run(request, 0)
-    run_result = task_result.new_run_result(request, to_run, 'localhost', 'abc',
-                                            {}, result_summary.resultdb_info)
-    run_result.started_ts = utils.utcnow()
-    run_result.modified_ts = run_result.started_ts
-    run_result.dead_after_ts = run_result.started_ts + datetime.timedelta(
-        seconds=1)
-    ndb.transaction(lambda: result_summary.set_from_run_result(
-        run_result, request))
-    ndb.transaction(lambda: ndb.put_multi((run_result, result_summary)))
-
-    self.assertEqual([run_result.key],
-                     list(task_result.yield_active_run_result_keys()))
-
-    run_result.completed_ts = run_result.started_ts
-    run_result.put()
-    self.assertEqual([], list(task_result.yield_active_run_result_keys()))
+    expected = [child_summary_1.key, child_summary_2.key]
+    self.assertEqual(sorted(expected),
+                     sorted(s.key for s in result_summary_iter))
 
   def test_set_from_run_result(self):
     request = _gen_request()
     result_summary = task_result.new_result_summary(request)
     to_run = task_to_run.new_task_to_run(request, 0)
-    run_result = task_result.new_run_result(request, to_run, 'localhost', 'abc',
-                                            {}, result_summary.resultdb_info)
+    bot_details = task_scheduler.BotDetails('abc', 'test_project')
+    run_result = task_result.new_run_result(request, to_run, 'localhost',
+                                            bot_details, {},
+                                            result_summary.resultdb_info)
     run_result.started_ts = utils.utcnow()
-    self.assertTrue(result_summary.need_update_from_run_result(run_result))
+    self.assertTrue(_need_update_from_run_result(result_summary, run_result))
     result_summary.modified_ts = utils.utcnow()
     run_result.modified_ts = utils.utcnow()
     run_result.dead_after_ts = utils.utcnow() + datetime.timedelta(
         seconds=request.bot_ping_tolerance_secs)
     ndb.transaction(lambda: ndb.put_multi((result_summary, run_result)))
 
-    self.assertTrue(result_summary.need_update_from_run_result(run_result))
+    self.assertTrue(_need_update_from_run_result(result_summary, run_result))
     ndb.transaction(lambda: result_summary.set_from_run_result(
         run_result, request))
     ndb.transaction(lambda: ndb.put_multi([result_summary]))
 
-    self.assertFalse(result_summary.need_update_from_run_result(run_result))
+    self.assertFalse(_need_update_from_run_result(result_summary, run_result))
 
   def test_set_from_run_result_two_server_versions(self):
     request = _gen_request()
     result_summary = task_result.new_result_summary(request)
     to_run = task_to_run.new_task_to_run(request, 0)
-    run_result = task_result.new_run_result(request, to_run, 'localhost', 'abc',
-                                            {}, result_summary.resultdb_info)
+    bot_details = task_scheduler.BotDetails('abc', 'test_project')
+    run_result = task_result.new_run_result(request, to_run, 'localhost',
+                                            bot_details, {},
+                                            result_summary.resultdb_info)
     run_result.started_ts = utils.utcnow()
-    self.assertTrue(result_summary.need_update_from_run_result(run_result))
+    self.assertTrue(_need_update_from_run_result(result_summary, run_result))
     result_summary.modified_ts = utils.utcnow()
     run_result.modified_ts = utils.utcnow()
     run_result.dead_after_ts = utils.utcnow() + datetime.timedelta(
         seconds=request.bot_ping_tolerance_secs)
     ndb.transaction(lambda: ndb.put_multi((result_summary, run_result)))
 
-    self.assertTrue(result_summary.need_update_from_run_result(run_result))
+    self.assertTrue(_need_update_from_run_result(result_summary, run_result))
     ndb.transaction(lambda: result_summary.set_from_run_result(
         run_result, request))
     ndb.transaction(lambda: ndb.put_multi([result_summary]))
 
-    run_result.signal_server_version('new-version')
+    self.mock(utils, 'get_app_version', lambda: 'new-version')
+    run_result.signal_server_version()
+
     run_result.modified_ts = utils.utcnow()
     run_result.dead_after_ts = utils.utcnow() + datetime.timedelta(
         seconds=request.bot_ping_tolerance_secs)
@@ -714,8 +760,10 @@ class TaskResultApiTest(TestCase):
     result_summary.modified_ts = utils.utcnow()
     ndb.transaction(result_summary.put)
     to_run = task_to_run.new_task_to_run(request, 0)
-    run_result = task_result.new_run_result(request, to_run, 'localhost', 'abc',
-                                            {}, result_summary.resultdb_info)
+    bot_details = task_scheduler.BotDetails('abc', 'test_project')
+    run_result = task_result.new_run_result(request, to_run, 'localhost',
+                                            bot_details, {},
+                                            result_summary.resultdb_info)
     run_result.state = task_result.State.TIMED_OUT
     run_result.duration = 0.1
     run_result.exit_code = -1
@@ -806,7 +854,6 @@ class TaskResultApiTest(TestCase):
     run_result.duration = 1.
     run_result.current_task_slice = 2
     run_result.exit_code = 1
-    run_result.children_task_ids = [u'12310']
     run_result.cas_output_root = task_request.CASReference(
         cas_instance=u'projects/test/instances/default',
         digest={
@@ -904,7 +951,6 @@ class TaskResultApiTest(TestCase):
             info=swarming_pb2.BotInfo(),
         ),
         server_versions=[u'v1a'],
-        children_task_ids=[u'12310'],
         task_id=u'1d69b9f858008810',
         run_id=u'1d69b9f858008811',
         cipd_pins=swarming_pb2.CIPDPins(
@@ -1066,181 +1112,6 @@ class TaskResultApiTest(TestCase):
     with self.assertRaises(datastore_errors.BadValueError):
       task_result.PerformanceStats().put()
 
-
-  def _mock_send_to_bq(self, expected_table_name):
-    payloads = []
-
-    def send_to_bq(table_name, rows):
-      self.assertEqual(expected_table_name, table_name)
-      if rows:
-        # When rows is empty, send_to_bq() can exit early.
-        payloads.append(rows)
-
-    self.mock(bq_state, 'send_to_bq', send_to_bq)
-    return payloads
-
-  def test_task_bq_run_empty(self):
-    # Empty, nothing is done.
-    start = utils.utcnow()
-    end = start + datetime.timedelta(seconds=60)
-    self.assertEqual(0, task_result.task_bq_run(start, end))
-
-  def test_task_bq_run(self):
-    payloads = self._mock_send_to_bq('task_results_run')
-
-    # Generate 4 tasks results to test boundaries.
-    self.mock_now(self.now, 10)
-    run_result_1 = _gen_run_result()
-    run_result_1.abandoned_ts = utils.utcnow()
-    run_result_1.completed_ts = utils.utcnow()
-    run_result_1.modified_ts = utils.utcnow()
-    run_result_1.put()
-    start = self.mock_now(self.now, 20)
-    run_result_2 = _gen_run_result()
-    run_result_2.completed_ts = utils.utcnow()
-    run_result_2.modified_ts = utils.utcnow()
-    run_result_2.put()
-    end = self.mock_now(self.now, 30)
-    run_result_3 = _gen_run_result()
-    run_result_3.completed_ts = utils.utcnow()
-    run_result_3.modified_ts = utils.utcnow()
-    run_result_3.put()
-    self.mock_now(self.now, 40)
-    run_result_4 = _gen_run_result()
-    run_result_4.completed_ts = utils.utcnow()
-    run_result_4.modified_ts = utils.utcnow()
-    run_result_4.put()
-
-    with mock.patch(
-        'components.pubsub.publish_multi',
-        side_effect=lambda _topic, messages: list(messages)) as mocked:
-      self.assertEqual(2, task_result.task_bq_run(start, end))
-      mocked.assert_called()
-    self.assertEqual(1, len(payloads), payloads)
-    actual_rows = payloads[0]
-    self.assertEqual(2, len(actual_rows))
-    expected = [
-        run_result_2.task_id,
-        run_result_3.task_id,
-    ]
-    self.assertEqual(expected, [r[0] for r in actual_rows])
-
-  def test_task_bq_run_running(self):
-    payloads = self._mock_send_to_bq('task_results_run')
-    self.now = datetime.datetime(2019, 1, 1)
-    start = self.mock_now(self.now, 0)
-    run_result = _gen_run_result()
-    run_result.started_ts = utils.utcnow()
-    run_result.modified_ts = utils.utcnow()
-    run_result.put()
-    end = self.mock_now(self.now, 60)
-
-    self.assertEqual(0, task_result.task_bq_run(start, end))
-    self.assertEqual(0, len(payloads), payloads)
-
-  def test_task_bq_run_recent_abandoned_ts(self):
-    # Confirm that a recent entity without completed_ts set is not found.
-    payloads = self._mock_send_to_bq('task_results_run')
-    start = self.now
-    run_result = _gen_run_result()
-    # Make sure started_ts is not caught.
-    run_result.started_ts = datetime.datetime(2010, 1, 1)
-    run_result.abandoned_ts = utils.utcnow()
-    run_result.modified_ts = utils.utcnow()
-    run_result.put()
-    self.assertIsNone(run_result.key.get().completed_ts)
-    end = self.mock_now(self.now, 60)
-
-    self.assertEqual(0, task_result.task_bq_run(start, end))
-    self.assertEqual(0, len(payloads), payloads)
-
-  def test_task_bq_summary_empty(self):
-    # Empty, nothing is done.
-    start = utils.utcnow()
-    end = start + datetime.timedelta(seconds=60)
-    self.assertEqual(0, task_result.task_bq_summary(start, end))
-
-  def test_task_bq_summary(self):
-    payloads = self._mock_send_to_bq('task_results_summary')
-
-    # Generate 4 tasks results to test boundaries.
-    self.mock_now(self.now, 10)
-    result_1 = _gen_summary_result()
-    result_1.abandoned_ts = utils.utcnow()
-    result_1.completed_ts = utils.utcnow()
-    result_1.modified_ts = utils.utcnow()
-    result_1.put()
-    start = self.mock_now(self.now, 20)
-    result_2 = _gen_summary_result()
-    result_2.completed_ts = utils.utcnow()
-    result_2.modified_ts = utils.utcnow()
-    result_2.put()
-    end = self.mock_now(self.now, 30)
-    result_3 = _gen_summary_result()
-    result_3.completed_ts = utils.utcnow()
-    result_3.modified_ts = utils.utcnow()
-    result_3.put()
-    self.mock_now(self.now, 40)
-    result_4 = _gen_summary_result()
-    result_4.completed_ts = utils.utcnow()
-    result_4.modified_ts = utils.utcnow()
-    result_4.put()
-
-    with mock.patch('components.pubsub.publish_multi', ) as mocked:
-      self.assertEqual(2, task_result.task_bq_summary(start, end))
-      mocked.assert_called()
-    self.assertEqual(1, len(payloads), payloads)
-    actual_rows = payloads[0]
-    self.assertEqual(2, len(actual_rows))
-    expected = [
-        result_2.task_id,
-        result_3.task_id,
-    ]
-    self.assertEqual(expected, [r[0] for r in actual_rows])
-
-  def test_task_bq_summary_pending(self):
-    payloads = self._mock_send_to_bq('task_results_summary')
-    self.now = datetime.datetime(2019, 2, 28)
-    start = self.mock_now(self.now, 0)
-    result = _gen_summary_result()
-    result.created_ts = utils.utcnow()
-    result.modified_ts = utils.utcnow()
-    result.put()
-    end = self.mock_now(self.now, 60)
-
-    self.assertEqual(0, task_result.task_bq_summary(start, end))
-    self.assertEqual(0, len(payloads), payloads)
-
-  def test_task_bq_summary_running(self):
-    payloads = self._mock_send_to_bq('task_results_summary')
-    self.now = datetime.datetime(2019, 2, 28)
-    start = self.mock_now(self.now, 0)
-    result = _gen_summary_result()
-    result.started_ts = utils.utcnow()
-    result.modified_ts = utils.utcnow()
-    result.put()
-    end = self.mock_now(self.now, 60)
-
-    self.assertEqual(0, task_result.task_bq_summary(start, end))
-    self.assertEqual(0, len(payloads), payloads)
-
-  def test_task_bq_summary_recent_abandoned_ts(self):
-    # Confirm that a recent entity without completed_ts set is not found.
-    payloads = self._mock_send_to_bq('task_results_summary')
-    start = self.now
-    result = _gen_summary_result()
-    # Make sure neither created_ts and started_ts is caught.
-    result.created_ts = datetime.datetime(2010, 1, 1)
-    result.started_ts = datetime.datetime(2010, 1, 1)
-    result.abandoned_ts = utils.utcnow()
-    result.modified_ts = utils.utcnow()
-    result.put()
-    self.assertIsNone(result.key.get().completed_ts)
-    end = self.mock_now(self.now, 60)
-
-    self.assertEqual(0, task_result.task_bq_summary(start, end))
-    self.assertEqual(0, len(payloads), payloads)
-
   def test_get_result_summaries_query(self):
     # Indirectly tested by API.
     pass
@@ -1261,12 +1132,16 @@ class TaskResultApiTest(TestCase):
 
     results = task_result.fetch_task_results([
         running_res.task_id, pending_res.task_id, running_res_cache.task_id,
-        pending_res_cache.task_id, '1d69b9f088008812'
+        pending_res_cache.task_id, '1d69b9f188008811'
     ])
 
     self.assertEqual(
         results,
         [running_res, pending_res, running_res_cache, pending_res_cache, None])
+
+  def test_fetch_task_result_summaries(self):
+    # Tested by test_fetch_task_results already.
+    pass
 
 
 class TestOutput(TestCase):
@@ -1436,8 +1311,8 @@ class TestOutput(TestCase):
   def test_get_output_utf8(self):
     self.mock(task_result.TaskOutput, 'CHUNK_SIZE', 4)
     run_result = _gen_run_result()
-    ndb.put_multi(run_result.append_output(b'Foo🤠Bar', 0))
-    self.assertEqual(b'Foo🤠Bar', run_result.get_output(0, 0))
+    ndb.put_multi(run_result.append_output('Foo🤠Bar', 0))
+    self.assertEqual('Foo🤠Bar', run_result.get_output(0, 0))
     self.assertTaskOutputChunk([
         {
             'chunk': b'Foo\xf0',
@@ -1455,13 +1330,14 @@ class TestOutput(TestCase):
 
   def test_get_output_utf8_range(self):
     run_result = _gen_run_result()
-    ndb.put_multi(run_result.append_output(b'Foo🤠Bar', 0))
-    self.assertEqual(b'🤠', run_result.get_output(3, 4))
+    ndb.put_multi(run_result.append_output('Foo🤠Bar', 0))
+    self.assertEqual('🤠', run_result.get_output(3, 4))
 
   def test_get_output_utf8_limit(self):
     run_result = _gen_run_result()
-    ndb.put_multi(run_result.append_output(b'😀😃😄😁😆', 0))
-    self.assertEqual(b'😀😃😄😁', run_result.get_output(0, 16))
+    ndb.put_multi(run_result.append_output('😀😃😄😁😆', 0))
+    self.assertEqual('😀😃😄😁', run_result.get_output(0, 16))
+
 
 if __name__ == '__main__':
   logging.basicConfig(

@@ -17,9 +17,6 @@ import time
 import unittest
 
 import mock
-# TODO(github.com/wolever/parameterized/issues/91)
-# use parameterized after the bug is resolved.
-from nose2.tools import params
 
 import test_env_api
 test_env_api.setup_test_env()
@@ -37,30 +34,77 @@ import os_utilities
 
 class TestOsUtilities(auto_stub.TestCase):
 
-  def setUp(self):
-    super(TestOsUtilities, self).setUp()
-    tools.clear_cache_all()
-
-  def tearDown(self):
-    super(TestOsUtilities, self).tearDown()
-    tools.clear_cache_all()
-
   def test_get_os_name(self):
     expected = ('Debian', 'Linux', 'Mac', 'Raspbian', 'Ubuntu', 'Windows')
     self.assertIn(os_utilities.get_os_name(), expected)
 
-  @params(
-      ('x86_64', 'x86'),
-      ('amd64', 'x86'),
-      ('i386', 'x86'),
-      ('i686', 'x86'),
-      ('aarch64', 'arm64'),
-      ('mips64', 'mips'),
-      ('arm64', 'arm64'),
-  )
-  def test_get_cpu_type(self, machine, expected):
-    self.mock(platform, 'machine', lambda: machine)
-    self.assertEqual(os_utilities.get_cpu_type(), expected)
+  def test_get_os_name_cases(self):
+    cases = [
+        ('openbsd7', 'openbsd'),
+        ('netbsd9', 'netbsd'),
+        ('sunos5', 'Solaris'),
+    ]
+    for pform, result in cases:
+      self.mock(sys, "platform", pform)
+      self.assertEqual(os_utilities.get_os_name(), result)
+
+  def test_get_cpu_type(self):
+    cases = [
+        ('x86_64', 'amd64', 'x86'),
+        ('amd64', 'amd64', 'x86'),
+        ('i686', 'i686', 'x86'),
+        ('i86pc', None, 'x86'),
+        ('aarch64', 'arm64', 'arm64'),
+        ('mips64', None, 'mips'),
+        ('arm64', None, 'arm64'),
+    ]
+    for machine, win_cpu_type, expected in cases:
+      self.mock(platform, 'machine', lambda: machine)
+      if sys.platform == 'win32':
+        self.mock(platforms.win, 'get_cpu_type_with_wmi', lambda: win_cpu_type)
+      self.assertEqual(os_utilities.get_cpu_type(), expected)
+
+  def test_get_cipd_architecture(self):
+    cases = [
+        ('x86', '64', 'amd64'),
+        ('x86', '32', '386'),
+        ('arm64', '64', 'arm64'),
+        ('armv7l', '32', 'armv6l'),
+        ('powerpc64', '64', 'ppc64'),
+        ('evbarm', '64', 'arm64'),
+        ('evbarm', '32', 'armv6l'),
+        ('riscv', '64', 'riscv64'),
+        ('loongarch64', '64', 'loong64'),
+    ]
+    for cpu_type, bitness, expected in cases:
+      self.mock(os_utilities, 'get_cpu_type', lambda: cpu_type)
+      self.mock(os_utilities, 'get_cpu_bitness', lambda: bitness)
+      self.assertEqual(os_utilities.get_cipd_architecture(), expected)
+
+  def test_get_cipd_architecture_netbsd(self):
+    cases = [
+        ('amd64', 'x86_64', 'amd64'),
+        ('evbarm', 'aarch64', 'arm64'),
+        ('evbarm', 'earmv6hf', 'armv6l'),
+        ('evbarm', 'earmv7hf', 'armv7l'),
+    ]
+    for machine, processor, expected in cases:
+      self.mock(sys, 'platform', 'netbsd10')
+      self.mock(platform, 'machine', lambda: machine)
+      self.mock(platform, 'processor', lambda: processor)
+      self.assertEqual(os_utilities.get_cipd_architecture(), expected)
+
+  def test_get_os_values(self):
+    cases = [
+        ('openbsd7', '7.2', ['openbsd', 'openbsd-7', 'openbsd-7.2']),
+        ('netbsd9', '9.3_STABLE',
+         ['netbsd', 'netbsd-9', 'netbsd-9.3', 'netbsd-9.3_STABLE']),
+        ('sunos5', '5.11', ['Solaris', 'Solaris-5', 'Solaris-5.11']),
+    ]
+    for pform, rel, result in cases:
+      self.mock(sys, "platform", pform)
+      self.mock(platform, "release", lambda: rel)
+      self.assertEqual(os_utilities.get_os_values(), result)
 
   @unittest.skipUnless(sys.platform == 'linux', 'this is only for linux')
   def test_get_os_values_linux(self):
@@ -97,6 +141,31 @@ class TestOsUtilities(auto_stub.TestCase):
     self.mock(sys, 'maxsize', 2**31 - 1)
     self.assertEqual(os_utilities.get_cpu_dimensions(),
                      ['mips', 'mips-32', 'mips-32-Cavium_Octeon_II_V0.1'])
+
+  def test_get_cpu_dimensions_aix_ppc64(self):
+    self.mock(sys, 'platform', 'aix')
+    self.mock(sys, 'maxsize', 2**63 - 1)
+    # A possible machine ID reported by python on aix.
+    self.mock(platform, 'machine', lambda: '00FAC25F4B00')
+    self.mock(os_utilities, 'get_cpuinfo', lambda: {'name': 'POWER8'})
+    self.assertEqual(os_utilities.get_cpu_dimensions(),
+                     ['ppc64', 'ppc64-64', 'ppc64-64-POWER8'])
+
+  def test_get_cpu_dimensions_ppc64(self):
+    self.mock(sys, 'platform', 'linux')
+    self.mock(platform, 'machine', lambda: 'ppc64')
+    self.mock(os_utilities, 'get_cpuinfo', lambda: {'name': 'POWER8'})
+    self.mock(sys, 'maxsize', 2**63 - 1)
+    self.assertEqual(os_utilities.get_cpu_dimensions(),
+                     ['ppc64', 'ppc64-64', 'ppc64-64-POWER8'])
+
+  def test_get_cpu_dimensions_ppc64le(self):
+    self.mock(sys, 'platform', 'linux')
+    self.mock(platform, 'machine', lambda: 'ppc64le')
+    self.mock(os_utilities, 'get_cpuinfo', lambda: {'name': 'POWER10'})
+    self.mock(sys, 'maxsize', 2**63 - 1)
+    self.assertEqual(os_utilities.get_cpu_dimensions(),
+                     ['ppc64le', 'ppc64le-64', 'ppc64le-64-POWER10'])
 
   def test_parse_intel_model(self):
     examples = [
@@ -181,8 +250,8 @@ class TestOsUtilities(auto_stub.TestCase):
     actual.discard('windows_client_version')
 
     expected = {
-        'cores', 'cpu', 'gce', 'gpu', 'id', 'inside_docker', 'os', 'pool',
-        'python'
+        'cipd_platform', 'cores', 'cpu', 'gce', 'gpu', 'id', 'inside_docker',
+        'os', 'pool', 'python'
     }
     if platforms.is_gce():
       expected.add('gcp')
@@ -198,8 +267,10 @@ class TestOsUtilities(auto_stub.TestCase):
     if sys.platform == 'linux':
       expected.add('kernel')
       expected.add('kvm')
+      expected.add('display_attached')
     if sys.platform == 'win32':
       expected.add('integrity')
+      expected.add('display_attached')
     self.assertEqual(expected, actual)
 
   def test_override_id_via_env(self):
@@ -223,6 +294,7 @@ class TestOsUtilities(auto_stub.TestCase):
         'cpu_name',
         'cwd',
         'disks',
+        'display_resolution',
         'env',
         'gpu',
         'ip',
@@ -239,6 +311,7 @@ class TestOsUtilities(auto_stub.TestCase):
     }
     if sys.platform in ('cygwin', 'win32'):
       expected.add('cygwin')
+      expected.add('active_displays')
     if sys.platform == 'darwin':
       expected.add('xcode')
     if 'quarantined' in actual:

@@ -34,11 +34,11 @@ Any ${SWARMING_TASK_ID} on the command line will be replaced by the
 SWARMING_TASK_ID value passed with the --env option.
 
 See
-https://chromium.googlesource.com/infra/luci/luci-py.git/+/master/appengine/swarming/doc/Magic-Values.md
+https://chromium.googlesource.com/infra/luci/luci-py.git/+/main/appengine/swarming/doc/Magic-Values.md
 for all the variables.
 
 See
-https://chromium.googlesource.com/infra/luci/luci-py.git/+/master/appengine/swarming/swarming_bot/config/bot_config.py
+https://chromium.googlesource.com/infra/luci/luci-py.git/+/main/appengine/swarming/swarming_bot/config/bot_config.py
 for more information about bot_config.py.
 """
 
@@ -70,9 +70,9 @@ tools.force_local_third_party()
 from depot_tools import fix_encoding
 
 # pylint: disable=ungrouped-imports
-import DEPS
 import auth
 import cipd
+import errors
 import local_caching
 from libs import luci_context
 from utils import file_path
@@ -104,20 +104,13 @@ RUN_ISOLATED_LOG_FILE = 'run_isolated.log'
 # - ir stands for isolated_run
 # - io stands for isolated_out
 # - it stands for isolated_tmp
-# - ic stands for isolated_client
-# - ns stands for nsjail
 ISOLATED_RUN_DIR = 'ir'
 ISOLATED_OUT_DIR = 'io'
 ISOLATED_TMP_DIR = 'it'
-ISOLATED_CLIENT_DIR = 'ic'
 _CAS_CLIENT_DIR = 'cc'
-_NSJAIL_DIR = 'ns'
-
 # TODO(tikuta): take these parameter from luci-config?
 _CAS_PACKAGE = 'infra/tools/luci/cas/${platform}'
-_LUCI_GO_REVISION = DEPS.deps['luci-go']['packages'][0]['version']
-_NSJAIL_PACKAGE = 'infra/3pp/tools/nsjail/${platform}'
-_NSJAIL_VERSION = DEPS.deps['nsjail']['packages'][0]['version']
+_LUCI_GO_REVISION = 'git_revision:d290e92048ea30ad4f74232430604cbf7053557c'
 
 # Keep synced with task_request.py
 CACHE_NAME_RE = re.compile(r'^[a-z0-9_]{1,4096}$')
@@ -152,7 +145,7 @@ How to fix?
     them to terminate before quitting.
 
 See
-https://chromium.googlesource.com/infra/luci/luci-py.git/+/master/appengine/swarming/doc/Bot.md#Graceful-termination_aka-the-SIGTERM-and-SIGKILL-dance
+https://chromium.googlesource.com/infra/luci/luci-py.git/+/main/appengine/swarming/doc/Bot.md#Graceful-termination_aka-the-SIGTERM-and-SIGKILL-dance
 for more information.
 
 *** May the SIGKILL force be with you ***
@@ -219,7 +212,6 @@ TaskData = collections.namedtuple(
         # downloading isolated files.
         'trim_caches_fn',
     ])
-
 
 def make_temp_dir(prefix, root_dir):
   """Returns a new unique temporary directory."""
@@ -406,9 +398,9 @@ def run_command(
   Returns:
     tuple(process exit code, bool if had a hard timeout)
   """
-  logging.info(
-      'run_command(%s, %s, %s, %s, %s, %s)',
-      command, cwd, hard_timeout, grace_period, lower_priority, containment)
+  logging_utils.user_logs('run_command(%s, %s, %s, %s, %s, %s)', command, cwd,
+                          hard_timeout, grace_period, lower_priority,
+                          containment)
 
   exit_code = None
   had_hard_timeout = False
@@ -570,7 +562,7 @@ def _fetch_and_map(cas_client, digest, instance, output_dir, cache_dir,
         # flags for output.
         '-dir',
         output_dir,
-        '-dump-stats-json',
+        '-dump-json',
         result_json_path,
         '-log-level',
         'info',
@@ -593,19 +585,43 @@ def _fetch_and_map(cas_client, digest, instance, output_dir, cache_dir,
     if kvs_dir:
       cmd.extend(['-kvs-dir', kvs_dir])
 
+    def open_json_and_check(result_json_path, cleanup_dirs):
+      cas_error = False
+      result_json = {}
+      error_digest = digest
+      try:
+        with open(result_json_path) as json_file:
+          result_json = json.load(json_file)
+          cas_error = result_json.get('result') in ('digest_invalid',
+                                                    'authentication_error',
+                                                    'arguments_invalid')
+          if cas_error and result_json.get('error_details'):
+            error_digest = result_json['error_details'].get('digest', digest)
+
+      except (IOError, ValueError):
+        logging.error('Failed to read json file: %s', result_json_path)
+        raise
+      finally:
+        if cleanup_dirs:
+          file_path.rmtree(kvs_dir)
+          file_path.rmtree(output_dir)
+      if cas_error:
+        raise errors.NonRecoverableCasException(result_json['result'],
+                                                error_digest, instance)
+      return result_json
+
     try:
       _run_go_cmd_and_wait(cmd, tmp_dir)
     except subprocess42.CalledProcessError as ex:
       if not kvs_dir:
+        open_json_and_check(result_json_path, False)
         raise
+      open_json_and_check(result_json_path, True)
       logging.exception('Failed to run cas, removing kvs cache dir and retry.')
       on_error.report("Failed to run cas %s" % ex)
-      file_path.rmtree(kvs_dir)
-      file_path.rmtree(output_dir)
       _run_go_cmd_and_wait(cmd, tmp_dir)
 
-    with open(result_json_path) as json_file:
-      result_json = json.load(json_file)
+    result_json = open_json_and_check(result_json_path, False)
 
     return {
         'duration': time.time() - start,
@@ -692,13 +708,15 @@ def upload_outdir(cas_client, cas_instance, outdir, tmp_dir):
     cmd = [
         cas_client,
         'archive',
+        '-log-level',
+        'debug',
         '-paths',
         # Format: <working directory>:<relative path to dir>
         outdir + ':',
         # output
         '-dump-digest',
         digest_path,
-        '-dump-stats-json',
+        '-dump-json',
         stats_json_path,
     ]
 
@@ -710,15 +728,13 @@ def upload_outdir(cas_client, cas_instance, outdir, tmp_dir):
         '-cas-addr',
         cas_addr,
       ])
-    else:
+    elif cas_instance:
       cmd.extend([
         '-cas-instance',
         cas_instance
       ])
-
-    if sys.platform == 'linux':
-      # TODO(crbug.com/1243194): remove this after investigation.
-      cmd.extend(['-log-level', 'debug'])
+    else:
+      return None, None
 
     start = time.time()
 
@@ -838,14 +854,8 @@ def map_and_run(data, constant_run_path):
 
   data.trim_caches_fn(result['stats']['trim_caches'])
 
-  nsjail_dir = None
-  if (sys.platform == "linux" and cipd.get_platform() == "amd64" and
-      data.containment.containment_type == subprocess42.Containment.NSJAIL):
-    nsjail_dir = make_temp_dir(_NSJAIL_DIR, data.root_dir)
-
   try:
-    with data.install_packages_fn(run_dir, cas_client_dir,
-                                  nsjail_dir) as cipd_info:
+    with data.install_packages_fn(run_dir, cas_client_dir) as cipd_info:
       if cipd_info:
         result['stats']['cipd'] = cipd_info.stats
         result['cipd_pins'] = cipd_info.pins
@@ -863,6 +873,7 @@ def map_and_run(data, constant_run_path):
             kvs_dir=data.cas_kvs,
             tmp_dir=tmp_dir)
         isolated_stats['download'].update(stats)
+        logging_utils.user_logs('Fetched CAS inputs')
 
       if not command:
         # Handle this as a task failure, not an internal failure.
@@ -889,6 +900,7 @@ def map_and_run(data, constant_run_path):
         file_path.create_directories(run_dir, data.outputs)
 
       with data.install_named_caches(run_dir, result['stats']['named_caches']):
+        logging_utils.user_logs('Installed named caches')
         sys.stdout.flush()
         start = time.time()
         try:
@@ -919,6 +931,21 @@ def map_and_run(data, constant_run_path):
     # We successfully ran the command, set internal_failure back to
     # None (even if the command failed, it's not an internal error).
     result['internal_failure'] = None
+  except errors.NonRecoverableCasException as e:
+    # We could not find the CAS package. The swarming task should not
+    # be retried automatically
+    result['missing_cas'] = [e.to_dict()]
+    logging.exception('internal failure: %s', e)
+    result['internal_failure'] = str(e)
+    on_error.report(None)
+
+  except errors.NonRecoverableCipdException as e:
+    # We could not find the CIPD package. The swarming task should not
+    # be retried automatically
+    result['missing_cipd'] = [e.to_dict()]
+    logging.exception('internal failure: %s', e)
+    result['internal_failure'] = str(e)
+    on_error.report(None)
   except Exception as e:
     # An internal error occurred. Report accordingly so the swarming task will
     # be retried automatically.
@@ -1050,7 +1077,7 @@ CipdInfo = collections.namedtuple('CipdInfo', [
 
 
 @contextlib.contextmanager
-def copy_local_packages(_run_dir, cas_dir, _nsjail_dir):
+def copy_local_packages(_run_dir, cas_dir):
   """Copies CIPD packages from luci/luci-go dir."""
   go_client_dir = os.environ.get('LUCI_GO_CLIENT_DIR')
   assert go_client_dir, ('Please set LUCI_GO_CLIENT_DIR env var to install CIPD'
@@ -1060,7 +1087,7 @@ def copy_local_packages(_run_dir, cas_dir, _nsjail_dir):
   yield None
 
 
-def _install_packages(run_dir, cipd_cache_dir, client, packages):
+def _install_packages(run_dir, cipd_cache_dir, client, packages, timeout=None):
   """Calls 'cipd ensure' for packages.
 
   Args:
@@ -1068,6 +1095,7 @@ def _install_packages(run_dir, cipd_cache_dir, client, packages):
     cipd_cache_dir (str): the directory to use for the cipd package cache.
     client (CipdClient): the cipd client to use
     packages: packages to install, list [(path, package_name, version), ...].
+    timeout (int): if not None, timeout in seconds for cipd ensure to run.
 
   Returns: list of pinned packages.  Looks like [
     {
@@ -1097,10 +1125,11 @@ def _install_packages(run_dir, cipd_cache_dir, client, packages):
   pins = client.ensure(
       run_dir,
       {
-          subdir: [(name, vers) for name, vers, _ in pkgs
-                  ] for subdir, pkgs in by_path.items()
+          subdir: [(name, vers) for name, vers, _ in pkgs]
+          for subdir, pkgs in by_path.items()
       },
       cache_dir=cipd_cache_dir,
+      timeout=timeout,
   )
 
   for subdir, pin_list in sorted(pins.items()):
@@ -1116,7 +1145,7 @@ def _install_packages(run_dir, cipd_cache_dir, client, packages):
 @contextlib.contextmanager
 def install_client_and_packages(run_dir, packages, service_url,
                                 client_package_name, client_version, cache_dir,
-                                cas_dir, nsjail_dir):
+                                cas_dir):
   """Bootstraps CIPD client and installs CIPD packages.
 
   Yields CipdClient, stats, client info and pins (as single CipdInfo object).
@@ -1149,8 +1178,6 @@ def install_client_and_packages(run_dir, packages, service_url,
     client_version (str): Version of CIPD client.
     cache_dir (str): where to keep cache of cipd clients, packages and tags.
     cas_dir (str): where to download cas client.
-    nsjail_dir (str): where to download nsjail. If set to None, nsjail is not
-      downloaded.
   """
   assert cache_dir
 
@@ -1166,27 +1193,27 @@ def install_client_and_packages(run_dir, packages, service_url,
                                    client_version)
 
   with client_manager as client:
+    logging_utils.user_logs('Installed CIPD client')
     get_client_duration = time.time() - get_client_start
 
     package_pins = []
     if packages:
       package_pins = _install_packages(run_dir, cipd_cache_dir, client,
                                        packages)
+      logging_utils.user_logs('Installed task packages')
 
     # Install cas client to |cas_dir|.
-    _install_packages(cas_dir, cipd_cache_dir, client,
-                      [('', _CAS_PACKAGE, _LUCI_GO_REVISION)])
-
-    # Install nsjail to |nsjail_dir|.
-    if nsjail_dir is not None:
-      _install_packages(nsjail_dir, cipd_cache_dir, client,
-                        [('', _NSJAIL_PACKAGE, _NSJAIL_VERSION)])
+    _install_packages(cas_dir,
+                      cipd_cache_dir,
+                      client, [('', _CAS_PACKAGE, _LUCI_GO_REVISION)],
+                      timeout=10 * 60)
+    logging_utils.user_logs('Installed CAS client')
 
     file_path.make_tree_files_read_only(run_dir)
 
     total_duration = time.time() - start
-    logging.info('Installing CIPD client and packages took %d seconds',
-                 total_duration)
+    logging_utils.user_logs(
+        'Installing CIPD client and packages took %d seconds', total_duration)
 
     yield CipdInfo(
         client=client,
@@ -1311,11 +1338,10 @@ def create_option_parser():
   parser.add_option(
       '--lower-priority', action='store_true',
       help='Lowers the child process priority')
-  parser.add_option(
-      '--containment-type',
-      choices=('NONE', 'AUTO', 'JOB_OBJECT', 'NSJAIL'),
-      default='NONE',
-      help='Type of container to use')
+  parser.add_option('--containment-type',
+                    choices=('NONE', 'AUTO', 'JOB_OBJECT'),
+                    default='NONE',
+                    help='Type of container to use')
   parser.add_option(
       '--limit-processes',
       type='int',
@@ -1409,12 +1435,16 @@ def process_named_cache_options(parser, options, time_fn=None):
     # with a really old cache.
     policies = local_caching.CachePolicies(
         # 1TiB.
-        max_cache_size=1024*1024*1024*1024,
+        max_cache_size=1024 * 1024 * 1024 * 1024,
         min_free_space=options.min_free_space,
         max_items=50,
         max_age_secs=MAX_AGE_SECS)
+    keep = [name for name, _, _ in options.named_caches]
     root_dir = os.path.abspath(options.named_cache_root)
-    cache = local_caching.NamedCache(root_dir, policies, time_fn=time_fn)
+    cache = local_caching.NamedCache(root_dir,
+                                     policies,
+                                     time_fn=time_fn,
+                                     keep=keep)
     # Touch any named caches we're going to use to minimize thrashing
     # between tasks that request some (but not all) of the same named caches.
     cache.touch(*[name for name, _, _ in options.named_caches])
@@ -1503,9 +1533,13 @@ def main(args):
   # parsed normally, the strings are str instances.
   (parser, options, args) = parse_args(args)
 
+  # adds another log level for logs which are directed to standard output
+  # these logs will be uploaded to cloudstorage
+  logging_utils.set_user_level_logging()
+
   # Must be logged after parse_args(), which eventually calls
   # logging_utils.prepare_logging() which expects no logs before its call.
-  logging.info('Starting run_isolated script')
+  logging_utils.user_logs('Starting run_isolated script')
 
   SWARMING_SERVER = os.environ.get('SWARMING_SERVER')
   SWARMING_TASK_ID = os.environ.get('SWARMING_TASK_ID')
@@ -1560,7 +1594,7 @@ def main(args):
         caches, root, min_free_space=min_free_space, max_age_secs=MAX_AGE_SECS)
     duration = time.time() - start
     stats['duration'] = duration
-    logging.info('trim_caches: took %d seconds', duration)
+    logging_utils.user_logs('trim_caches: took %d seconds', duration)
 
   # Save state of cas cache not to overwrite state from go client.
   if cas_cache:
@@ -1616,17 +1650,14 @@ def main(args):
     if not cache_dir:
       tmp_cipd_cache_dir = tempfile.mkdtemp()
       cache_dir = tmp_cipd_cache_dir
-    install_packages_fn = (
-        lambda run_dir, cas_dir, nsjail_dir: install_client_and_packages(
-            run_dir,
-            cipd.parse_package_args(options.cipd_packages),
-            options.cipd_server,
-            options.cipd_client_package,
-            options.cipd_client_version,
-            cache_dir=cache_dir,
-            cas_dir=cas_dir,
-            nsjail_dir=nsjail_dir,
-        ))
+    install_packages_fn = (lambda run_dir, cas_dir: install_client_and_packages(
+        run_dir,
+        cipd.parse_package_args(options.cipd_packages),
+        options.cipd_server,
+        options.cipd_client_package,
+        options.cipd_client_version,
+        cache_dir=cache_dir,
+        cas_dir=cas_dir))
 
   @contextlib.contextmanager
   def install_named_caches(run_dir, stats):
@@ -1685,10 +1716,6 @@ def main(args):
     containment_type = subprocess42.Containment.AUTO
   if options.containment_type == 'JOB_OBJECT':
     containment_type = subprocess42.Containment.JOB_OBJECT
-  if options.containment_type == 'NSJAIL':
-    containment_type = subprocess42.Containment.NSJAIL
-  # TODO(https://crbug.com/1227833): This object should eventually contain the
-  # path to the nsjail binary and the nsjail configuration file.
   containment = subprocess42.Containment(
       containment_type=containment_type,
       limit_processes=options.limit_processes,
@@ -1735,7 +1762,6 @@ def main(args):
         logging.exception('Remove tmp_cipd_cache_dir=%s failed',
                           tmp_cipd_cache_dir)
         # Best effort clean up. Failed to do so doesn't affect the outcome.
-
 
 if __name__ == '__main__':
   subprocess42.inhibit_os_error_reporting()

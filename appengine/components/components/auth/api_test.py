@@ -3,10 +3,6 @@
 # Use of this source code is governed under the Apache License, Version 2.0
 # that can be found in the LICENSE file.
 
-# Disable 'Access to a protected member', Unused argument', 'Unused variable'.
-# pylint: disable=W0212,W0612,W0613
-# pylint: disable=redefined-outer-name
-
 import datetime
 import sys
 import threading
@@ -18,6 +14,7 @@ import mock
 from test_support import test_env
 test_env.setup_test_env()
 
+from google.appengine import runtime
 from google.appengine.ext import ndb
 
 from components.auth import api
@@ -69,17 +66,18 @@ class AuthDBTest(test_case.TestCase):
 
   def test_get_group(self):
     g = model.AuthGroup(
-      key=model.group_key('group'),
-      members=[
-        model.Identity.from_bytes('user:b@example.com'),
-        model.Identity.from_bytes('user:a@example.com'),
-      ],
-      globs=[model.IdentityGlob.from_bytes('user:*')],
-      nested=['blah'],
-      created_by=model.Identity.from_bytes('user:x@example.com'),
-      created_ts=datetime.datetime(2014, 1, 2, 3, 4, 5),
-      modified_by=model.Identity.from_bytes('user:y@example.com'),
-      modified_ts=datetime.datetime(2015, 1, 2, 3, 4, 5))
+        key=model.group_key('group'),
+        members=[
+            model.Identity.from_bytes('user:b@example.com'),
+            model.Identity.from_bytes('user:a@example.com'),
+            model.Identity.from_bytes('user:C@EXAMPLE.COM'),
+        ],
+        globs=[model.IdentityGlob.from_bytes('user:*')],
+        nested=['blah'],
+        created_by=model.Identity.from_bytes('user:x@example.com'),
+        created_ts=datetime.datetime(2014, 1, 2, 3, 4, 5),
+        modified_by=model.Identity.from_bytes('user:y@example.com'),
+        modified_ts=datetime.datetime(2015, 1, 2, 3, 4, 5))
 
     db = new_auth_db(groups=[g])
 
@@ -90,10 +88,11 @@ class AuthDBTest(test_case.TestCase):
     from_cache = db.get_group('group')
     self.assertEqual(from_cache.key, g.key)
 
-    # Members list is sorted.
+    # Members list is normalized and sorted.
     self.assertEqual(from_cache.members, [
-      model.Identity.from_bytes('user:a@example.com'),
-      model.Identity.from_bytes('user:b@example.com'),
+        model.Identity.from_bytes('user:a@example.com'),
+        model.Identity.from_bytes('user:b@example.com'),
+        model.Identity.from_bytes('user:c@example.com'),
     ])
 
     # Fields that are know to be different.
@@ -105,6 +104,8 @@ class AuthDBTest(test_case.TestCase):
   def test_is_group_member(self):
     # Test identity.
     joe = model.Identity(model.IDENTITY_USER, 'joe@example.com')
+    joeTitled = model.Identity(model.IDENTITY_USER, 'Joe@example.com')
+    joeUpper = model.Identity(model.IDENTITY_USER, 'JOE@EXAMPLE.COM')
 
     # Group that includes joe via glob.
     with_glob = model.AuthGroup(id='WithGlob')
@@ -133,14 +134,22 @@ class AuthDBTest(test_case.TestCase):
 
     # Globs are respected.
     self.assertTrue(is_member([with_glob], joe, 'WithGlob'))
+    self.assertTrue(is_member([with_glob], joeTitled, 'WithGlob'))
+    self.assertFalse(is_member([with_glob], joeUpper, 'WithGlob'))
     self.assertFalse(is_member([with_glob], model.Anonymous, 'WithGlob'))
 
     # Members lists are respected.
     self.assertTrue(is_member([with_listing], joe, 'WithListing'))
+    self.assertTrue(is_member([with_listing], joeTitled, 'WithListing'))
+    self.assertTrue(is_member([with_listing], joeUpper, 'WithListing'))
     self.assertFalse(is_member([with_listing], model.Anonymous, 'WithListing'))
 
     # Nested groups are respected.
     self.assertTrue(is_member([with_nesting, with_listing], joe, 'WithNesting'))
+    self.assertTrue(
+        is_member([with_nesting, with_listing], joeTitled, 'WithNesting'))
+    self.assertTrue(
+        is_member([with_nesting, with_listing], joeUpper, 'WithNesting'))
     self.assertFalse(
         is_member([with_nesting, with_listing], model.Anonymous, 'WithNesting'))
 
@@ -706,17 +715,17 @@ class TestAuthDBCache(test_case.TestCase):
     self.set_time(api.get_process_cache_expiration_sec() + 1)
 
     # Emulate an exception in fetch_auth_db.
-    def mock_fetch_auth_db(*_kwargs):
-      raise Exception('Boom!')
+    def mock_fetch_auth_db(**_kwargs):
+      raise runtime.DeadlineExceededError()
     self.mock(api, 'fetch_auth_db', mock_fetch_auth_db)
 
     # Capture calls to logging.exception.
     logger_calls = []
     self.mock(api.logging, 'exception', lambda *_args: logger_calls.append(1))
 
-    # Should return older copy of auth_db_v0 and log the exception.
-    self.assertEqual(auth_db_v0, api.get_process_auth_db())
-    self.assertEqual(1, len(logger_calls))
+    # Propagates the exception, releases the fetch lock.
+    with self.assertRaises(runtime.DeadlineExceededError):
+      api.get_process_auth_db()
 
     # Make fetch_auth_db to work again. Verify get_process_auth_db() works too.
     self.set_fetched_auth_db(auth_db_v1)
@@ -943,14 +952,14 @@ class ApiTest(test_case.TestCase):
     with self.assertRaises(TypeError):
       @api.public
       @api.require(lambda: True)
-      def func():
+      def _func():
         pass
 
   def test_require_then_public_fails(self):
     with self.assertRaises(TypeError):
       @api.require(lambda: True)
       @api.public
-      def func():
+      def _func():
         pass
 
   def test_is_decorated(self):
@@ -1070,6 +1079,41 @@ class RelevantSubgraphTest(test_case.TestCase):
       4: ('g4', {}),
       5: ('g1', {}),
     }, self.call(b.build(), 'user:a@example.com'))
+
+  def test_glob_case_is_respected(self):
+    b = AuthDBBuilder()
+    b.group('g1', ['user:a@example.com'])
+    b.group('g2', ['user:b@example.com'])
+    b.group('g3', [], ['user:*@example.com'])
+    b.group('g4', ['user:a@example.com'], ['user:*'])
+    db = b.build()
+    self.assertEqual(
+        {
+            0: ('user:A@example.com', {
+                'IN': [1, 3, 4, 5]
+            }),
+            1: ('user:*@example.com', {
+                'IN': [2]
+            }),
+            2: ('g3', {}),
+            3: ('user:*', {
+                'IN': [4]
+            }),
+            4: ('g4', {}),
+            5: ('g1', {}),
+        }, self.call(db, 'user:A@example.com'))
+
+    self.assertEqual(
+        {
+            0: ('user:a@Example.COM', {
+                'IN': [1, 2, 3]
+            }),
+            1: ('user:*', {
+                'IN': [2]
+            }),
+            2: ('g4', {}),
+            3: ('g1', {}),
+        }, self.call(db, 'user:a@Example.COM'))
 
   def test_glob_is_matched_directly(self):
     b = AuthDBBuilder()
@@ -1225,6 +1269,7 @@ PERM2 = api.Permission('luci.dev.testing2')
 ALL_PERMS = [PERM0, PERM1, PERM2]
 
 ID1 = model.Identity.from_bytes('user:1@example.com')
+ID1_UPPER = model.Identity.from_bytes('user:1@EXAMPLE.COM')
 ID2 = model.Identity.from_bytes('user:2@example.com')
 ID3 = model.Identity.from_bytes('user:3@example.com')
 
@@ -1295,6 +1340,7 @@ class RealmsTest(test_case.TestCase):
         any(msg in m for m in self.logs[lvl]),
         '%r not in %r' % (msg, self.logs[lvl]))
 
+  # pylint: disable=redefined-outer-name
   def assert_check(self, db, perm, realms, ident, attrs, outcome):
     self.assertEqual(
         outcome, db.has_permission(perm, realms, ident, attributes=attrs),
@@ -1315,6 +1361,9 @@ class RealmsTest(test_case.TestCase):
     self.assert_check(db, PERM0, ['proj:realm'], ID1, None, True)
     self.assert_check(db, PERM1, ['proj:realm'], ID1, None, True)
     self.assert_check(db, PERM2, ['proj:realm'], ID1, None, False)
+    self.assert_check(db, PERM0, ['proj:realm'], ID1_UPPER, None, True)
+    self.assert_check(db, PERM1, ['proj:realm'], ID1_UPPER, None, True)
+    self.assert_check(db, PERM2, ['proj:realm'], ID1_UPPER, None, False)
     self.assert_check(db, PERM0, ['proj:realm'], ID2, None, True)
     self.assert_check(db, PERM1, ['proj:realm'], ID2, None, False)
     self.assert_check(db, PERM2, ['proj:realm'], ID2, None, True)
@@ -1334,6 +1383,9 @@ class RealmsTest(test_case.TestCase):
     self.assert_check(db, PERM0, ['proj:realm'], ID1, None, True)
     self.assert_check(db, PERM1, ['proj:realm'], ID1, None, True)
     self.assert_check(db, PERM2, ['proj:realm'], ID1, None, False)
+    self.assert_check(db, PERM0, ['proj:realm'], ID1_UPPER, None, True)
+    self.assert_check(db, PERM1, ['proj:realm'], ID1_UPPER, None, True)
+    self.assert_check(db, PERM2, ['proj:realm'], ID1_UPPER, None, False)
     self.assert_check(db, PERM0, ['proj:realm'], ID2, None, True)
     self.assert_check(db, PERM1, ['proj:realm'], ID2, None, False)
     self.assert_check(db, PERM2, ['proj:realm'], ID2, None, True)
@@ -1362,15 +1414,31 @@ class RealmsTest(test_case.TestCase):
     self.assert_check(db, PERM0, ['p:r'], ID1, {'a1': 'c'}, False)
     self.assert_check(db, PERM0, ['p:r'], ID1, {'xx': 'a'}, False)
     self.assert_check(db, PERM0, ['p:r'], ID1, None, False)
+    self.assert_check(db, PERM0, ['p:r'], ID1_UPPER, {'a1': 'a'}, True)
+    self.assert_check(db, PERM0, ['p:r'], ID1_UPPER, {'a1': 'b'}, True)
+    self.assert_check(db, PERM0, ['p:r'], ID1_UPPER, {'a1': 'c'}, False)
+    self.assert_check(db, PERM0, ['p:r'], ID1_UPPER, {'xx': 'a'}, False)
+    self.assert_check(db, PERM0, ['p:r'], ID1_UPPER, None, False)
 
     # ANDing conditions works.
     self.assert_check(db, PERM1, ['p:r'], ID1, {'a1': 'a', 'a2': 'c'}, True)
     self.assert_check(db, PERM1, ['p:r'], ID1, {'a1': 'a'}, False)
     self.assert_check(db, PERM1, ['p:r'], ID1, {'a2': 'c'}, False)
+    self.assert_check(db, PERM1, ['p:r'], ID1_UPPER, {
+        'a1': 'a',
+        'a2': 'c'
+    }, True)
+    self.assert_check(db, PERM1, ['p:r'], ID1_UPPER, {'a1': 'a'}, False)
+    self.assert_check(db, PERM1, ['p:r'], ID1_UPPER, {'a2': 'c'}, False)
 
     # Empty restriction is allowed and evaluates to False.
     self.assert_check(db, PERM2, ['p:r'], ID1, {'a1': 'a', 'a3': 'c'}, False)
     self.assert_check(db, PERM2, ['p:r'], ID1, {'a1': 'a'}, False)
+    self.assert_check(db, PERM2, ['p:r'], ID1_UPPER, {
+        'a1': 'a',
+        'a3': 'c'
+    }, False)
+    self.assert_check(db, PERM2, ['p:r'], ID1_UPPER, {'a1': 'a'}, False)
 
     # ORing conditions via multiple bindings.
     self.assert_check(db, PERM0, ['p:r'], ID2, {'a1': 'a'}, True) # via 0
@@ -1382,6 +1450,7 @@ class RealmsTest(test_case.TestCase):
   def test_fallback_to_root(self):
     db = self.auth_db({'proj:@root': [([], [PERM0], [ID1])]})
     self.assert_check(db, PERM0, ['proj:@root'], ID1, None, True)
+    self.assert_check(db, PERM0, ['proj:@root'], ID1_UPPER, None, True)
     self.assert_check(db, PERM0, ['proj:@root'], ID2, None, False)
 
     self.assert_logs_empty('warning')

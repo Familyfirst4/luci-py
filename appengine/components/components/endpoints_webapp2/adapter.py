@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import posixpath
+import zlib
 
 from endpoints import protojson
 from protorpc import message_types
@@ -34,10 +35,9 @@ def decode_field(field, value):
     value = value.lower()
     if value == 'true':
       return True
-    elif value == 'false':
+    if value == 'false':
       return False
-    else:
-      raise ValueError('boolean field must be either "true" or "false"')
+    raise ValueError('boolean field must be either "true" or "false"')
   return PROTOCOL.decode_field(field, value)
 
 
@@ -54,6 +54,8 @@ def decode_message(remote_method_info, request):
     res_container = None
     body_type = remote_method_info.request_type
 
+  if request.content_type == 'application/json-zlib':
+    request.body = zlib.decompress(request.body)
   body = PROTOCOL.decode_message(body_type, request.body)
   if res_container:
     result = res_container.combined_message_class()
@@ -121,7 +123,8 @@ def path_handler(api_class, api_method, service_path):
         req = decode_message(api_method.remote, self.request)
         # Check that required fields are populated.
         req.check_initialized()
-      except (messages.DecodeError, messages.ValidationError, ValueError) as ex:
+      except (messages.DecodeError, messages.ValidationError, ValueError,
+              zlib.error) as ex:
         response_body = json.dumps({'error': {'message': ex.message}})
         self.response.set_status(httplib.BAD_REQUEST)
       else:
@@ -206,7 +209,7 @@ def api_routes(api_classes, base_path='/_ah/api', regex='[^/]+'):
   return routes
 
 
-def api_server(api_classes, base_path='/_ah/api', regex='[^/]+'):
+def api_server(api_classes, base_path='/_ah/api', regex='[^/]+', debug=False):
   """Creates a webapp2 application for the given Endpoints v1 services.
 
   A shortcut for webapp2.WSGIApplication(api_routes(...)), which exists to
@@ -217,11 +220,13 @@ def api_server(api_classes, base_path='/_ah/api', regex='[^/]+'):
     base_path: The base path under which all service paths should exist. If
       unspecified, defaults to /_ah/api.
     regex: Regular expression to allow in path parameters.
+    debug: if True, send stack traces in error responses.
 
   Returns:
     A webapp2.WSGIApplication.
   """
-  return webapp2.WSGIApplication(api_routes(api_classes, base_path, regex))
+  return webapp2.WSGIApplication(api_routes(api_classes, base_path, regex),
+                                 debug=debug)
 
 
 def discovery_handler_factory(api_classes, base_path):
