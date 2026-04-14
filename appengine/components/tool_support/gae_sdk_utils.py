@@ -40,6 +40,14 @@ else:
 TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
+# Environment variables that trigger enterprise certificate proxy loading
+# in gcloud, causing crashes in restricted vpython environments.
+GCLOUD_INCOMPATIBLE_VARS = [
+    'CLOUDSDK_CONTEXT_AWARE_CERTIFICATE_CONFIG_FILE_PATH',
+    'CLOUDSDK_CONTEXT_AWARE_USE_CLIENT_CERTIFICATE'
+]
+
+
 # Path to a current SDK, set in setup_gae_sdk.
 _GAE_SDK_PATH = None
 
@@ -486,7 +494,7 @@ class Application(object):
     """
     return os.path.dirname(self._services['default'].path)
 
-  def run_cmd(self, cmd, cwd=None):
+  def run_cmd(self, cmd, cwd=None, env=None):
     """Runs subprocess, capturing the output.
 
     Returns output as bytes on python3.
@@ -494,12 +502,16 @@ class Application(object):
     Doesn't close stdin, since gcloud may be asking for user input. If this is
     undesirable (e.g when gae.py is used from scripts), close 'stdin' of gae.py
     process itself.
+
+    Note: If `env` is provided, it must be a complete environment mapping (e.g.
+    created via `os.environ.copy()`), as it replaces the current environment
+    entirely. This allows callers to remove variables if needed.
     """
     logging.debug('Running %s', cmd)
-    proc = subprocess.Popen(
-        cmd,
-        cwd=cwd or self._app_dir,
-        stdout=subprocess.PIPE)
+    proc = subprocess.Popen(cmd,
+                            cwd=cwd or self._app_dir,
+                            stdout=subprocess.PIPE,
+                            env=env)
     output, _ = proc.communicate()
     if proc.returncode:
       if output:
@@ -512,13 +524,29 @@ class Application(object):
       raise subprocess.CalledProcessError(proc.returncode, cmd, output)
     return output
 
+  def _get_gcloud_env(self):
+    """Returns a copy of os.environ with incompatible variables removed."""
+    env = os.environ.copy()
+    removed = []
+    for var in GCLOUD_INCOMPATIBLE_VARS:
+      if env.pop(var, None) is not None:
+        removed.append(var)
+
+    if removed:
+      logging.debug(
+          'Stripped environment variables to avoid enterprise proxy '
+          'crashes: %s', ', '.join(removed))
+    return env
+
   def run_gcloud(self, args):
     """Runs 'gcloud <args> --project ... --format ...' and parses the output."""
     gcloud = find_gcloud()
     if not is_gcloud_auth_set():
       raise LoginRequiredError('Login first using \'gcloud auth login\'')
-    raw = self.run_cmd(
-        [gcloud] + args + ['--project', self.app_id, '--format', 'json'])
+
+    raw = self.run_cmd([gcloud] + args +
+                       ['--project', self.app_id, '--format', 'json'],
+                       env=self._get_gcloud_env())
     try:
       return json.loads(raw)
     except ValueError:
